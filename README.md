@@ -2,6 +2,7 @@
 
 # Do as I Do
 
+[**Project Page**](https://do-as-i-do.com/) | [**arXiv**](https://arxiv.org/abs/2606.19333) 
 
 Code release for Do as I Do.
 
