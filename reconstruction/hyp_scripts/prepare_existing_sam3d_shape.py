@@ -6,10 +6,7 @@ import json
 from pathlib import Path
 
 import numpy as np
-import torch
 import trimesh
-from pytorch3d.transforms import quaternion_to_matrix
-from sam3d_objects.data.dataset.tdfy.transforms_3d import compose_transform
 from scipy.spatial.transform import Rotation
 
 
@@ -75,18 +72,16 @@ def vector(payload: np.lib.npyio.NpzFile, key: str, size: int) -> np.ndarray:
 
 
 def compute_layout(mesh: trimesh.Trimesh, rotation: np.ndarray, translation: np.ndarray, scale: np.ndarray) -> dict:
-    device = torch.device("cpu")
-    quat = torch.as_tensor(rotation, dtype=torch.float32, device=device).reshape(1, 4)
-    translation_t = torch.as_tensor(translation, dtype=torch.float32, device=device).reshape(1, 3)
-    scale_t = torch.as_tensor(scale, dtype=torch.float32, device=device).reshape(1, 3)
-    rotation_t = quaternion_to_matrix(quat)
-    transform = compose_transform(scale=scale_t, rotation=rotation_t, translation=translation_t)
+    # SAM3D stores quaternions as (w, x, y, z). PyTorch3D Transform3d uses
+    # row vectors; scale().rotate().translate() therefore evaluates as
+    # p' = p @ (diag(scale) @ R) + translation.
+    quat_xyzw = np.asarray([rotation[1], rotation[2], rotation[3], rotation[0]])
+    rotation_matrix = Rotation.from_quat(quat_xyzw).as_matrix().astype(np.float32)
+    linear = np.diag(scale.astype(np.float32)) @ rotation_matrix
 
     raw_vertices = np.asarray(mesh.vertices, dtype=np.float32)
     vertices_zup = raw_vertices @ R_YUP_TO_ZUP
-    transformed = transform.transform_points(
-        torch.from_numpy(vertices_zup).to(device).unsqueeze(0)
-    ).squeeze(0).cpu().numpy()
+    transformed = vertices_zup @ linear + translation.reshape(1, 3)
     transformed_isaac = transformed @ P3D_TO_ISAAC
     matrix, _, _ = trimesh.registration.procrustes(
         raw_vertices,
@@ -95,8 +90,9 @@ def compute_layout(mesh: trimesh.Trimesh, rotation: np.ndarray, translation: np.
         return_cost=True,
     )
     new_quat = Rotation.from_matrix(matrix[:3, :3]).as_quat(scalar_first=True)
-    quat_xyzw = np.asarray([rotation[1], rotation[2], rotation[3], rotation[0]], dtype=np.float32)
-    matrix_4x4 = transform.get_matrix().detach().cpu().squeeze(0).numpy()
+    matrix_4x4 = np.eye(4, dtype=np.float32)
+    matrix_4x4[:3, :3] = linear
+    matrix_4x4[3, :3] = translation
     return {
         "translation": translation.tolist(),
         "scale": scale.tolist(),

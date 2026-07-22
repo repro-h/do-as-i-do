@@ -38,8 +38,8 @@ produced by hand-uni into the OBJ directory and `layout.json` written by
 `generate_mesh_sam3d.py`. It preserves the original network rotation,
 translation and scale and links the source GLB/NPZ for provenance.
 
-Run this script in the `sam3d` environment because it uses PyTorch3D and the
-SAM3D transform helpers.
+This conversion does not load a SAM3D model or use CUDA. It only requires
+NumPy, SciPy and trimesh.
 
 ```bash
 python reconstruction/hyp_scripts/prepare_existing_sam3d_shape.py \
