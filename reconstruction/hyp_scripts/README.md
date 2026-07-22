@@ -30,3 +30,20 @@ python reconstruction/hyp_scripts/prepare_dexycb_sequence.py \
   --fps 30 \
   --overwrite
 ```
+
+## Reuse an existing SAM3D shape
+
+`prepare_existing_sam3d_shape.py` converts the canonical GLB/NPZ already
+produced by hand-uni into the OBJ directory and `layout.json` written by
+`generate_mesh_sam3d.py`. It preserves the original network rotation,
+translation and scale and links the source GLB/NPZ for provenance.
+
+Run this script in the `sam3d` environment because it uses PyTorch3D and the
+SAM3D transform helpers.
+
+```bash
+python reconstruction/hyp_scripts/prepare_existing_sam3d_shape.py \
+  --run_dir /path/to/prepared/stream \
+  --shape_bank_root /path/to/object_shape_bank_v2 \
+  --overwrite
+```
