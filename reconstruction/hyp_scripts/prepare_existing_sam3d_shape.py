@@ -89,7 +89,11 @@ def compute_layout(mesh: trimesh.Trimesh, rotation: np.ndarray, translation: np.
         reflection=False,
         return_cost=True,
     )
-    new_quat = Rotation.from_matrix(matrix[:3, :3]).as_quat(scalar_first=True)
+    new_quat_xyzw = Rotation.from_matrix(matrix[:3, :3]).as_quat()
+    new_quat = np.asarray(
+        [new_quat_xyzw[3], new_quat_xyzw[0], new_quat_xyzw[1], new_quat_xyzw[2]],
+        dtype=np.float32,
+    )
     matrix_4x4 = np.eye(4, dtype=np.float32)
     matrix_4x4[:3, :3] = linear
     matrix_4x4[3, :3] = translation
@@ -97,7 +101,7 @@ def compute_layout(mesh: trimesh.Trimesh, rotation: np.ndarray, translation: np.
         "translation": translation.tolist(),
         "scale": scale.tolist(),
         "quat_wxyz": rotation.tolist(),
-        "new_quat": new_quat.astype(np.float32).tolist(),
+        "new_quat": new_quat.tolist(),
         "quat_xyzw": quat_xyzw.tolist(),
         "matrix_4x4_row_major": matrix_4x4.reshape(-1).astype(float).tolist(),
     }
