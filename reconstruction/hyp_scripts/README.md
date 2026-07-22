@@ -47,3 +47,18 @@ python reconstruction/hyp_scripts/prepare_existing_sam3d_shape.py \
   --shape_bank_root /path/to/object_shape_bank_v2 \
   --overwrite
 ```
+
+## Continue the reconstruction pipeline
+
+After RGB/masks and the existing SAM3D shape are prepared, continue from
+pointmaps through tracking without re-running frame extraction, SAM3, or SAM3D
+shape generation:
+
+```bash
+bash reconstruction/hyp_scripts/run_prepared_dexycb.sh \
+  --run-dir /path/to/prepared/stream \
+  --gpu 0
+```
+
+The default Fast-SAM3D settings use 8 pose samples and 12 Euler steps to fit a
+24 GB GPU. Pass `--force` to recompute cached stages.
