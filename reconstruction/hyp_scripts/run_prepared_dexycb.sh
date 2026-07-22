@@ -175,7 +175,7 @@ if [[ "$FORCE" == true || ! -f "$LAYOUT_JSON" ]]; then
   echo "=== Fast-SAM3D tracking ==="
   activate_env "$ENV_SAM3D"
   cd "$FASTSAM3D_DIR"
-  python track_object.py \
+  PYTHONPATH="$SAM3D_DIR${PYTHONPATH:+:$PYTHONPATH}" python track_object.py \
     --config checkpoints/hf/pipeline.yaml \
     --vid_dir "$RUN_DIR" \
     --masks_root "$VIDEO_MASKS_DIR" \
