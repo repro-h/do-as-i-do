@@ -74,6 +74,14 @@ done
 CONDA_BASE="$(conda info --base)"
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 
+activate_env() {
+  # Some conda activate.d scripts read toolchain variables before defining
+  # them, which is incompatible with bash nounset mode.
+  set +u
+  conda activate "$1"
+  set -u
+}
+
 read_json() {
   "$CONDA_BASE/bin/python" - "$1" "$2" <<'PY'
 import json
@@ -110,7 +118,7 @@ export CUDA_VISIBLE_DEVICES="$GPU"
 echo "run_dir=$RUN_DIR"
 echo "object=$OBJECT_ID init_frame=$INIT_FRAME hand=$ANCHOR_HAND gpu=$GPU"
 
-conda activate "$ENV_SAM3D"
+activate_env "$ENV_SAM3D"
 if [[ "$FORCE" == true || ! -f "$POINTMAP_PATH" || ! -f "$INTRINSICS_PATH" ]]; then
   echo "=== Reference pointmap ==="
   cd "$SCRIPTS_DIR"
@@ -122,7 +130,7 @@ fi
 if [[ "$SKIP_HAWOR" == false ]]; then
   if [[ "$FORCE" == true || ! -f "$HAND_MESHES" ]]; then
     echo "=== HaWoR ==="
-    conda activate "$ENV_HAWOR"
+    activate_env "$ENV_HAWOR"
     cd "$HAWOR_DIR"
     IMG_FOCAL="$(head -n 1 "$INTRINSICS_PATH")"
     python demo.py --video_path "$VIDEO_PATH" --vis_mode cam --img_focal "$IMG_FOCAL" --static_camera
@@ -131,7 +139,7 @@ if [[ "$SKIP_HAWOR" == false ]]; then
   fi
 fi
 
-conda activate "$ENV_SAM3D"
+activate_env "$ENV_SAM3D"
 FIRST_POINTMAP="$RUN_DIR/all_frames/000000_pointmap.npy"
 if [[ "$FORCE" == true || ! -f "$FIRST_POINTMAP" ]]; then
   echo "=== All-frame pointmaps ==="
@@ -151,7 +159,7 @@ fi
 
 if [[ "$FORCE" == true || ! -f "$MOTION_JSON" ]]; then
   echo "=== TAPIR ==="
-  conda activate "$ENV_TAPNET"
+  activate_env "$ENV_TAPNET"
   cd "$SCRIPTS_DIR"
   python tapir_velocity_tracking.py \
     --video "$VIDEO_PATH" \
@@ -165,7 +173,7 @@ fi
 
 if [[ "$FORCE" == true || ! -f "$LAYOUT_JSON" ]]; then
   echo "=== Fast-SAM3D tracking ==="
-  conda activate "$ENV_SAM3D"
+  activate_env "$ENV_SAM3D"
   cd "$FASTSAM3D_DIR"
   python track_object.py \
     --config checkpoints/hf/pipeline.yaml \
@@ -195,7 +203,7 @@ else
   echo "=== Fast-SAM3D tracking: cached ==="
 fi
 
-conda activate "$ENV_SAM3D"
+activate_env "$ENV_SAM3D"
 cd "$SCRIPTS_DIR"
 if [[ "$FORCE" == true || ! -f "$TRACK_ROOT/projected/video.mp4" ]]; then
   echo "=== Project tracked mesh ==="
