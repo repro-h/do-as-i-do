@@ -181,6 +181,10 @@ def main() -> None:
     if target_id not in object_names:
         raise KeyError(f"DexYCB class ID {target_id} has no model directory in {model_root}")
     object_name = object_names[target_id]
+    hand_side = str((meta.get("mano_sides") or ["right"])[0]).lower()
+    if hand_side not in {"left", "right"}:
+        raise ValueError(f"Unexpected DexYCB MANO side: {hand_side}")
+    hand_name = f"{hand_side}_hand_0"
 
     images = sorted(stream_dir.glob("color_*.jpg")) or sorted(stream_dir.glob("color_*.png"))
     selected_images: list[Path] = []
@@ -237,9 +241,11 @@ def main() -> None:
             mask_dir = masks_root / f"frame_{output_frame}_masks"
             mask_dir.mkdir(parents=True, exist_ok=True)
             mask_path = mask_dir / f"{object_name}.png"
+            hand_mask_path = mask_dir / f"{hand_name}.png"
             cv2.imwrite(str(frame_path), image)
             cv2.imwrite(str(root_frame_path), image)
             cv2.imwrite(str(mask_path), object_mask * 255)
+            cv2.imwrite(str(hand_mask_path), hand_mask * 255)
             writer.write(image)
 
             metrics = score_hand_object_anchor_frame(
@@ -264,6 +270,7 @@ def main() -> None:
                     "image_path": str(image_path),
                     "label_path": str(label_path),
                     "mask_path": str(mask_path),
+                    "hand_mask_path": str(hand_mask_path),
                 }
             )
     finally:
@@ -288,7 +295,7 @@ def main() -> None:
     config = {
         "frame_number": int(init_row["output_index"]),
         "object_names": [object_name],
-        "anchor_hand": str((meta.get("mano_sides") or ["right"])[0]),
+        "anchor_hand": hand_side,
     }
     (out_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
     payload = {
@@ -296,6 +303,7 @@ def main() -> None:
         "stream_dir": str(stream_dir),
         "video_path": str(video_path),
         "object_name": object_name,
+        "hand_name": hand_name,
         "target_dexycb_class_id": target_id,
         "num_frames": len(frame_map),
         "fps": float(args.fps),

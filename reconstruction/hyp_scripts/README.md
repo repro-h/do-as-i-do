@@ -15,6 +15,7 @@ ground-truth segmentation into the layout expected by TAPIR and Fast-SAM3D:
   config.json
   all_frames/000000.png
   video_segmentation/masks/frame_000000_masks/<object_name>.png
+  video_segmentation/masks/frame_000000_masks/<left|right>_hand_0.png
 ```
 
 The target object is read from `meta.yml` using
