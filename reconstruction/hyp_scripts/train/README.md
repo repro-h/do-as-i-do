@@ -55,3 +55,14 @@ python reconstruction/hyp_scripts/train/build_dexycb_hybrid_manifest.py \
 
 This writes one JSONL per split, an all-splits JSONL, and an audit summary. It
 does not copy images, depth maps, labels, poses, or meshes.
+
+## Select and run a pilot
+
+Use `select_dexycb_hybrid_pilot.py` to select a deterministic pilot with equal
+left/right coverage and as many distinct objects as possible. Then run
+`run_handflow_hybrid_jobs.py`.
+
+Left-hand streams are mirrored before right-hand HandFlow inference, then their
+camera-space vertices are mirrored back and face winding is corrected. Raw
+right-MANO parameters from mirrored inference are retained under
+`handflow_raw_*` keys but must not be interpreted as left-MANO parameters.
