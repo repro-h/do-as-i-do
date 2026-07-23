@@ -66,3 +66,9 @@ Left-hand streams are mirrored before right-hand HandFlow inference, then their
 camera-space vertices are mirrored back and face winding is corrected. Raw
 right-MANO parameters from mirrored inference are retained under
 `handflow_raw_*` keys but must not be interpreted as left-MANO parameters.
+
+Run `audit_hand_object_initialization.py` before scaling up. It reports
+HandFlow-to-GT hand error, temporal speed/acceleration, FoundationPose
+translation motion, relative hand-object motion, and unsigned hand-to-SAM3D
+surface distances. It intentionally does not report signed penetration until a
+reliable collision representation is selected.
