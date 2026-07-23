@@ -26,6 +26,7 @@ data/dexycb/
 *.txt
 *.png
 *.jpg
+*.mp4
 
 # OS / editor
 .DS_Store
