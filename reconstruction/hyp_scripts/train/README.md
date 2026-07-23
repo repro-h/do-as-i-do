@@ -19,6 +19,24 @@ The first stage does not require SAM3D-to-YCB canonical alignment. Object
 supervision is defined using camera-space rendering, depth, masks, and surface
 geometry.
 
+## Local data layout
+
+Machine-local inputs and generated artifacts can be grouped under:
+
+```text
+reconstruction/data/dexycb/
+├── foundationpose_quality_filter_v2 -> external QA results
+├── objects -> external SAM3D object shape bank
+└── hybrid_training_v1/
+    ├── manifests/
+    ├── handflow_cache/
+    ├── audits/
+    └── windows/
+```
+
+The complete `reconstruction/data/dexycb/` directory is gitignored because it
+contains machine-specific absolute symlinks and generated data.
+
 ## Build a manifest
 
 Pass each QA-approved pose index explicitly so stale shards are not discovered

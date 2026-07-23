@@ -16,6 +16,9 @@ modules/HaWoR/_DATA/
 # Vendored sam3 package: drop generated outputs
 modules/sam3/output/
 
+# Machine-local DexYCB links, inference caches, audits, and training windows.
+data/dexycb/
+
 # OS / editor
 .DS_Store
 *.swp
