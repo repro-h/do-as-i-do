@@ -62,8 +62,8 @@ def parse_args():
                         help='Optional GT object camera-frame layout JSON')
     parser.add_argument('--gt-object-mesh', type=str, default=None,
                         help='Optional GT object mesh')
-    parser.add_argument('--gt-object-scale', type=float, default=0.001,
-                        help='Scale applied to the GT object mesh (DexYCB YCB OBJ files use millimeters)')
+    parser.add_argument('--gt-object-scale', type=float, default=None,
+                        help='Scale applied to the GT object mesh; inferred from mesh extent when omitted')
     parser.add_argument('--hands', type=str, default='both',
                         choices=['left', 'right', 'both'],
                         help='Which hand(s) to render')
@@ -202,6 +202,7 @@ def main():
     gt_layout = None
     gt_mesh_verts = None
     gt_mesh_faces = None
+    gt_object_scale = 1.0
     if args.gt_object_layout_json or args.gt_object_mesh:
         if not args.gt_object_layout_json or not args.gt_object_mesh:
             print("[error] Pass both --gt-object-layout-json and --gt-object-mesh")
@@ -213,6 +214,14 @@ def main():
             gt_mesh = gt_mesh.dump(concatenate=True)
         gt_mesh_verts = np.asarray(gt_mesh.vertices)
         gt_mesh_faces = np.asarray(gt_mesh.faces)
+        if args.gt_object_scale is None:
+            gt_object_scale = 0.001 if float(np.max(gt_mesh.extents)) > 2.0 else 1.0
+            print(
+                f"  [info] Inferred GT object scale={gt_object_scale} "
+                f"from raw extents={gt_mesh.extents.tolist()}"
+            )
+        else:
+            gt_object_scale = float(args.gt_object_scale)
 
     # Camera intrinsics
     fov_y = 2.0 * math.atan(args.height / (2.0 * args.fy))
@@ -387,7 +396,7 @@ def main():
             gt_rotation = R.from_quat(gt_xyzw).as_matrix()
             gt_translation = np.asarray(gt_pose["translation"])
             gt_vertices = (
-                gt_mesh_verts * args.gt_object_scale
+                gt_mesh_verts * gt_object_scale
             ) @ gt_rotation.T + gt_translation
             gt_object_handle = server.scene.add_mesh_simple(
                 "/gt/object_mesh",
