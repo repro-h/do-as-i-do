@@ -225,6 +225,7 @@ if [[ "$SKIP_HAWOR" == false ]]; then
     python optimize_translation_scale.py \
       --video-dir "$RUN_DIR" \
       --layout-json "$LAYOUT_CF" \
+      --hand-meshes "$HAND_MESHES" \
       --anchor-hand "$ANCHOR_HAND" \
       --ref-frame "$INIT_FRAME"
   fi
