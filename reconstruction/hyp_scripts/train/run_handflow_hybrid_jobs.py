@@ -24,8 +24,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--status-json", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--keep-videos", action="store_true")
+    parser.add_argument("--keep-raw", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
     return parser.parse_args()
 
 
@@ -159,12 +162,21 @@ def main() -> None:
             raise FileNotFoundError(path)
 
     records = load_jsonl(manifest_path)
+    if args.num_shards <= 0:
+        raise ValueError("--num-shards must be positive")
+    if not 0 <= args.shard_index < args.num_shards:
+        raise ValueError(
+            f"--shard-index must be in [0, {args.num_shards}), got {args.shard_index}"
+        )
+    records = records[args.shard_index :: args.num_shards]
     if args.limit > 0:
         records = records[: args.limit]
     out_root.mkdir(parents=True, exist_ok=True)
     state = {
         "manifest": str(manifest_path),
         "out_root": str(out_root),
+        "num_shards": args.num_shards,
+        "shard_index": args.shard_index,
         "num_requested": len(records),
         "completed": {},
         "failed": {},
@@ -242,6 +254,8 @@ def main() -> None:
                 intrinsics,
                 mirrored_left=is_left,
             )
+            if not args.keep_raw and raw_result.is_file():
+                raw_result.unlink()
             if not args.keep_videos:
                 for name in ("overlay.mp4", "ortho.mp4"):
                     video = stream_out / name

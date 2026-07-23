@@ -77,3 +77,8 @@ Hand/contact temporal metrics are gated by both HandFlow validity and DexYCB GT
 hand validity. This prevents off-screen HandFlow hallucinations from becoming
 contact supervision. The future training dataset must carry the same explicit
 visibility mask.
+
+Full HandFlow export supports deterministic `--num-shards/--shard-index`
+partitioning. By default it removes raw HandFlow NPZ files and rendered videos
+after producing `handflow_camera_result.npz`; use `--keep-raw` or
+`--keep-videos` only for small debugging runs.
