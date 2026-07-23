@@ -82,3 +82,9 @@ Full HandFlow export supports deterministic `--num-shards/--shard-index`
 partitioning. By default it removes raw HandFlow NPZ files and rendered videos
 after producing `handflow_camera_result.npz`; use `--keep-raw` or
 `--keep-videos` only for small debugging runs.
+
+`wait_train_then_export_val.sh` waits for all configured train shard PIDs to
+exit, detects sufficiently idle GPUs from an allowlist, and launches validation
+with a matching dynamic shard count. It intentionally does not require every
+train manifest record to have succeeded; failed or missing train exports are
+audited separately.
