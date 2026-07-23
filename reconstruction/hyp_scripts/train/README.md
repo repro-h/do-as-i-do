@@ -88,3 +88,18 @@ exit, detects sufficiently idle GPUs from an allowlist, and launches validation
 with a matching dynamic shard count. It intentionally does not require every
 train manifest record to have succeeded; failed or missing train exports are
 audited separately.
+
+## Stage-1 rigid temporal refinement
+
+After train and validation HandFlow caches finish, run
+`prepare_stage1_rigid_supervision.py` for each split. The compact per-stream
+files contain predicted/GT hand centers, predicted/GT object surface centers,
+FoundationPose rotation context, and explicit hand/object/relative validity
+masks. SAM3D and DexYCB CAD centroids are transformed independently, so their
+different canonical origins are never treated as the same translation target.
+
+`train_stage1_rigid_refiner.py` trains a temporal Transformer that predicts
+small hand and object translation residuals. The initial stage intentionally
+does not supervise object rotation across incompatible canonical frames and
+does not optimize local MANO articulation or contact. Those belong to the
+second-stage geometric/contact refiner.
