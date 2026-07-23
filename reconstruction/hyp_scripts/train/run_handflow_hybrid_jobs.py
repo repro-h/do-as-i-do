@@ -24,6 +24,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--status-json", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--keep-videos", action="store_true")
+    parser.add_argument(
+        "--keep-overlay",
+        action="store_true",
+        help="Keep overlay.mp4 but remove orthographic preview videos.",
+    )
     parser.add_argument("--keep-raw", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--limit", type=int, default=0)
@@ -257,7 +262,10 @@ def main() -> None:
             if not args.keep_raw and raw_result.is_file():
                 raw_result.unlink()
             if not args.keep_videos:
-                for name in ("overlay.mp4", "ortho.mp4"):
+                names = ["ortho.mp4", "ortho_side.mp4"]
+                if not args.keep_overlay:
+                    names.append("overlay.mp4")
+                for name in names:
                     video = stream_out / name
                     if video.is_file():
                         video.unlink()
