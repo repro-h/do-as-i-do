@@ -88,7 +88,8 @@ def cam_to_pytorch3d(verts_cam):
     return verts_p3d
 
 
-def make_renderer(fx, fy, cx, cy, width, height, device):
+def make_renderer(fx, fy, cx, cy, width, height, device,
+                  max_faces_per_bin=200000):
     """Create a PyTorch3D renderer with given camera intrinsics."""
     focal_length = torch.tensor([[fx, fy]], dtype=torch.float32, device=device)
     principal_point = torch.tensor([[cx, cy]], dtype=torch.float32, device=device)
@@ -113,7 +114,7 @@ def make_renderer(fx, fy, cx, cy, width, height, device):
         blur_radius=1e-5,
         faces_per_pixel=8,
         bin_size=None,
-        max_faces_per_bin=200000,
+        max_faces_per_bin=max_faces_per_bin,
     )
 
     lights = PointLights(device=device, location=[[0.0, 0.0, -3.0]])
@@ -355,8 +356,8 @@ def main():
     print("Loading mesh...")
     mesh = load_objs_as_meshes([args.mesh], device=device)
 
-    if args.object_color is not None:
-        rgb = _parse_rgb(args.object_color)
+    if args.object_color is not None or mesh.textures is None:
+        rgb = _parse_rgb(args.object_color) if args.object_color is not None else (0.75, 0.45, 0.25)
         verts_list = mesh.verts_list()
         faces_list = mesh.faces_list()
         n_verts = verts_list[0].shape[0]
@@ -366,7 +367,13 @@ def main():
             verts=verts_list, faces=faces_list,
             textures=TexturesVertex(verts_features=verts_features),
         )
-        print(f"Object mesh re-colored to solid RGB={rgb}")
+        reason = "requested" if args.object_color is not None else "mesh has no texture"
+        print(f"Object mesh re-colored to solid RGB={rgb} ({reason})")
+
+    # Dense SAM3D reconstructions can contain close to one million faces. The
+    # coarse rasterizer silently drops faces when this cap is too small.
+    renderer_max_faces_per_bin = max(200000, int(mesh.num_faces_per_mesh().max().item()))
+    print(f"Renderer max_faces_per_bin={renderer_max_faces_per_bin}")
 
     # Load hand data once
     hand_data = None
@@ -395,7 +402,10 @@ def main():
         cy = intr.get("cy_norm", 0.5) * H
         key = (round(fx, 4), round(fy, 4), round(cx, 4), round(cy, 4), W, H)
         if key not in renderer_cache:
-            renderer_cache[key] = make_renderer(fx, fy, cx, cy, W, H, device)
+            renderer_cache[key] = make_renderer(
+                fx, fy, cx, cy, W, H, device,
+                max_faces_per_bin=renderer_max_faces_per_bin,
+            )
         return renderer_cache[key]
 
     # Process all frames
