@@ -28,6 +28,20 @@ def parse_args() -> argparse.Namespace:
         default="keep",
         help="Keep generated HandFlow meshes on detector-invalid frames or replace them with NaN.",
     )
+    parser.add_argument(
+        "--hand-side",
+        choices=("left", "right"),
+        default="right",
+        help="Destination hand side in the Do-As-I-Do hand-mesh archive.",
+    )
+    parser.add_argument(
+        "--mirror-x",
+        action="store_true",
+        help=(
+            "Reflect HandFlow camera-space vertices across x=0 and reverse face "
+            "winding. Use this when a left-hand video was mirrored for right-hand inference."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -111,6 +125,8 @@ def adapt_handflow(
     source_path: Path,
     out_path: Path,
     invalid_hand_mode: str,
+    hand_side: str,
+    mirror_x: bool,
 ) -> dict:
     with np.load(source_path, allow_pickle=True) as data:
         vertices = np.asarray(data["verts_cam"], dtype=np.float32)
@@ -126,17 +142,33 @@ def adapt_handflow(
         )
         fps = float(np.asarray(data["fps"]).reshape(-1)[0]) if "fps" in data else 30.0
 
+    if mirror_x:
+        vertices = vertices.copy()
+        vertices[..., 0] *= -1.0
+        faces = faces[:, [0, 2, 1]].copy()
+
     if invalid_hand_mode == "nan":
         vertices = vertices.copy()
         vertices[~valid] = np.nan
 
-    left_vertices = np.zeros_like(vertices)
-    left_valid = np.zeros(len(vertices), dtype=bool)
+    inactive_vertices = np.zeros_like(vertices)
+    inactive_valid = np.zeros(len(vertices), dtype=bool)
+    if hand_side == "right":
+        right_vertices = vertices
+        right_valid = valid
+        left_vertices = inactive_vertices
+        left_valid = inactive_valid
+    else:
+        right_vertices = inactive_vertices
+        right_valid = inactive_valid
+        left_vertices = vertices
+        left_valid = valid
+
     np.savez_compressed(
         out_path,
-        right_vertices=vertices,
+        right_vertices=right_vertices,
         right_faces=faces,
-        right_valid=valid,
+        right_valid=right_valid,
         left_vertices=left_vertices,
         left_faces=faces.copy(),
         left_valid=left_valid,
@@ -151,6 +183,8 @@ def adapt_handflow(
         "num_vertices": int(vertices.shape[1]),
         "num_faces": int(len(faces)),
         "invalid_hand_mode": invalid_hand_mode,
+        "hand_side": hand_side,
+        "mirror_x": bool(mirror_x),
     }
 
 
@@ -174,7 +208,13 @@ def main() -> None:
         pose_path,
         layout_path,
     )
-    hand_summary = adapt_handflow(handflow_path, hand_path, args.invalid_hand_mode)
+    hand_summary = adapt_handflow(
+        handflow_path,
+        hand_path,
+        args.invalid_hand_mode,
+        args.hand_side,
+        args.mirror_x,
+    )
 
     summary = {
         "foundationpose_json": str(pose_path),
