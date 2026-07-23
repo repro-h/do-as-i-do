@@ -19,6 +19,14 @@ modules/sam3/output/
 # Machine-local DexYCB links, inference caches, audits, and training windows.
 data/dexycb/
 
+# Machine-local reconstruction runs and generated artifacts.
+/dexycb_runs/
+*.json
+*.obj
+*.txt
+*.png
+*.jpg
+
 # OS / editor
 .DS_Store
 *.swp
