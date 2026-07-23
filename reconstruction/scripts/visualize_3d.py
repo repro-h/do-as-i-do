@@ -56,6 +56,14 @@ def parse_args():
                         help='Path to object mesh (.obj)')
     parser.add_argument('--hand-meshes', type=str, default=None,
                         help='Path to hand meshes NPZ file')
+    parser.add_argument('--gt-hand-meshes', type=str, default=None,
+                        help='Optional GT hand meshes NPZ file')
+    parser.add_argument('--gt-object-layout-json', type=str, default=None,
+                        help='Optional GT object camera-frame layout JSON')
+    parser.add_argument('--gt-object-mesh', type=str, default=None,
+                        help='Optional GT object mesh')
+    parser.add_argument('--gt-object-scale', type=float, default=0.001,
+                        help='Scale applied to the GT object mesh (DexYCB YCB OBJ files use millimeters)')
     parser.add_argument('--hands', type=str, default='both',
                         choices=['left', 'right', 'both'],
                         help='Which hand(s) to render')
@@ -169,6 +177,7 @@ def main():
 
     # Load hand meshes
     hand_data = None
+    gt_hand_data = None
     hands_to_render = []
     hand_colors = {'left': (204, 128, 128), 'right': (128, 128, 204)}
     if args.hand_meshes:
@@ -181,6 +190,29 @@ def main():
         for hand in hands_to_render:
             n = hand_data[f'{hand}_vertices'].shape[0]
             print(f"  {hand} hand: {n} frames, {hand_data[f'{hand}_vertices'].shape[1]} vertices")
+    if args.gt_hand_meshes:
+        if not os.path.exists(args.gt_hand_meshes):
+            print(f"[error] GT hand meshes not found: {args.gt_hand_meshes}")
+            sys.exit(1)
+        print("Loading GT hand meshes...")
+        gt_hand_data = np.load(args.gt_hand_meshes)
+        if not hands_to_render:
+            hands_to_render = ['left', 'right'] if args.hands == 'both' else [args.hands]
+
+    gt_layout = None
+    gt_mesh_verts = None
+    gt_mesh_faces = None
+    if args.gt_object_layout_json or args.gt_object_mesh:
+        if not args.gt_object_layout_json or not args.gt_object_mesh:
+            print("[error] Pass both --gt-object-layout-json and --gt-object-mesh")
+            sys.exit(1)
+        print("Loading GT object...")
+        gt_layout = load_layout(args.gt_object_layout_json)
+        gt_mesh = trimesh.load_mesh(args.gt_object_mesh, process=False)
+        if not isinstance(gt_mesh, trimesh.Trimesh):
+            gt_mesh = gt_mesh.dump(concatenate=True)
+        gt_mesh_verts = np.asarray(gt_mesh.vertices)
+        gt_mesh_faces = np.asarray(gt_mesh.faces)
 
     # Camera intrinsics
     fov_y = 2.0 * math.atan(args.height / (2.0 * args.fy))
@@ -228,6 +260,8 @@ def main():
         "FPS", min=1, max=60, step=1, initial_value=int(args.fps),
     )
     texture_checkbox = server.gui.add_checkbox("Enable Texture", initial_value=False)
+    prediction_checkbox = server.gui.add_checkbox("Show Prediction", initial_value=True)
+    gt_checkbox = server.gui.add_checkbox("Show GT", initial_value=True)
 
     # Playback state
     playing = False
@@ -319,15 +353,16 @@ def main():
         # Update object mesh
         if texture_checkbox.value:
             mesh_cam = trimesh.Trimesh(vertices=verts_cam, faces=mesh_faces, visual=mesh_visual)
-            server.scene.add_mesh_trimesh("/object_mesh", mesh=mesh_cam)
+            pred_object_handle = server.scene.add_mesh_trimesh("/prediction/object_mesh", mesh=mesh_cam)
         else:
-            server.scene.add_mesh_simple(
-                "/object_mesh",
+            pred_object_handle = server.scene.add_mesh_simple(
+                "/prediction/object_mesh",
                 vertices=verts_cam.astype(np.float32),
                 faces=mesh_faces.astype(np.uint32),
                 color=(180, 180, 180),
                 side="double",
             )
+        pred_object_handle.visible = prediction_checkbox.value
 
         # Update hand meshes
         if hand_data is not None:
@@ -336,13 +371,56 @@ def main():
                 hand_faces = hand_data[f'{hand}_faces']
                 # Clamp frame index to available hand frames
                 hi = min(frame_idx, hand_verts.shape[0] - 1)
-                server.scene.add_mesh_simple(
-                    f"/hand_{hand}",
+                hand_handle = server.scene.add_mesh_simple(
+                    f"/prediction/hand_{hand}",
                     vertices=hand_verts[hi].astype(np.float32),
                     faces=hand_faces.astype(np.uint32),
                     color=hand_colors[hand],
                     side="double",
                 )
+                hand_handle.visible = prediction_checkbox.value
+
+        if gt_layout is not None and frame_idx in gt_layout:
+            gt_pose = gt_layout[frame_idx]
+            gt_quat = gt_pose["quat"]
+            gt_xyzw = np.asarray([gt_quat[1], gt_quat[2], gt_quat[3], gt_quat[0]])
+            gt_rotation = R.from_quat(gt_xyzw).as_matrix()
+            gt_translation = np.asarray(gt_pose["translation"])
+            gt_vertices = (
+                gt_mesh_verts * args.gt_object_scale
+            ) @ gt_rotation.T + gt_translation
+            gt_object_handle = server.scene.add_mesh_simple(
+                "/gt/object_mesh",
+                vertices=gt_vertices.astype(np.float32),
+                faces=gt_mesh_faces.astype(np.uint32),
+                color=(60, 220, 220),
+                opacity=0.45,
+                side="double",
+            )
+            gt_object_handle.visible = gt_checkbox.value
+
+        if gt_hand_data is not None:
+            gt_colors = {'left': (80, 255, 100), 'right': (80, 255, 100)}
+            for hand in hands_to_render:
+                gt_vertices = gt_hand_data[f'{hand}_vertices']
+                gt_faces = gt_hand_data[f'{hand}_faces']
+                gt_valid = gt_hand_data.get(f'{hand}_valid')
+                hi = min(frame_idx, gt_vertices.shape[0] - 1)
+                is_valid = (
+                    np.isfinite(gt_vertices[hi]).all()
+                    and (gt_valid is None or bool(gt_valid[hi]))
+                )
+                if not is_valid:
+                    continue
+                gt_hand_handle = server.scene.add_mesh_simple(
+                    f"/gt/hand_{hand}",
+                    vertices=gt_vertices[hi].astype(np.float32),
+                    faces=gt_faces.astype(np.uint32),
+                    color=gt_colors[hand],
+                    opacity=0.5,
+                    side="double",
+                )
+                gt_hand_handle.visible = gt_checkbox.value
 
     # Initial frame
     update_frame(0)
@@ -353,6 +431,14 @@ def main():
 
     @texture_checkbox.on_update
     def on_texture_change(_):
+        update_frame(int(frame_slider.value))
+
+    @prediction_checkbox.on_update
+    def on_prediction_change(_):
+        update_frame(int(frame_slider.value))
+
+    @gt_checkbox.on_update
+    def on_gt_change(_):
         update_frame(int(frame_slider.value))
 
     @play_button.on_click
