@@ -206,17 +206,20 @@ def audit_stream(record: dict, handflow_root: Path, mano_data_dir: Path, samples
             continue
         pose = poses[frame]
         object_translations[index] = pose[:3, 3]
-        if pred_valid[index]:
+        if joint_valid[index]:
             relative_centers[index] = pred_centers[index] - pose[:3, 3]
             object_vertices = canonical @ pose[:3, :3].T + pose[:3, 3]
             distances, _ = cKDTree(object_vertices).query(pred_vertices[index], k=1)
             contact_min.append(float(np.min(distances)))
             contact_p10.append(float(np.quantile(distances, 0.1)))
 
-    pred_speed, pred_acc = motion_metrics(pred_centers, pred_valid)
-    gt_speed, gt_acc = motion_metrics(gt_centers, gt_valid)
+    # Compare temporal hand motion only where both prediction and DexYCB hand
+    # annotations are valid. HandFlow may emit plausible meshes while the hand
+    # is outside the image, which must not become contact supervision.
+    pred_speed, pred_acc = motion_metrics(pred_centers, joint_valid)
+    gt_speed, gt_acc = motion_metrics(gt_centers, joint_valid)
     object_speed, object_acc = motion_metrics(object_translations, object_valid)
-    relative_valid = pred_valid & object_valid & np.isfinite(relative_centers).all(axis=1)
+    relative_valid = joint_valid & object_valid & np.isfinite(relative_centers).all(axis=1)
     relative_speed, relative_acc = motion_metrics(relative_centers, relative_valid)
 
     return {
@@ -255,6 +258,10 @@ def main() -> None:
     rows = []
     failures = []
     aggregate = defaultdict(list)
+    aggregate_by_side = {
+        "left": defaultdict(list),
+        "right": defaultdict(list),
+    }
     for index, record in enumerate(records, start=1):
         print(f"[{index}/{len(records)}] {record['stream_id']}")
         try:
@@ -265,6 +272,7 @@ def main() -> None:
             for key, value in row.items():
                 if isinstance(value, dict) and value.get("count", 0) > 0:
                     aggregate[key].append(value["median"])
+                    aggregate_by_side[row["hand_side"]][key].append(value["median"])
         except Exception as error:
             failures.append(
                 {
@@ -285,6 +293,13 @@ def main() -> None:
         "num_failed": len(failures),
         "aggregate_stream_medians": {
             key: quantiles(values) for key, values in sorted(aggregate.items())
+        },
+        "aggregate_stream_medians_by_side": {
+            side: {
+                key: quantiles(values)
+                for key, values in sorted(side_values.items())
+            }
+            for side, side_values in aggregate_by_side.items()
         },
         "failures": failures,
         "streams": rows,

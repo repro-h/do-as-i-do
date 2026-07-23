@@ -72,3 +72,8 @@ HandFlow-to-GT hand error, temporal speed/acceleration, FoundationPose
 translation motion, relative hand-object motion, and unsigned hand-to-SAM3D
 surface distances. It intentionally does not report signed penetration until a
 reliable collision representation is selected.
+
+Hand/contact temporal metrics are gated by both HandFlow validity and DexYCB GT
+hand validity. This prevents off-screen HandFlow hallucinations from becoming
+contact supervision. The future training dataset must carry the same explicit
+visibility mask.
