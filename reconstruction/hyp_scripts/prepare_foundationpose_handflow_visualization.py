@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -21,6 +22,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--foundationpose-json", required=True)
     parser.add_argument("--frame-map-json", required=True)
     parser.add_argument("--handflow-npz", required=True)
+    parser.add_argument(
+        "--stage1-prediction",
+        default=None,
+        help="Optional stage1_rigid_prediction.npz with hand/object deltas.",
+    )
     parser.add_argument("--out-dir", required=True)
     parser.add_argument(
         "--invalid-hand-mode",
@@ -65,6 +71,7 @@ def adapt_layout(
     frame_map_payload: dict,
     source_pose_path: Path,
     out_path: Path,
+    object_delta_by_frame: Optional[dict[str, np.ndarray]] = None,
 ) -> dict:
     pose_rows = pose_payload.get("by_frame") or pose_payload.get("frames") or {}
     original_to_output = {
@@ -91,6 +98,9 @@ def adapt_layout(
             missing_pose_frames.append(original_frame)
             continue
 
+        translation = pose[:3, 3].copy()
+        if object_delta_by_frame and original_frame in object_delta_by_frame:
+            translation += object_delta_by_frame[original_frame]
         objects.append(
             {
                 "frame_idx": output_index,
@@ -99,7 +109,7 @@ def adapt_layout(
                 "mode": row.get("mode"),
                 "local_to_scene": {
                     "quat_wxyz_camera_frame": matrix_to_wxyz(pose[:3, :3]),
-                    "translation_camera_frame": pose[:3, 3].astype(float).tolist(),
+                    "translation_camera_frame": translation.astype(float).tolist(),
                     "scale": [source_scale, source_scale, source_scale],
                 },
             }
@@ -127,6 +137,8 @@ def adapt_handflow(
     invalid_hand_mode: str,
     hand_side: str,
     mirror_x: bool,
+    hand_delta: Optional[np.ndarray] = None,
+    stage1_predicted: Optional[np.ndarray] = None,
 ) -> dict:
     with np.load(source_path, allow_pickle=True) as data:
         vertices = np.asarray(data["verts_cam"], dtype=np.float32)
@@ -146,6 +158,17 @@ def adapt_handflow(
         vertices = vertices.copy()
         vertices[..., 0] *= -1.0
         faces = faces[:, [0, 2, 1]].copy()
+
+    num_stage1_frames = 0
+    if hand_delta is not None:
+        count = min(len(vertices), len(hand_delta))
+        active = np.ones(count, dtype=bool)
+        if stage1_predicted is not None:
+            active &= np.asarray(stage1_predicted[:count]).astype(bool)
+        vertices = vertices.copy()
+        active_indices = np.flatnonzero(active)
+        vertices[active_indices] += hand_delta[active_indices, None, :]
+        num_stage1_frames = int(active.sum())
 
     if invalid_hand_mode == "nan":
         vertices = vertices.copy()
@@ -185,6 +208,7 @@ def adapt_handflow(
         "invalid_hand_mode": invalid_hand_mode,
         "hand_side": hand_side,
         "mirror_x": bool(mirror_x),
+        "num_stage1_frames": num_stage1_frames,
     }
 
 
@@ -193,6 +217,11 @@ def main() -> None:
     pose_path = Path(args.foundationpose_json).expanduser().resolve()
     frame_map_path = Path(args.frame_map_json).expanduser().resolve()
     handflow_path = Path(args.handflow_npz).expanduser().resolve()
+    stage1_path = (
+        Path(args.stage1_prediction).expanduser().resolve()
+        if args.stage1_prediction
+        else None
+    )
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -202,11 +231,26 @@ def main() -> None:
 
     pose_payload = load_json(pose_path)
     frame_map_payload = load_json(frame_map_path)
+    hand_delta = None
+    stage1_predicted = None
+    object_delta_by_frame = None
+    if stage1_path is not None:
+        with np.load(stage1_path, allow_pickle=False) as data:
+            frame_ids = [str(value).zfill(6) for value in data["frame_ids"]]
+            hand_delta = np.asarray(data["hand_delta"], dtype=np.float32)
+            object_delta = np.asarray(data["object_delta"], dtype=np.float32)
+            stage1_predicted = np.asarray(data["predicted"]).astype(bool)
+        object_delta_by_frame = {
+            frame: object_delta[index]
+            for index, frame in enumerate(frame_ids)
+            if stage1_predicted[index]
+        }
     layout_summary = adapt_layout(
         pose_payload,
         frame_map_payload,
         pose_path,
         layout_path,
+        object_delta_by_frame,
     )
     hand_summary = adapt_handflow(
         handflow_path,
@@ -214,12 +258,15 @@ def main() -> None:
         args.invalid_hand_mode,
         args.hand_side,
         args.mirror_x,
+        hand_delta,
+        stage1_predicted,
     )
 
     summary = {
         "foundationpose_json": str(pose_path),
         "frame_map_json": str(frame_map_path),
         "handflow_npz": str(handflow_path),
+        "stage1_prediction": str(stage1_path) if stage1_path else None,
         "layout_json": str(layout_path),
         "hand_meshes_npz": str(hand_path),
         "num_object_pose_frames": int(layout_summary["num_objects"]),
