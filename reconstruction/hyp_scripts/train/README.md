@@ -117,3 +117,8 @@ Use `visualize_stage1_dexycb.py` to prepare GT overlays and launch paired
 before/after Viser viewers. Without `--stream-id` it selects a representative
 validation stream whose relative median error improved; pass an exact stream
 ID to inspect a specific prediction. Prepared assets are cached per stream.
+
+Use `render_stage1_dexycb_comparison.py` for deterministic offline rendering.
+It writes every RGB frame to the output timeline and produces original,
+Stage-1-corrected, and side-by-side MP4 files without depending on Viser's
+browser update rate.
