@@ -127,6 +127,10 @@ repulsion ignores dilated hand-occlusion pixels, attraction uses visible
 DexYCB object pixels, and depth fitting uses valid visible RGB-D object pixels.
 It does not read DexYCB object poses.
 
+Use `audit_isolated_object_fit.py` after fitting. It compares initial and
+fitted visible-mask IoU/coverage/precision, spill ratio, and visible RGB-D depth
+errors, and saves worst-regression contour previews without rerunning fitting.
+
 Run `audit_stage1_rigid_supervision.py` before training. It reports hand,
 object, and relative residual distributions, 2D projection error, left/right
 breakdowns, and streams exceeding the configured residual range.
