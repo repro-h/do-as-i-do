@@ -107,3 +107,8 @@ second-stage geometric/contact refiner.
 Run `audit_stage1_rigid_supervision.py` before training. It reports hand,
 object, and relative residual distributions, 2D projection error, left/right
 breakdowns, and streams exceeding the configured residual range.
+
+Use `apply_stage1_rigid_refiner.py` with `best.pt` to aggregate overlapping
+window predictions into one hand/object translation residual per frame. The
+output keeps prediction counts and corrected centers for evaluation and later
+mesh/pose visualization adapters.
