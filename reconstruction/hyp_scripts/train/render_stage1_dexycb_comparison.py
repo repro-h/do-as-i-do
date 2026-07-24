@@ -43,6 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--alpha", type=float, default=0.72)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--view",
+        choices=("camera", "side", "orbit"),
+        default="camera",
+        help="RGB camera overlay, fixed 3D side view, or rotating 3D view.",
+    )
     parser.add_argument("--object-color", default="0.95,0.20,0.55")
     parser.add_argument("--hand-color", default="0.10,0.65,0.95")
     return parser.parse_args()
@@ -168,6 +174,29 @@ def object_vertices_camera(
     return torch.as_tensor(transformed, dtype=torch.float32, device=device)
 
 
+def transform_to_view(
+    vertices: torch.Tensor,
+    center: np.ndarray,
+    forward: np.ndarray,
+    distance: float,
+) -> torch.Tensor:
+    """Map camera-frame points to a synthetic right/down/forward camera."""
+    down = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+    forward = np.asarray(forward, dtype=np.float32)
+    forward /= np.linalg.norm(forward)
+    right = np.cross(down, forward)
+    right /= np.linalg.norm(right)
+    relative = vertices - torch.as_tensor(center, dtype=torch.float32, device=vertices.device)
+    basis = torch.as_tensor(
+        np.stack([right, down, forward], axis=1),
+        dtype=torch.float32,
+        device=vertices.device,
+    )
+    transformed = relative @ basis
+    transformed[:, 2] += float(distance)
+    return transformed
+
+
 def render_overlay(
     image_bgr: np.ndarray,
     object_vertices: np.ndarray,
@@ -181,6 +210,7 @@ def render_overlay(
     object_color: tuple[float, float, float],
     hand_color: tuple[float, float, float],
     alpha: float,
+    view_spec: Optional[tuple[np.ndarray, np.ndarray, float]] = None,
 ) -> np.ndarray:
     vertices_list = []
     faces_list = []
@@ -189,6 +219,8 @@ def render_overlay(
 
     if object_transform is not None:
         vertices = object_vertices_camera(object_vertices, object_transform, device)
+        if view_spec is not None:
+            vertices = transform_to_view(vertices, *view_spec)
         faces = torch.as_tensor(object_faces, dtype=torch.int64, device=device)
         vertices_list.append(camera_to_pytorch3d(vertices))
         faces_list.append(faces + vertex_offset)
@@ -200,6 +232,8 @@ def render_overlay(
 
     if hand_valid and np.isfinite(hand_vertices).all():
         vertices = torch.as_tensor(hand_vertices, dtype=torch.float32, device=device)
+        if view_spec is not None:
+            vertices = transform_to_view(vertices, *view_spec)
         faces = torch.as_tensor(hand_faces, dtype=torch.int64, device=device)
         vertices_list.append(camera_to_pytorch3d(vertices))
         faces_list.append(faces + vertex_offset)
@@ -227,6 +261,43 @@ def render_overlay(
         image_bgr[mask], 1.0 - alpha, render_bgr[mask], alpha, 0.0
     )
     return result
+
+
+def scene_bounds(
+    object_vertices: np.ndarray,
+    layouts: tuple[dict[int, dict], dict[int, dict]],
+    hands: tuple[
+        tuple[np.ndarray, np.ndarray, np.ndarray],
+        tuple[np.ndarray, np.ndarray, np.ndarray],
+    ],
+) -> tuple[np.ndarray, float]:
+    samples = []
+    vertex_stride = max(1, len(object_vertices) // 2000)
+    for layout in layouts:
+        for transform in layout.values():
+            quaternion = transform["quat_wxyz_camera_frame"]
+            xyzw = [quaternion[1], quaternion[2], quaternion[3], quaternion[0]]
+            rotation = Rotation.from_quat(xyzw).as_matrix().astype(np.float32)
+            translation = np.asarray(
+                transform["translation_camera_frame"], dtype=np.float32
+            )
+            scale = np.asarray(
+                transform.get("scale", [1.0, 1.0, 1.0]), dtype=np.float32
+            )
+            vertices = object_vertices[::vertex_stride] * scale[None, :]
+            samples.append(vertices @ rotation.T + translation[None, :])
+    for vertices, _, valid in hands:
+        valid_vertices = vertices[valid]
+        if len(valid_vertices):
+            samples.append(valid_vertices[:, ::20, :].reshape(-1, 3))
+    if not samples:
+        raise RuntimeError("Cannot estimate 3D scene bounds")
+    points = np.concatenate(samples, axis=0)
+    lower = np.quantile(points, 0.01, axis=0)
+    upper = np.quantile(points, 0.99, axis=0)
+    center = (lower + upper) * 0.5
+    extent = float(np.max(upper - lower))
+    return center.astype(np.float32), max(extent, 0.05)
 
 
 def make_writer(path: Path, fps: float, size: tuple[int, int]) -> cv2.VideoWriter:
@@ -259,13 +330,31 @@ def main() -> None:
         Path(args.corrected_hand_meshes).expanduser().resolve(), args.hand_side
     )
     max_faces = max(200000, int(len(object_faces) + len(original_hand[1])))
+    view_center = None
+    view_distance = None
+    if args.view == "camera":
+        render_fx, render_fy = args.fx, args.fy
+        render_cx, render_cy = args.cx, args.cy
+    else:
+        view_center, scene_extent = scene_bounds(
+            object_vertices,
+            (original_layout, corrected_layout),
+            (original_hand, corrected_hand),
+        )
+        view_distance = scene_extent * 1.35
+        render_fx = render_fy = min(width, height) * 1.05
+        render_cx, render_cy = width * 0.5, height * 0.5
+        print(
+            f"3D view center={view_center.tolist()} "
+            f"extent={scene_extent:.4f} distance={view_distance:.4f}"
+        )
     renderer = make_renderer(
         width,
         height,
-        args.fx,
-        args.fy,
-        args.cx,
-        args.cy,
+        render_fx,
+        render_fy,
+        render_cx,
+        render_cy,
         device,
         max_faces,
     )
@@ -284,6 +373,17 @@ def main() -> None:
             image = cv2.imread(str(frame_path))
             if image is None:
                 raise RuntimeError(f"Failed to read {frame_path}")
+            view_spec = None
+            if args.view != "camera":
+                image = np.full_like(image, 245)
+                if args.view == "side":
+                    forward = np.asarray([-1.0, 0.0, 0.0], dtype=np.float32)
+                else:
+                    angle = 2.0 * np.pi * frame_index / max(len(frames), 1)
+                    forward = np.asarray(
+                        [np.sin(angle), 0.0, np.cos(angle)], dtype=np.float32
+                    )
+                view_spec = (view_center, forward, view_distance)
             original = render_overlay(
                 image,
                 object_vertices,
@@ -297,6 +397,7 @@ def main() -> None:
                 object_color,
                 hand_color,
                 args.alpha,
+                view_spec,
             )
             corrected = render_overlay(
                 image,
@@ -311,6 +412,7 @@ def main() -> None:
                 object_color,
                 hand_color,
                 args.alpha,
+                view_spec,
             )
             cv2.putText(
                 original,
@@ -364,6 +466,7 @@ def main() -> None:
     summary = {
         "num_frames": len(frames),
         "fps": args.fps,
+        "view": args.view,
         "original": str(out_dir / "original.mp4"),
         "corrected": str(out_dir / "stage1_corrected.mp4"),
         "comparison": str(out_dir / "before_after.mp4"),
