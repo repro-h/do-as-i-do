@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -36,7 +37,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-velocity", type=float, default=0.25)
     parser.add_argument("--w-acceleration", type=float, default=0.1)
     parser.add_argument("--w-residual", type=float, default=0.01)
-    parser.add_argument("--max-residual-mm", type=float, default=50.0)
+    parser.add_argument("--max-residual-mm", type=float, default=100.0)
+    parser.add_argument("--max-target-hand-mm", type=float, default=120.0)
+    parser.add_argument("--max-target-object-mm", type=float, default=100.0)
+    parser.add_argument("--max-target-relative-mm", type=float, default=150.0)
+    parser.add_argument("--smooth-l1-beta-mm", type=float, default=10.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     return parser.parse_args()
@@ -47,11 +52,26 @@ def load_jsonl(path: Path) -> list[dict]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
+@lru_cache(maxsize=128)
+def load_supervision(path_text: str) -> dict[str, np.ndarray]:
+    with np.load(path_text, allow_pickle=False) as raw:
+        return {key: np.asarray(raw[key]) for key in raw.files}
+
+
 class WindowDataset(Dataset):
-    def __init__(self, path: Path):
+    def __init__(
+        self,
+        path: Path,
+        max_target_hand_m: float,
+        max_target_object_m: float,
+        max_target_relative_m: float,
+    ):
         self.rows = load_jsonl(path)
         if not self.rows:
             raise RuntimeError(f"No windows in {path}")
+        self.max_target_hand_m = max_target_hand_m
+        self.max_target_object_m = max_target_object_m
+        self.max_target_relative_m = max_target_relative_m
 
     def __len__(self):
         return len(self.rows)
@@ -59,25 +79,38 @@ class WindowDataset(Dataset):
     def __getitem__(self, index):
         row = self.rows[index]
         start, end = int(row["start"]), int(row["end"])
-        with np.load(row["supervision_npz"], allow_pickle=False) as raw:
-            hand = np.asarray(raw["pred_hand_center"][start:end], dtype=np.float32)
-            obj = np.asarray(raw["pred_object_center"][start:end], dtype=np.float32)
-            rot6d = np.asarray(raw["pred_object_rot6d"][start:end], dtype=np.float32)
-            gt_hand = np.asarray(raw["gt_hand_center"][start:end], dtype=np.float32)
-            gt_obj = np.asarray(raw["gt_object_center"][start:end], dtype=np.float32)
-            hand_mask = np.asarray(
-                raw["hand_supervision_valid"][start:end], dtype=bool
-            )
-            object_mask = np.asarray(
-                raw["object_supervision_valid"][start:end], dtype=bool
-            )
-            relative_mask = np.asarray(
-                raw["relative_supervision_valid"][start:end], dtype=bool
-            )
-            intrinsics = np.asarray(raw["intrinsics"], dtype=np.float32)
+        raw = load_supervision(row["supervision_npz"])
+        hand = np.asarray(raw["pred_hand_center"][start:end], dtype=np.float32)
+        obj = np.asarray(raw["pred_object_center"][start:end], dtype=np.float32)
+        rot6d = np.asarray(raw["pred_object_rot6d"][start:end], dtype=np.float32)
+        gt_hand = np.asarray(raw["gt_hand_center"][start:end], dtype=np.float32)
+        gt_obj = np.asarray(raw["gt_object_center"][start:end], dtype=np.float32)
+        hand_mask = np.asarray(
+            raw["hand_supervision_valid"][start:end], dtype=bool
+        )
+        object_mask = np.asarray(
+            raw["object_supervision_valid"][start:end], dtype=bool
+        )
+        relative_mask = np.asarray(
+            raw["relative_supervision_valid"][start:end], dtype=bool
+        )
+        intrinsics = np.asarray(raw["intrinsics"], dtype=np.float32)
 
         hand_safe = np.nan_to_num(hand)
         obj_safe = np.nan_to_num(obj)
+        gt_hand_safe = np.nan_to_num(gt_hand)
+        gt_obj_safe = np.nan_to_num(gt_obj)
+        hand_delta = gt_hand_safe - hand_safe
+        object_delta = gt_obj_safe - obj_safe
+        relative_delta = hand_delta - object_delta
+        hand_mask &= np.linalg.norm(hand_delta, axis=-1) <= self.max_target_hand_m
+        object_mask &= (
+            np.linalg.norm(object_delta, axis=-1) <= self.max_target_object_m
+        )
+        relative_mask &= hand_mask & object_mask
+        relative_mask &= (
+            np.linalg.norm(relative_delta, axis=-1) <= self.max_target_relative_m
+        )
         rot_safe = np.nan_to_num(rot6d)
         hand_velocity = np.zeros_like(hand_safe)
         object_velocity = np.zeros_like(obj_safe)
@@ -100,8 +133,8 @@ class WindowDataset(Dataset):
             "features": torch.from_numpy(features),
             "pred_hand": torch.from_numpy(hand_safe),
             "pred_object": torch.from_numpy(obj_safe),
-            "gt_hand": torch.from_numpy(np.nan_to_num(gt_hand)),
-            "gt_object": torch.from_numpy(np.nan_to_num(gt_obj)),
+            "gt_hand": torch.from_numpy(gt_hand_safe),
+            "gt_object": torch.from_numpy(gt_obj_safe),
             "hand_mask": torch.from_numpy(hand_mask),
             "object_mask": torch.from_numpy(object_mask),
             "relative_mask": torch.from_numpy(relative_mask),
@@ -148,18 +181,20 @@ class RigidTemporalRefiner(nn.Module):
         return residual[..., :3], residual[..., 3:]
 
 
-def masked_smooth_l1(value, target, mask):
-    error = F.smooth_l1_loss(value, target, reduction="none").mean(dim=-1)
+def masked_smooth_l1(value, target, mask, beta):
+    error = F.smooth_l1_loss(
+        value, target, reduction="none", beta=beta
+    ).mean(dim=-1)
     weights = mask.float()
     return (error * weights).sum() / weights.sum().clamp_min(1.0)
 
 
-def temporal_loss(value, target, mask, order: int):
+def temporal_loss(value, target, mask, order: int, beta: float):
     for _ in range(order):
         value = value[:, 1:] - value[:, :-1]
         target = target[:, 1:] - target[:, :-1]
         mask = mask[:, 1:] & mask[:, :-1]
-    return masked_smooth_l1(value, target, mask)
+    return masked_smooth_l1(value, target, mask, beta)
 
 
 def project_points(points, intrinsics):
@@ -175,6 +210,7 @@ def project_points(points, intrinsics):
 
 def compute_loss(model, batch, args):
     batch = {key: value.to(args.device) for key, value in batch.items()}
+    beta = args.smooth_l1_beta_mm / 1000.0
     hand_delta, object_delta = model(
         batch["features"], args.max_residual_mm / 1000.0
     )
@@ -197,30 +233,32 @@ def compute_loss(model, batch, args):
             project_points(corrected_hand, batch["intrinsics"]) / 100.0,
             project_points(batch["gt_hand"], batch["intrinsics"]) / 100.0,
             hand_projection_mask,
+            beta,
         )
         + masked_smooth_l1(
             project_points(corrected_object, batch["intrinsics"]) / 100.0,
             project_points(batch["gt_object"], batch["intrinsics"]) / 100.0,
             object_projection_mask,
+            beta,
         )
     )
 
     losses = {
         "hand": masked_smooth_l1(
-            corrected_hand, batch["gt_hand"], batch["hand_mask"]
+            corrected_hand, batch["gt_hand"], batch["hand_mask"], beta
         ),
         "object": masked_smooth_l1(
-            corrected_object, batch["gt_object"], batch["object_mask"]
+            corrected_object, batch["gt_object"], batch["object_mask"], beta
         ),
         "relative": masked_smooth_l1(
-            corrected_relative, gt_relative, batch["relative_mask"]
+            corrected_relative, gt_relative, batch["relative_mask"], beta
         ),
         "projection": projection,
         "velocity": temporal_loss(
-            corrected_relative, gt_relative, batch["relative_mask"], 1
+            corrected_relative, gt_relative, batch["relative_mask"], 1, beta
         ),
         "acceleration": temporal_loss(
-            corrected_relative, gt_relative, batch["relative_mask"], 2
+            corrected_relative, gt_relative, batch["relative_mask"], 2, beta
         ),
         "residual": (hand_delta.square().mean() + object_delta.square().mean()),
     }
@@ -233,7 +271,25 @@ def compute_loss(model, batch, args):
         + args.w_acceleration * losses["acceleration"]
         + args.w_residual * losses["residual"]
     )
-    return total, losses
+    return total, losses, {
+        "corrected_hand": corrected_hand,
+        "corrected_object": corrected_object,
+        "corrected_relative": corrected_relative,
+        "gt_relative": gt_relative,
+        "batch": batch,
+    }
+
+
+def error_quantiles(values):
+    if not values:
+        return {"median_mm": None, "p90_mm": None}
+    array = torch.cat(values)
+    if not len(array):
+        return {"median_mm": None, "p90_mm": None}
+    return {
+        "median_mm": float(torch.quantile(array, 0.5) * 1000.0),
+        "p90_mm": float(torch.quantile(array, 0.9) * 1000.0),
+    }
 
 
 def run_epoch(model, loader, args, optimizer=None):
@@ -241,19 +297,64 @@ def run_epoch(model, loader, args, optimizer=None):
     model.train(training)
     sums = {}
     count = 0
+    errors = {
+        "initial_hand": [],
+        "corrected_hand": [],
+        "initial_object": [],
+        "corrected_object": [],
+        "initial_relative": [],
+        "corrected_relative": [],
+    }
     for batch in loader:
         with torch.set_grad_enabled(training):
-            total, losses = compute_loss(model, batch, args)
+            total, losses, aux = compute_loss(model, batch, args)
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 total.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
+            else:
+                values = aux["batch"]
+                definitions = (
+                    (
+                        "hand",
+                        values["pred_hand"],
+                        aux["corrected_hand"],
+                        values["gt_hand"],
+                        values["hand_mask"],
+                    ),
+                    (
+                        "object",
+                        values["pred_object"],
+                        aux["corrected_object"],
+                        values["gt_object"],
+                        values["object_mask"],
+                    ),
+                    (
+                        "relative",
+                        values["pred_hand"] - values["pred_object"],
+                        aux["corrected_relative"],
+                        aux["gt_relative"],
+                        values["relative_mask"],
+                    ),
+                )
+                for name, initial, corrected, target, mask in definitions:
+                    errors[f"initial_{name}"].append(
+                        torch.linalg.norm(initial[mask] - target[mask], dim=-1).cpu()
+                    )
+                    errors[f"corrected_{name}"].append(
+                        torch.linalg.norm(corrected[mask] - target[mask], dim=-1).cpu()
+                    )
         values = {"total": total, **losses}
         for key, value in values.items():
             sums[key] = sums.get(key, 0.0) + float(value.detach())
         count += 1
-    return {key: value / max(count, 1) for key, value in sums.items()}
+    metrics = {key: value / max(count, 1) for key, value in sums.items()}
+    if not training:
+        metrics["errors"] = {
+            key: error_quantiles(value) for key, value in errors.items()
+        }
+    return metrics
 
 
 def main() -> None:
@@ -263,8 +364,17 @@ def main() -> None:
     torch.manual_seed(args.seed)
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    train_data = WindowDataset(Path(args.train_windows).expanduser().resolve())
-    val_data = WindowDataset(Path(args.val_windows).expanduser().resolve())
+    dataset_args = (
+        args.max_target_hand_mm / 1000.0,
+        args.max_target_object_mm / 1000.0,
+        args.max_target_relative_mm / 1000.0,
+    )
+    train_data = WindowDataset(
+        Path(args.train_windows).expanduser().resolve(), *dataset_args
+    )
+    val_data = WindowDataset(
+        Path(args.val_windows).expanduser().resolve(), *dataset_args
+    )
     train_loader = DataLoader(
         train_data,
         batch_size=args.batch_size,
