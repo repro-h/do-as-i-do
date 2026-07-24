@@ -115,6 +115,12 @@ changes in the predicted correction. They are separate from trajectory losses:
 the latter match GT motion, while delta smoothness prevents the refiner itself
 from injecting visible jitter.
 
+`stabilize_foundationpose_object.py` merges an object-only translation
+prediction into its source FoundationPose track and applies motion-aware local
+SO(3) smoothing to each contiguous rotation segment. The output preserves the
+FoundationPose JSON schema and includes before/after angular speed and
+acceleration audits.
+
 Run `audit_stage1_rigid_supervision.py` before training. It reports hand,
 object, and relative residual distributions, 2D projection error, left/right
 breakdowns, and streams exceeding the configured residual range.

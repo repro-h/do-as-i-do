@@ -51,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--object-color", default="0.95,0.20,0.55")
     parser.add_argument("--hand-color", default="0.10,0.65,0.95")
+    parser.add_argument("--original-label", default="Before")
+    parser.add_argument("--corrected-label", default="Stage 1")
     return parser.parse_args()
 
 
@@ -416,7 +418,7 @@ def main() -> None:
             )
             cv2.putText(
                 original,
-                "Before",
+                args.original_label,
                 (16, 32),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.8,
@@ -426,7 +428,7 @@ def main() -> None:
             )
             cv2.putText(
                 corrected,
-                "Stage 1",
+                args.corrected_label,
                 (16, 32),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.8,
