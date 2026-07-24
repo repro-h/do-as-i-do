@@ -110,6 +110,11 @@ identically zero, and velocity/acceleration losses supervise the object
 trajectory itself. `--mode hand_only` is reserved for the subsequent
 object-frozen wrist/relative-position stage.
 
+`--w-delta-velocity` and `--w-delta-acceleration` directly regularize temporal
+changes in the predicted correction. They are separate from trajectory losses:
+the latter match GT motion, while delta smoothness prevents the refiner itself
+from injecting visible jitter.
+
 Run `audit_stage1_rigid_supervision.py` before training. It reports hand,
 object, and relative residual distributions, 2D projection error, left/right
 breakdowns, and streams exceeding the configured residual range.

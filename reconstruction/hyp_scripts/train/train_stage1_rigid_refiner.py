@@ -36,12 +36,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-projection", type=float, default=0.25)
     parser.add_argument("--w-velocity", type=float, default=0.25)
     parser.add_argument("--w-acceleration", type=float, default=0.1)
+    parser.add_argument("--w-delta-velocity", type=float, default=0.0)
+    parser.add_argument("--w-delta-acceleration", type=float, default=0.0)
     parser.add_argument("--w-residual", type=float, default=0.01)
     parser.add_argument("--max-residual-mm", type=float, default=100.0)
     parser.add_argument("--max-target-hand-mm", type=float, default=120.0)
     parser.add_argument("--max-target-object-mm", type=float, default=100.0)
     parser.add_argument("--max-target-relative-mm", type=float, default=150.0)
     parser.add_argument("--smooth-l1-beta-mm", type=float, default=10.0)
+    parser.add_argument("--delta-smooth-beta-mm", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -218,6 +221,13 @@ def temporal_loss(value, target, mask, order: int, beta: float):
     return masked_smooth_l1(value, target, mask, beta)
 
 
+def temporal_zero_loss(value, mask, order: int, beta: float):
+    for _ in range(order):
+        value = value[:, 1:] - value[:, :-1]
+        mask = mask[:, 1:] & mask[:, :-1]
+    return masked_smooth_l1(value, torch.zeros_like(value), mask, beta)
+
+
 def project_points(points, intrinsics):
     z = points[..., 2].clamp_min(1e-4)
     x = points[..., 0] / z
@@ -232,6 +242,7 @@ def project_points(points, intrinsics):
 def compute_loss(model, batch, args):
     batch = {key: value.to(args.device) for key, value in batch.items()}
     beta = args.smooth_l1_beta_mm / 1000.0
+    delta_beta = args.delta_smooth_beta_mm / 1000.0
     hand_delta, object_delta = model(
         batch["features"], args.max_residual_mm / 1000.0
     )
@@ -302,6 +313,18 @@ def compute_loss(model, batch, args):
         "hand_acceleration": temporal_loss(
             corrected_hand, batch["gt_hand"], batch["hand_mask"], 2, beta
         ),
+        "object_delta_velocity": temporal_zero_loss(
+            object_delta, batch["object_mask"], 1, delta_beta
+        ),
+        "object_delta_acceleration": temporal_zero_loss(
+            object_delta, batch["object_mask"], 2, delta_beta
+        ),
+        "hand_delta_velocity": temporal_zero_loss(
+            hand_delta, batch["hand_mask"], 1, delta_beta
+        ),
+        "hand_delta_acceleration": temporal_zero_loss(
+            hand_delta, batch["hand_mask"], 2, delta_beta
+        ),
         "residual": (hand_delta.square().mean() + object_delta.square().mean()),
     }
     if args.mode == "object_only":
@@ -310,6 +333,8 @@ def compute_loss(model, batch, args):
             + args.w_projection * losses["object_projection"]
             + args.w_velocity * losses["object_velocity"]
             + args.w_acceleration * losses["object_acceleration"]
+            + args.w_delta_velocity * losses["object_delta_velocity"]
+            + args.w_delta_acceleration * losses["object_delta_acceleration"]
             + args.w_residual * losses["residual"]
         )
     elif args.mode == "hand_only":
@@ -319,6 +344,8 @@ def compute_loss(model, batch, args):
             + args.w_projection * losses["hand_projection"]
             + args.w_velocity * losses["hand_velocity"]
             + args.w_acceleration * losses["hand_acceleration"]
+            + args.w_delta_velocity * losses["hand_delta_velocity"]
+            + args.w_delta_acceleration * losses["hand_delta_acceleration"]
             + args.w_residual * losses["residual"]
         )
     else:
