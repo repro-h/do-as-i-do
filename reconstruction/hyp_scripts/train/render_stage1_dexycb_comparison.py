@@ -48,9 +48,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--view",
-        choices=("camera", "side", "orbit"),
+        choices=("camera", "camera_clean", "side", "orbit"),
         default="camera",
-        help="RGB camera overlay, fixed 3D side view, or rotating 3D view.",
+        help=(
+            "RGB camera overlay, clean camera-axis 3D view, fixed 3D side "
+            "view, or rotating 3D view."
+        ),
+    )
+    parser.add_argument(
+        "--gt-separate-panel",
+        action="store_true",
+        help="Render GT as a third independent panel instead of an overlay.",
     )
     parser.add_argument("--object-color", default="0.95,0.20,0.55")
     parser.add_argument("--hand-color", default="0.10,0.65,0.95")
@@ -58,6 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gt-hand-color", default="0.30,0.95,0.35")
     parser.add_argument("--original-label", default="Before")
     parser.add_argument("--corrected-label", default="Stage 1")
+    parser.add_argument("--gt-label", default="Ground Truth")
     return parser.parse_args()
 
 
@@ -419,7 +428,7 @@ def main() -> None:
     max_faces = max(200000, int(total_faces))
     view_center = None
     view_distance = None
-    if args.view == "camera":
+    if args.view in ("camera", "camera_clean"):
         render_fx, render_fy = args.fx, args.fy
         render_cx, render_cy = args.cx, args.cy
     else:
@@ -452,6 +461,17 @@ def main() -> None:
     comparison_writer = make_writer(
         out_dir / "before_after.mp4", args.fps, (width * 2, height)
     )
+    gt_writer = None
+    triptych_writer = None
+    if args.gt_separate_panel:
+        if gt_layout is None or gt_hand is None:
+            raise ValueError("--gt-separate-panel requires all GT inputs")
+        gt_writer = make_writer(out_dir / "ground_truth.mp4", args.fps, (width, height))
+        triptych_writer = make_writer(
+            out_dir / "foundationpose_gt_rts.mp4",
+            args.fps,
+            (width * 3, height),
+        )
     object_color = parse_color(args.object_color)
     hand_color = parse_color(args.hand_color)
     gt_object_color = parse_color(args.gt_object_color)
@@ -463,16 +483,26 @@ def main() -> None:
             if image is None:
                 raise RuntimeError(f"Failed to read {frame_path}")
             view_spec = None
-            if args.view != "camera":
+            if args.view == "camera_clean":
                 image = np.full_like(image, 245)
+            if args.view != "camera":
+                if args.view != "camera_clean":
+                    image = np.full_like(image, 245)
                 if args.view == "side":
                     forward = np.asarray([-1.0, 0.0, 0.0], dtype=np.float32)
-                else:
+                elif args.view == "orbit":
                     angle = 2.0 * np.pi * frame_index / max(len(frames), 1)
                     forward = np.asarray(
                         [np.sin(angle), 0.0, np.cos(angle)], dtype=np.float32
                     )
-                view_spec = (view_center, forward, view_distance)
+                if args.view in ("side", "orbit"):
+                    view_spec = (view_center, forward, view_distance)
+            overlay_gt = not args.gt_separate_panel
+            label_color = (
+                (40, 40, 40)
+                if args.view == "camera_clean"
+                else (255, 255, 255)
+            )
             original = render_overlay(
                 image,
                 object_vertices,
@@ -487,12 +517,24 @@ def main() -> None:
                 hand_color,
                 args.alpha,
                 view_spec,
-                gt_object_vertices,
-                gt_object_faces,
-                gt_layout.get(frame_index) if gt_layout is not None else None,
-                gt_hand[0][frame_index] if gt_hand is not None else None,
-                gt_hand[1] if gt_hand is not None else None,
-                bool(gt_hand[2][frame_index]) if gt_hand is not None else False,
+                gt_object_vertices if overlay_gt else None,
+                gt_object_faces if overlay_gt else None,
+                (
+                    gt_layout.get(frame_index)
+                    if overlay_gt and gt_layout is not None
+                    else None
+                ),
+                (
+                    gt_hand[0][frame_index]
+                    if overlay_gt and gt_hand is not None
+                    else None
+                ),
+                gt_hand[1] if overlay_gt and gt_hand is not None else None,
+                (
+                    bool(gt_hand[2][frame_index])
+                    if overlay_gt and gt_hand is not None
+                    else False
+                ),
                 gt_object_color,
                 gt_hand_color,
             )
@@ -510,12 +552,24 @@ def main() -> None:
                 hand_color,
                 args.alpha,
                 view_spec,
-                gt_object_vertices,
-                gt_object_faces,
-                gt_layout.get(frame_index) if gt_layout is not None else None,
-                gt_hand[0][frame_index] if gt_hand is not None else None,
-                gt_hand[1] if gt_hand is not None else None,
-                bool(gt_hand[2][frame_index]) if gt_hand is not None else False,
+                gt_object_vertices if overlay_gt else None,
+                gt_object_faces if overlay_gt else None,
+                (
+                    gt_layout.get(frame_index)
+                    if overlay_gt and gt_layout is not None
+                    else None
+                ),
+                (
+                    gt_hand[0][frame_index]
+                    if overlay_gt and gt_hand is not None
+                    else None
+                ),
+                gt_hand[1] if overlay_gt and gt_hand is not None else None,
+                (
+                    bool(gt_hand[2][frame_index])
+                    if overlay_gt and gt_hand is not None
+                    else False
+                ),
                 gt_object_color,
                 gt_hand_color,
             )
@@ -525,7 +579,7 @@ def main() -> None:
                 (16, 32),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.8,
-                (255, 255, 255),
+                label_color,
                 2,
                 cv2.LINE_AA,
             )
@@ -535,17 +589,54 @@ def main() -> None:
                 (16, 32),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.8,
-                (255, 255, 255),
+                label_color,
                 2,
                 cv2.LINE_AA,
             )
+            ground_truth = None
+            if args.gt_separate_panel:
+                ground_truth = render_overlay(
+                    image,
+                    gt_object_vertices,
+                    gt_object_faces,
+                    gt_layout.get(frame_index),
+                    gt_hand[0][frame_index],
+                    gt_hand[1],
+                    bool(gt_hand[2][frame_index]),
+                    renderer,
+                    device,
+                    gt_object_color,
+                    gt_hand_color,
+                    args.alpha,
+                    view_spec,
+                )
+                cv2.putText(
+                    ground_truth,
+                    args.gt_label,
+                    (16, 32),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (40, 40, 40),
+                    2,
+                    cv2.LINE_AA,
+                )
+                cv2.putText(
+                    ground_truth,
+                    f"{frame_index:06d}",
+                    (16, height - 16),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (40, 40, 40),
+                    2,
+                    cv2.LINE_AA,
+                )
             cv2.putText(
                 original,
                 f"{frame_index:06d}",
                 (16, height - 16),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
-                (255, 255, 255),
+                label_color,
                 2,
                 cv2.LINE_AA,
             )
@@ -555,18 +646,29 @@ def main() -> None:
                 (16, height - 16),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
-                (255, 255, 255),
+                label_color,
                 2,
                 cv2.LINE_AA,
             )
             original_writer.write(original)
             corrected_writer.write(corrected)
             comparison_writer.write(np.concatenate([original, corrected], axis=1))
+            if gt_writer is not None and triptych_writer is not None:
+                gt_writer.write(ground_truth)
+                triptych_writer.write(
+                    np.concatenate(
+                        [original, ground_truth, corrected], axis=1
+                    )
+                )
             print(f"[{frame_index + 1}/{len(frames)}] {frame_path.name}", flush=True)
     finally:
         original_writer.release()
         corrected_writer.release()
         comparison_writer.release()
+        if gt_writer is not None:
+            gt_writer.release()
+        if triptych_writer is not None:
+            triptych_writer.release()
 
     summary = {
         "num_frames": len(frames),
@@ -575,6 +677,16 @@ def main() -> None:
         "original": str(out_dir / "original.mp4"),
         "corrected": str(out_dir / "stage1_corrected.mp4"),
         "comparison": str(out_dir / "before_after.mp4"),
+        "ground_truth": (
+            str(out_dir / "ground_truth.mp4")
+            if args.gt_separate_panel
+            else None
+        ),
+        "triptych": (
+            str(out_dir / "foundationpose_gt_rts.mp4")
+            if args.gt_separate_panel
+            else None
+        ),
     }
     (out_dir / "render_summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
