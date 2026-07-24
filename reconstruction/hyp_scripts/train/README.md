@@ -104,6 +104,12 @@ does not supervise object rotation across incompatible canonical frames and
 does not optimize local MANO articulation or contact. Those belong to the
 second-stage geometric/contact refiner.
 
+Use `--mode object_only` to train the object stabilization stage first. In
+this mode the output head predicts only object translation, hand residuals are
+identically zero, and velocity/acceleration losses supervise the object
+trajectory itself. `--mode hand_only` is reserved for the subsequent
+object-frozen wrist/relative-position stage.
+
 Run `audit_stage1_rigid_supervision.py` before training. It reports hand,
 object, and relative residual distributions, 2D projection error, left/right
 breakdowns, and streams exceeding the configured residual range.

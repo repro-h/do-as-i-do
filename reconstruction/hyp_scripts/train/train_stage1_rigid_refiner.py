@@ -44,6 +44,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smooth-l1-beta-mm", type=float, default=10.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--mode",
+        choices=("joint", "object_only", "hand_only"),
+        default="joint",
+        help="Select which rigid translation residuals the model may predict.",
+    )
     return parser.parse_args()
 
 
@@ -143,8 +149,18 @@ class WindowDataset(Dataset):
 
 
 class RigidTemporalRefiner(nn.Module):
-    def __init__(self, hidden_dim: int, layers: int, heads: int, dropout: float):
+    def __init__(
+        self,
+        hidden_dim: int,
+        layers: int,
+        heads: int,
+        dropout: float,
+        mode: str = "joint",
+    ):
         super().__init__()
+        if mode not in {"joint", "object_only", "hand_only"}:
+            raise ValueError(f"Unsupported refinement mode: {mode}")
+        self.mode = mode
         self.input = nn.Sequential(
             nn.Linear(23, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -166,7 +182,7 @@ class RigidTemporalRefiner(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 6),
+            nn.Linear(hidden_dim, 6 if mode == "joint" else 3),
         )
 
     def forward(self, features: torch.Tensor, max_residual: float):
@@ -178,7 +194,12 @@ class RigidTemporalRefiner(nn.Module):
         tokens = self.input(features) + self.position[:, : features.shape[1]]
         encoded = self.encoder(tokens)
         residual = torch.tanh(self.output(encoded)) * max_residual
-        return residual[..., :3], residual[..., 3:]
+        if self.mode == "joint":
+            return residual[..., :3], residual[..., 3:]
+        zeros = torch.zeros_like(residual)
+        if self.mode == "object_only":
+            return zeros, residual
+        return residual, zeros
 
 
 def masked_smooth_l1(value, target, mask, beta):
@@ -228,20 +249,19 @@ def compute_loss(model, batch, args):
         & (corrected_object[..., 2] > 1e-4)
         & (batch["gt_object"][..., 2] > 1e-4)
     )
-    projection = 0.5 * (
-        masked_smooth_l1(
-            project_points(corrected_hand, batch["intrinsics"]) / 100.0,
-            project_points(batch["gt_hand"], batch["intrinsics"]) / 100.0,
-            hand_projection_mask,
-            beta,
-        )
-        + masked_smooth_l1(
-            project_points(corrected_object, batch["intrinsics"]) / 100.0,
-            project_points(batch["gt_object"], batch["intrinsics"]) / 100.0,
-            object_projection_mask,
-            beta,
-        )
+    hand_projection = masked_smooth_l1(
+        project_points(corrected_hand, batch["intrinsics"]) / 100.0,
+        project_points(batch["gt_hand"], batch["intrinsics"]) / 100.0,
+        hand_projection_mask,
+        beta,
     )
+    object_projection = masked_smooth_l1(
+        project_points(corrected_object, batch["intrinsics"]) / 100.0,
+        project_points(batch["gt_object"], batch["intrinsics"]) / 100.0,
+        object_projection_mask,
+        beta,
+    )
+    projection = 0.5 * (hand_projection + object_projection)
 
     losses = {
         "hand": masked_smooth_l1(
@@ -254,23 +274,63 @@ def compute_loss(model, batch, args):
             corrected_relative, gt_relative, batch["relative_mask"], beta
         ),
         "projection": projection,
+        "hand_projection": hand_projection,
+        "object_projection": object_projection,
         "velocity": temporal_loss(
             corrected_relative, gt_relative, batch["relative_mask"], 1, beta
         ),
         "acceleration": temporal_loss(
             corrected_relative, gt_relative, batch["relative_mask"], 2, beta
         ),
+        "object_velocity": temporal_loss(
+            corrected_object,
+            batch["gt_object"],
+            batch["object_mask"],
+            1,
+            beta,
+        ),
+        "object_acceleration": temporal_loss(
+            corrected_object,
+            batch["gt_object"],
+            batch["object_mask"],
+            2,
+            beta,
+        ),
+        "hand_velocity": temporal_loss(
+            corrected_hand, batch["gt_hand"], batch["hand_mask"], 1, beta
+        ),
+        "hand_acceleration": temporal_loss(
+            corrected_hand, batch["gt_hand"], batch["hand_mask"], 2, beta
+        ),
         "residual": (hand_delta.square().mean() + object_delta.square().mean()),
     }
-    total = (
-        args.w_hand * losses["hand"]
-        + args.w_object * losses["object"]
-        + args.w_relative * losses["relative"]
-        + args.w_projection * losses["projection"]
-        + args.w_velocity * losses["velocity"]
-        + args.w_acceleration * losses["acceleration"]
-        + args.w_residual * losses["residual"]
-    )
+    if args.mode == "object_only":
+        total = (
+            args.w_object * losses["object"]
+            + args.w_projection * losses["object_projection"]
+            + args.w_velocity * losses["object_velocity"]
+            + args.w_acceleration * losses["object_acceleration"]
+            + args.w_residual * losses["residual"]
+        )
+    elif args.mode == "hand_only":
+        total = (
+            args.w_hand * losses["hand"]
+            + args.w_relative * losses["relative"]
+            + args.w_projection * losses["hand_projection"]
+            + args.w_velocity * losses["hand_velocity"]
+            + args.w_acceleration * losses["hand_acceleration"]
+            + args.w_residual * losses["residual"]
+        )
+    else:
+        total = (
+            args.w_hand * losses["hand"]
+            + args.w_object * losses["object"]
+            + args.w_relative * losses["relative"]
+            + args.w_projection * losses["projection"]
+            + args.w_velocity * losses["velocity"]
+            + args.w_acceleration * losses["acceleration"]
+            + args.w_residual * losses["residual"]
+        )
     return total, losses, {
         "corrected_hand": corrected_hand,
         "corrected_object": corrected_object,
@@ -392,7 +452,7 @@ def main() -> None:
         persistent_workers=args.num_workers > 0,
     )
     model = RigidTemporalRefiner(
-        args.hidden_dim, args.layers, args.heads, args.dropout
+        args.hidden_dim, args.layers, args.heads, args.dropout, args.mode
     ).to(args.device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay

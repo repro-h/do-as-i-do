@@ -104,6 +104,7 @@ def main() -> None:
         int(config["layers"]),
         int(config["heads"]),
         float(config["dropout"]),
+        str(config.get("mode", "joint")),
     )
     model.load_state_dict(checkpoint["model"])
     model.to(args.device).eval()
