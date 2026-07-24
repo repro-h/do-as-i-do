@@ -103,3 +103,7 @@ small hand and object translation residuals. The initial stage intentionally
 does not supervise object rotation across incompatible canonical frames and
 does not optimize local MANO articulation or contact. Those belong to the
 second-stage geometric/contact refiner.
+
+Run `audit_stage1_rigid_supervision.py` before training. It reports hand,
+object, and relative residual distributions, 2D projection error, left/right
+breakdowns, and streams exceeding the configured residual range.
