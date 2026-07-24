@@ -133,6 +133,12 @@ Use `audit_isolated_object_fit.py` after fitting. It compares initial and
 fitted visible-mask IoU/coverage/precision, spill ratio, and visible RGB-D depth
 errors, and saves worst-regression contour previews without rerunning fitting.
 
+`filter_foundationpose_ekf_rts.py` is an object-only trajectory-denoising
+baseline. It reads FoundationPose JSON directly, applies constant-velocity
+Kalman filtering to translation and sign-continuous unit quaternions, then runs
+an offline RTS backward pass. It writes EKF and RTS JSON files in the original
+FoundationPose schema and records motion and correction audits.
+
 Run `audit_stage1_rigid_supervision.py` before training. It reports hand,
 object, and relative residual distributions, 2D projection error, left/right
 breakdowns, and streams exceeding the configured residual range.
