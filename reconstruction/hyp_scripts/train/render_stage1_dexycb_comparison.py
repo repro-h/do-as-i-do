@@ -34,6 +34,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--original-hand-meshes", required=True)
     parser.add_argument("--corrected-layout", required=True)
     parser.add_argument("--corrected-hand-meshes", required=True)
+    parser.add_argument("--gt-object-layout")
+    parser.add_argument("--gt-object-mesh")
+    parser.add_argument("--gt-hand-meshes")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--hand-side", choices=("left", "right"), required=True)
     parser.add_argument("--fx", type=float, required=True)
@@ -51,6 +54,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--object-color", default="0.95,0.20,0.55")
     parser.add_argument("--hand-color", default="0.10,0.65,0.95")
+    parser.add_argument("--gt-object-color", default="0.05,0.90,0.90")
+    parser.add_argument("--gt-hand-color", default="0.30,0.95,0.35")
     parser.add_argument("--original-label", default="Before")
     parser.add_argument("--corrected-label", default="Stage 1")
     return parser.parse_args()
@@ -213,6 +218,14 @@ def render_overlay(
     hand_color: tuple[float, float, float],
     alpha: float,
     view_spec: Optional[tuple[np.ndarray, np.ndarray, float]] = None,
+    gt_object_vertices: Optional[np.ndarray] = None,
+    gt_object_faces: Optional[np.ndarray] = None,
+    gt_object_transform: Optional[dict] = None,
+    gt_hand_vertices: Optional[np.ndarray] = None,
+    gt_hand_faces: Optional[np.ndarray] = None,
+    gt_hand_valid: bool = False,
+    gt_object_color: tuple[float, float, float] = (0.05, 0.90, 0.90),
+    gt_hand_color: tuple[float, float, float] = (0.30, 0.95, 0.35),
 ) -> np.ndarray:
     vertices_list = []
     faces_list = []
@@ -242,6 +255,51 @@ def render_overlay(
         colors_list.append(
             torch.tensor(hand_color, dtype=torch.float32, device=device)
             .expand(len(vertices), 3)
+        )
+        vertex_offset += len(vertices)
+
+    if (
+        gt_object_vertices is not None
+        and gt_object_faces is not None
+        and gt_object_transform is not None
+    ):
+        vertices = object_vertices_camera(
+            gt_object_vertices, gt_object_transform, device
+        )
+        if view_spec is not None:
+            vertices = transform_to_view(vertices, *view_spec)
+        faces = torch.as_tensor(
+            gt_object_faces, dtype=torch.int64, device=device
+        )
+        vertices_list.append(camera_to_pytorch3d(vertices))
+        faces_list.append(faces + vertex_offset)
+        colors_list.append(
+            torch.tensor(
+                gt_object_color, dtype=torch.float32, device=device
+            ).expand(len(vertices), 3)
+        )
+        vertex_offset += len(vertices)
+
+    if (
+        gt_hand_vertices is not None
+        and gt_hand_faces is not None
+        and gt_hand_valid
+        and np.isfinite(gt_hand_vertices).all()
+    ):
+        vertices = torch.as_tensor(
+            gt_hand_vertices, dtype=torch.float32, device=device
+        )
+        if view_spec is not None:
+            vertices = transform_to_view(vertices, *view_spec)
+        faces = torch.as_tensor(
+            gt_hand_faces, dtype=torch.int64, device=device
+        )
+        vertices_list.append(camera_to_pytorch3d(vertices))
+        faces_list.append(faces + vertex_offset)
+        colors_list.append(
+            torch.tensor(
+                gt_hand_color, dtype=torch.float32, device=device
+            ).expand(len(vertices), 3)
         )
 
     if not vertices_list:
@@ -331,7 +389,34 @@ def main() -> None:
     corrected_hand = load_hand(
         Path(args.corrected_hand_meshes).expanduser().resolve(), args.hand_side
     )
-    max_faces = max(200000, int(len(object_faces) + len(original_hand[1])))
+    gt_arguments = (
+        args.gt_object_layout,
+        args.gt_object_mesh,
+        args.gt_hand_meshes,
+    )
+    if any(gt_arguments) and not all(gt_arguments):
+        raise ValueError(
+            "Pass --gt-object-layout, --gt-object-mesh, and "
+            "--gt-hand-meshes together"
+        )
+    gt_layout = None
+    gt_object_vertices = None
+    gt_object_faces = None
+    gt_hand = None
+    if all(gt_arguments):
+        gt_layout = load_layout(
+            Path(args.gt_object_layout).expanduser().resolve()
+        )
+        gt_object_vertices, gt_object_faces = load_mesh(
+            Path(args.gt_object_mesh).expanduser().resolve()
+        )
+        gt_hand = load_hand(
+            Path(args.gt_hand_meshes).expanduser().resolve(), args.hand_side
+        )
+    total_faces = len(object_faces) + len(original_hand[1])
+    if gt_object_faces is not None and gt_hand is not None:
+        total_faces += len(gt_object_faces) + len(gt_hand[1])
+    max_faces = max(200000, int(total_faces))
     view_center = None
     view_distance = None
     if args.view == "camera":
@@ -369,6 +454,8 @@ def main() -> None:
     )
     object_color = parse_color(args.object_color)
     hand_color = parse_color(args.hand_color)
+    gt_object_color = parse_color(args.gt_object_color)
+    gt_hand_color = parse_color(args.gt_hand_color)
 
     try:
         for frame_index, frame_path in enumerate(frames):
@@ -400,6 +487,14 @@ def main() -> None:
                 hand_color,
                 args.alpha,
                 view_spec,
+                gt_object_vertices,
+                gt_object_faces,
+                gt_layout.get(frame_index) if gt_layout is not None else None,
+                gt_hand[0][frame_index] if gt_hand is not None else None,
+                gt_hand[1] if gt_hand is not None else None,
+                bool(gt_hand[2][frame_index]) if gt_hand is not None else False,
+                gt_object_color,
+                gt_hand_color,
             )
             corrected = render_overlay(
                 image,
@@ -415,6 +510,14 @@ def main() -> None:
                 hand_color,
                 args.alpha,
                 view_spec,
+                gt_object_vertices,
+                gt_object_faces,
+                gt_layout.get(frame_index) if gt_layout is not None else None,
+                gt_hand[0][frame_index] if gt_hand is not None else None,
+                gt_hand[1] if gt_hand is not None else None,
+                bool(gt_hand[2][frame_index]) if gt_hand is not None else False,
+                gt_object_color,
+                gt_hand_color,
             )
             cv2.putText(
                 original,
