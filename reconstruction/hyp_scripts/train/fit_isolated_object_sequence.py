@@ -73,14 +73,26 @@ def load_mesh(path: Path, max_faces: int) -> tuple[np.ndarray, np.ndarray]:
         if not loaded.geometry:
             raise RuntimeError(f"Empty mesh scene: {path}")
         loaded = trimesh.util.concatenate(tuple(loaded.geometry.values()))
+    if len(loaded.faces) > max_faces:
+        try:
+            try:
+                loaded = loaded.simplify_quadric_decimation(face_count=max_faces)
+            except TypeError:
+                # Compatibility with older trimesh releases.
+                loaded = loaded.simplify_quadratic_decimation(max_faces)
+        except Exception as error:
+            raise RuntimeError(
+                "Surface-preserving mesh simplification failed. Install the "
+                "fast-simplification package in this environment; isolated "
+                "fitting must not use sparse face subsampling."
+            ) from error
+        if len(loaded.faces) > max_faces * 1.1:
+            raise RuntimeError(
+                f"Mesh simplification returned {len(loaded.faces)} faces, "
+                f"expected approximately {max_faces}"
+            )
     vertices = np.asarray(loaded.vertices, dtype=np.float32)
     faces = np.asarray(loaded.faces, dtype=np.int64)
-    if len(faces) > max_faces:
-        indices = np.linspace(0, len(faces) - 1, max_faces, dtype=np.int64)
-        faces = faces[indices]
-        used, inverse = np.unique(faces.reshape(-1), return_inverse=True)
-        vertices = vertices[used]
-        faces = inverse.reshape(-1, 3)
     return vertices, faces
 
 
