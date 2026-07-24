@@ -112,3 +112,8 @@ Use `apply_stage1_rigid_refiner.py` with `best.pt` to aggregate overlapping
 window predictions into one hand/object translation residual per frame. The
 output keeps prediction counts and corrected centers for evaluation and later
 mesh/pose visualization adapters.
+
+Use `visualize_stage1_dexycb.py` to prepare GT overlays and launch paired
+before/after Viser viewers. Without `--stream-id` it selects a representative
+validation stream whose relative median error improved; pass an exact stream
+ID to inspect a specific prediction. Prepared assets are cached per stream.
