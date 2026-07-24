@@ -26,6 +26,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stream-id", default=None)
     parser.add_argument("--original-port", type=int, default=8095)
     parser.add_argument("--corrected-port", type=int, default=8096)
+    parser.add_argument(
+        "--hide-gt",
+        action="store_true",
+        help="Do not load DexYCB GT hand or object meshes in the viewers.",
+    )
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--force-prepare", action="store_true")
     return parser.parse_args()
@@ -192,13 +197,14 @@ def main() -> None:
         json.dumps(selected, indent=2), encoding="utf-8"
     )
 
-    required = (
+    required = [
         handflow_path,
         foundationpose_path,
         prediction_path,
         object_mesh,
-        gt_object_mesh,
-    )
+    ]
+    if not args.hide_gt:
+        required.append(gt_object_mesh)
     for path in required:
         if not path.is_file():
             raise FileNotFoundError(path)
@@ -208,7 +214,9 @@ def main() -> None:
 
     gt_hand = gt_out / "dexycb_gt_hand_meshes.npz"
     gt_layout = gt_out / "dexycb_gt_object_layout_camera_frame.json"
-    if args.force_prepare or not gt_hand.is_file() or not gt_layout.is_file():
+    if not args.hide_gt and (
+        args.force_prepare or not gt_hand.is_file() or not gt_layout.is_file()
+    ):
         run(
             [
                 sys.executable,
@@ -291,14 +299,6 @@ def main() -> None:
         str(record["foundationpose_source_mesh_scale"]),
         "--translation-scale",
         "1.0",
-        "--gt-hand-meshes",
-        str(gt_hand),
-        "--gt-object-layout-json",
-        str(gt_layout),
-        "--gt-object-mesh",
-        str(gt_object_mesh),
-        "--gt-object-scale",
-        "1.0",
         "--fx",
         str(camera["fx"]),
         "--fy",
@@ -316,6 +316,17 @@ def main() -> None:
         "--frustum-scale",
         "0.15",
     ]
+    if not args.hide_gt:
+        viewer_common += [
+            "--gt-hand-meshes",
+            str(gt_hand),
+            "--gt-object-layout-json",
+            str(gt_layout),
+            "--gt-object-mesh",
+            str(gt_object_mesh),
+            "--gt-object-scale",
+            "1.0",
+        ]
     original_command = viewer_common + [
         "--layout-json",
         str(original_layout),
