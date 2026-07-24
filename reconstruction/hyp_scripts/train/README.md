@@ -121,6 +121,12 @@ SO(3) smoothing to each contiguous rotation segment. The output preserves the
 FoundationPose JSON schema and includes before/after angular speed and
 acceleration audits.
 
+`fit_isolated_object_sequence.py` performs CHOIR-style per-sequence 6DoF
+fitting directly from a FoundationPose initialization. Its silhouette
+repulsion ignores dilated hand-occlusion pixels, attraction uses visible
+DexYCB object pixels, and depth fitting uses valid visible RGB-D object pixels.
+It does not read DexYCB object poses.
+
 Run `audit_stage1_rigid_supervision.py` before training. It reports hand,
 object, and relative residual distributions, 2D projection error, left/right
 breakdowns, and streams exceeding the configured residual range.
