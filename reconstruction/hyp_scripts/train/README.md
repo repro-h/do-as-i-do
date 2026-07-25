@@ -148,6 +148,12 @@ depth cannot create a coherent false translation. It stores all confidence,
 depth, 3D, PnP, and RANSAC-inlier arrays for lag diagnosis and later pose-graph
 optimization.
 
+`audit_foundationpose_tapir_motion.py` compares the PnP relative transform with
+`O[t+1] @ inv(O[t])` from FoundationPose. Because the comparison is relative,
+the unknown fixed SAM3D-to-YCB canonical orientation cancels. The audit reports
+global lags from -3 to +3 frames and proposes start/stop lag boundaries without
+modifying either trajectory.
+
 Run `audit_stage1_rigid_supervision.py` before training. It reports hand,
 object, and relative residual distributions, 2D projection error, left/right
 breakdowns, and streams exceeding the configured residual range.
