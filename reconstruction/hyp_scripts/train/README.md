@@ -152,7 +152,9 @@ optimization.
 `O[t+1] @ inv(O[t])` from FoundationPose. Because the comparison is relative,
 the unknown fixed SAM3D-to-YCB canonical orientation cancels. The audit reports
 global lags from -3 to +3 frames and proposes start/stop lag boundaries without
-modifying either trajectory.
+modifying either trajectory. Translation speed is measured at the tracked
+object center, not from the raw camera-frame SE(3) translation component, which
+would incorrectly amplify rotation at large camera depth.
 
 Run `audit_stage1_rigid_supervision.py` before training. It reports hand,
 object, and relative residual distributions, 2D projection error, left/right

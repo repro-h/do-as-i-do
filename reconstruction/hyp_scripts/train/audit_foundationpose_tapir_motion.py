@@ -207,20 +207,30 @@ def main() -> None:
         first_pose = resolve_pose(rows, first_frame)
         second_pose = resolve_pose(rows, second_frame)
         tapir = tapir_transforms[pair_index]
-        tapir_speed[pair_index], tapir_rotation[pair_index] = transform_metrics(
-            tapir
-        )
+        _, tapir_rotation[pair_index] = transform_metrics(tapir)
         if first_pose is not None and second_pose is not None:
             foundationpose = second_pose @ np.linalg.inv(first_pose)
-            fp_speed[pair_index], fp_rotation[pair_index] = transform_metrics(
-                foundationpose
+            _, fp_rotation[pair_index] = transform_metrics(foundationpose)
+            first_center = first_pose[:3, 3]
+            second_center = second_pose[:3, 3]
+            tapir_center = (
+                tapir[:3, :3] @ first_center + tapir[:3, 3]
             )
-            residual = tapir @ np.linalg.inv(foundationpose)
-            translation_error[pair_index], rotation_error[pair_index] = (
-                transform_metrics(residual)
+            tapir_vector = tapir_center - first_center
+            fp_vector = second_center - first_center
+            tapir_speed[pair_index] = (
+                np.linalg.norm(tapir_vector) * 1000.0
             )
-            tapir_vector = tapir[:3, 3]
-            fp_vector = foundationpose[:3, 3]
+            fp_speed[pair_index] = np.linalg.norm(fp_vector) * 1000.0
+            translation_error[pair_index] = (
+                np.linalg.norm(tapir_center - second_center) * 1000.0
+            )
+            rotation_residual = (
+                tapir[:3, :3] @ foundationpose[:3, :3].T
+            )
+            rotation_error[pair_index] = rotation_angle_deg(
+                rotation_residual
+            )
             denominator = np.linalg.norm(tapir_vector) * np.linalg.norm(fp_vector)
             if denominator > 1e-10:
                 direction_cosine[pair_index] = float(
@@ -239,13 +249,17 @@ def main() -> None:
                 "valid": bool(valid[pair_index]),
                 "pnp_status": pnp_status[pair_index],
                 "pnp_inliers": int(pnp_inliers[pair_index]),
-                "tapir_translation_mm": float(tapir_speed[pair_index]),
-                "foundationpose_translation_mm": (
+                "tapir_center_motion_mm": (
+                    float(tapir_speed[pair_index])
+                    if np.isfinite(tapir_speed[pair_index])
+                    else None
+                ),
+                "foundationpose_center_motion_mm": (
                     float(fp_speed[pair_index])
                     if np.isfinite(fp_speed[pair_index])
                     else None
                 ),
-                "translation_error_mm": (
+                "center_prediction_error_mm": (
                     float(translation_error[pair_index])
                     if np.isfinite(translation_error[pair_index])
                     else None
@@ -299,7 +313,9 @@ def main() -> None:
                 "foundationpose_speed_mm": float(fp_smoothed[index]),
                 "tapir_speed_change_mm": float(tapir_change[index]),
                 "speed_mismatch_mm": float(mismatch),
-                "translation_error_mm": records[index]["translation_error_mm"],
+                "center_prediction_error_mm": records[index][
+                    "center_prediction_error_mm"
+                ],
                 "rotation_error_deg": records[index]["rotation_error_deg"],
             }
         )
@@ -308,11 +324,15 @@ def main() -> None:
     best_lag = min(scores, key=lambda row: row["mae_mm"]) if scores else None
     summary = {
         "settings": vars(args),
+        "translation_comparison": (
+            "TAPIR PnP transform applied to the FoundationPose object center "
+            "at t, compared with the FoundationPose object center at t+1"
+        ),
         "num_pairs": pair_count,
         "num_valid_pairs": int(valid.sum()),
-        "tapir_translation_mm": distribution(tapir_speed[valid]),
-        "foundationpose_translation_mm": distribution(fp_speed[valid]),
-        "translation_error_mm": distribution(translation_error[valid]),
+        "tapir_center_motion_mm": distribution(tapir_speed[valid]),
+        "foundationpose_center_motion_mm": distribution(fp_speed[valid]),
+        "center_prediction_error_mm": distribution(translation_error[valid]),
         "rotation_error_deg": distribution(rotation_error[valid]),
         "translation_direction_cosine": distribution(direction_cosine[valid]),
         "lag_scores": scores,
