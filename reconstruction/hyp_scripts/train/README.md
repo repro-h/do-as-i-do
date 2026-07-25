@@ -139,6 +139,12 @@ Kalman filtering to translation and sign-continuous unit quaternions, then runs
 an offline RTS backward pass. It writes EKF and RTS JSON files in the original
 FoundationPose schema and records motion and correction audits.
 
+`export_tapir_object_3d_tracks.py` reuses the repository's BootsTAPIR model but
+exports the adjacent-frame point correspondences instead of only 2D velocity
+statistics. It lifts reliable mask-interior tracks with aligned metric depth,
+fits robust relative SE(3) transforms, and stores all confidence, depth, 3D,
+and RANSAC-inlier arrays for lag diagnosis and later pose-graph optimization.
+
 Run `audit_stage1_rigid_supervision.py` before training. It reports hand,
 object, and relative residual distributions, 2D projection error, left/right
 breakdowns, and streams exceeding the configured residual range.
