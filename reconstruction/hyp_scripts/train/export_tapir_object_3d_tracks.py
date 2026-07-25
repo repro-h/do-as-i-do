@@ -36,6 +36,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-3d-points", type=int, default=8)
     parser.add_argument("--ransac-trials", type=int, default=128)
     parser.add_argument("--ransac-threshold-mm", type=float, default=12.0)
+    parser.add_argument("--pnp-threshold-px", type=float, default=4.0)
+    parser.add_argument("--min-pnp-points", type=int, default=8)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -254,6 +256,53 @@ def ransac_rigid(
     return transform, best_inliers
 
 
+def solve_relative_pnp(
+    source_points: np.ndarray,
+    target_pixels: np.ndarray,
+    valid: np.ndarray,
+    intrinsic: np.ndarray,
+    threshold_px: float,
+    min_points: int,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    transform = np.eye(4, dtype=np.float64)
+    inlier_mask = np.zeros(len(source_points), dtype=bool)
+    indices = np.flatnonzero(
+        valid
+        & np.isfinite(source_points).all(axis=1)
+        & np.isfinite(target_pixels).all(axis=1)
+    )
+    if len(indices) < min_points:
+        return transform, inlier_mask, "too_few_pnp_points"
+    success, rotation_vector, translation, local_inliers = cv2.solvePnPRansac(
+        source_points[indices].astype(np.float64),
+        target_pixels[indices].astype(np.float64),
+        intrinsic.astype(np.float64),
+        None,
+        iterationsCount=256,
+        reprojectionError=float(threshold_px),
+        confidence=0.999,
+        flags=cv2.SOLVEPNP_EPNP,
+    )
+    if not success or local_inliers is None:
+        return transform, inlier_mask, "pnp_failed"
+    selected = indices[np.asarray(local_inliers).reshape(-1)]
+    if len(selected) < min_points:
+        return transform, inlier_mask, "too_few_pnp_inliers"
+    rotation_vector, translation = cv2.solvePnPRefineLM(
+        source_points[selected].astype(np.float64),
+        target_pixels[selected].astype(np.float64),
+        intrinsic.astype(np.float64),
+        None,
+        rotation_vector,
+        translation,
+    )
+    rotation, _ = cv2.Rodrigues(rotation_vector)
+    transform[:3, :3] = rotation
+    transform[:3, 3] = np.asarray(translation).reshape(3)
+    inlier_mask[selected] = True
+    return transform, inlier_mask, "ok"
+
+
 def make_preview(
     first: np.ndarray,
     second: np.ndarray,
@@ -336,7 +385,10 @@ def main() -> None:
     valid_3d_all = np.zeros((pair_count, point_count), bool)
     inliers_all = np.zeros((pair_count, point_count), bool)
     transforms_all = np.repeat(np.eye(4)[None], pair_count, axis=0)
+    pnp_inliers_all = np.zeros((pair_count, point_count), bool)
+    pnp_transforms_all = np.repeat(np.eye(4)[None], pair_count, axis=0)
     statuses = []
+    pnp_statuses = []
 
     for frame_index in range(pair_count):
         mask_first = load_mask(
@@ -361,6 +413,7 @@ def main() -> None:
         )
         if len(query_xy) < 3:
             statuses.append("too_few_mask_points")
+            pnp_statuses.append("too_few_mask_points")
             continue
         query_tyx = np.concatenate(
             [
@@ -454,6 +507,14 @@ def main() -> None:
             status = "ok" if local_inliers.sum() >= args.min_3d_points else "too_few_inliers"
         else:
             status = "too_few_3d_points"
+        pnp_transform, pnp_inliers, pnp_status = solve_relative_pnp(
+            points_pair[:, 0],
+            tracks[:, 1],
+            valid_2d & np.isfinite(points_pair[:, 0]).all(axis=1),
+            intrinsic,
+            args.pnp_threshold_px,
+            args.min_pnp_points,
+        )
 
         tracks_all[frame_index, :count] = tracks
         confidence_all[frame_index, :count] = confidence
@@ -463,14 +524,17 @@ def main() -> None:
         valid_3d_all[frame_index, :count] = valid_3d
         inliers_all[frame_index, :count] = inliers
         transforms_all[frame_index] = transform
+        pnp_inliers_all[frame_index, :count] = pnp_inliers
+        pnp_transforms_all[frame_index] = pnp_transform
         statuses.append(status)
+        pnp_statuses.append(pnp_status)
         if preview_dir is not None:
             make_preview(
                 images[frame_index],
                 images[frame_index + 1],
                 tracks,
                 valid_3d,
-                inliers,
+                pnp_inliers,
                 preview_dir / f"{frame_index:06d}_{frame_index + 1:06d}.jpg",
             )
         translation_mm = np.linalg.norm(transform[:3, 3]) * 1000.0
@@ -479,11 +543,24 @@ def main() -> None:
                 np.clip((np.trace(transform[:3, :3]) - 1.0) * 0.5, -1.0, 1.0)
             )
         )
+        pnp_translation_mm = np.linalg.norm(pnp_transform[:3, 3]) * 1000.0
+        pnp_angle_deg = np.degrees(
+            np.arccos(
+                np.clip(
+                    (np.trace(pnp_transform[:3, :3]) - 1.0) * 0.5,
+                    -1.0,
+                    1.0,
+                )
+            )
+        )
         print(
-            f"[{frame_index + 1}/{pair_count}] {status} "
+            f"[{frame_index + 1}/{pair_count}] 3d={status} pnp={pnp_status} "
             f"2d={valid_2d.sum()} 3d={valid_3d.sum()} "
-            f"inliers={inliers.sum()} t={translation_mm:.2f}mm "
-            f"R={angle_deg:.2f}deg",
+            f"inliers={inliers.sum()} pnp_inliers={pnp_inliers.sum()} "
+            f"3d_t={translation_mm:.2f}mm "
+            f"3d_R={angle_deg:.2f}deg "
+            f"pnp_t={pnp_translation_mm:.2f}mm "
+            f"pnp_R={pnp_angle_deg:.2f}deg",
             flush=True,
         )
 
@@ -502,7 +579,10 @@ def main() -> None:
         valid_3d=valid_3d_all,
         inlier_mask=inliers_all,
         relative_transform=transforms_all,
+        pnp_inlier_mask=pnp_inliers_all,
+        relative_transform_pnp=pnp_transforms_all,
         status=np.asarray(statuses),
+        pnp_status=np.asarray(pnp_statuses),
         intrinsics=intrinsic,
     )
     valid_transforms = np.asarray(statuses) == "ok"
@@ -519,6 +599,27 @@ def main() -> None:
             )
         )
     )
+    valid_pnp = np.asarray(pnp_statuses) == "ok"
+    pnp_translation = (
+        np.linalg.norm(pnp_transforms_all[:, :3, 3], axis=1) * 1000.0
+    )
+    pnp_angle = np.degrees(
+        np.arccos(
+            np.clip(
+                (
+                    np.trace(
+                        pnp_transforms_all[:, :3, :3],
+                        axis1=1,
+                        axis2=2,
+                    )
+                    - 1.0
+                )
+                * 0.5,
+                -1.0,
+                1.0,
+            )
+        )
+    )
     summary = {
         "settings": vars(args),
         "num_frames": len(images),
@@ -526,9 +627,14 @@ def main() -> None:
         "status_counts": {
             name: statuses.count(name) for name in sorted(set(statuses))
         },
+        "pnp_status_counts": {
+            name: pnp_statuses.count(name)
+            for name in sorted(set(pnp_statuses))
+        },
         "valid_2d_median": float(np.median(valid_2d_all.sum(axis=1))),
         "valid_3d_median": float(np.median(valid_3d_all.sum(axis=1))),
         "inlier_median": float(np.median(inliers_all.sum(axis=1))),
+        "pnp_inlier_median": float(np.median(pnp_inliers_all.sum(axis=1))),
         "translation_mm": {
             "median": float(np.median(translation[valid_transforms]))
             if valid_transforms.any()
@@ -549,6 +655,28 @@ def main() -> None:
             else None,
             "max": float(np.max(angle[valid_transforms]))
             if valid_transforms.any()
+            else None,
+        },
+        "pnp_translation_mm": {
+            "median": float(np.median(pnp_translation[valid_pnp]))
+            if valid_pnp.any()
+            else None,
+            "p90": float(np.quantile(pnp_translation[valid_pnp], 0.9))
+            if valid_pnp.any()
+            else None,
+            "max": float(np.max(pnp_translation[valid_pnp]))
+            if valid_pnp.any()
+            else None,
+        },
+        "pnp_rotation_deg": {
+            "median": float(np.median(pnp_angle[valid_pnp]))
+            if valid_pnp.any()
+            else None,
+            "p90": float(np.quantile(pnp_angle[valid_pnp], 0.9))
+            if valid_pnp.any()
+            else None,
+            "max": float(np.max(pnp_angle[valid_pnp]))
+            if valid_pnp.any()
             else None,
         },
         "out_npz": str(out_path),
