@@ -25,6 +25,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exit-rotation-deg", type=float, default=0.6)
     parser.add_argument("--enter-frames", type=int, default=2)
     parser.add_argument("--exit-frames", type=int, default=4)
+    parser.add_argument("--stationary-window", type=int, default=6)
+    parser.add_argument("--exit-net-translation-mm", type=float, default=8.0)
+    parser.add_argument("--exit-net-rotation-deg", type=float, default=1.5)
     parser.add_argument("--median-window", type=int, default=3)
     parser.add_argument("--min-static-frames", type=int, default=5)
     parser.add_argument("--static-trim-frames", type=int, default=1)
@@ -97,9 +100,15 @@ def hysteresis_motion(
     exit_rotation: float,
     enter_frames: int,
     exit_frames: int,
+    stationary_ready: np.ndarray | None = None,
+    stationary_backfill: int = 1,
 ) -> np.ndarray:
     high = (translation >= enter_translation) | (rotation >= enter_rotation)
-    low = (translation <= exit_translation) & (rotation <= exit_rotation)
+    low = (
+        stationary_ready
+        if stationary_ready is not None
+        else (translation <= exit_translation) & (rotation <= exit_rotation)
+    )
     dynamic = np.zeros(len(translation), dtype=bool)
     state = False
     high_run = 0
@@ -115,7 +124,8 @@ def hysteresis_motion(
             dynamic[index] = True
             low_run = low_run + 1 if low[index] else 0
             if low_run >= exit_frames:
-                dynamic[index - exit_frames + 1 : index + 1] = False
+                backfill = max(exit_frames, stationary_backfill)
+                dynamic[max(0, index - backfill + 1) : index + 1] = False
                 state = False
                 high_run = 0
                 low_run = 0
@@ -225,6 +235,40 @@ def main() -> None:
         translation_speed, args.median_window
     )
     rotation_filtered = median_filter(rotation_speed, args.median_window)
+    stationary_ready = np.zeros(len(tracks), dtype=bool)
+    window_net_translation = np.full(len(tracks), np.nan)
+    window_net_rotation = np.full(len(tracks), np.nan)
+    window = max(2, args.stationary_window)
+    for end_index in range(window - 1, len(tracks)):
+        begin_index = end_index - window + 1
+        if not all(
+            statuses[index] == "ok" and inliers[index] >= 8
+            for index in range(begin_index, end_index + 1)
+        ):
+            continue
+        accumulated = np.eye(4, dtype=np.float64)
+        for edge_index in range(begin_index, end_index + 1):
+            accumulated = tracks[edge_index] @ accumulated
+        begin_center = centers[begin_index]
+        predicted_center = (
+            accumulated[:3, :3] @ begin_center + accumulated[:3, 3]
+        )
+        net_translation = (
+            np.linalg.norm(predicted_center - begin_center) * 1000.0
+        )
+        net_rotation = rotation_angle_deg(accumulated[:3, :3])
+        window_net_translation[end_index] = net_translation
+        window_net_rotation[end_index] = net_rotation
+        local_translation = translation_filtered[
+            begin_index : end_index + 1
+        ]
+        local_rotation = rotation_filtered[begin_index : end_index + 1]
+        stationary_ready[end_index] = (
+            np.nanmedian(local_translation) <= args.exit_translation_mm
+            and np.nanmedian(local_rotation) <= args.exit_rotation_deg
+            and net_translation <= args.exit_net_translation_mm
+            and net_rotation <= args.exit_net_rotation_deg
+        )
     edge_dynamic = hysteresis_motion(
         translation_filtered,
         rotation_filtered,
@@ -233,7 +277,9 @@ def main() -> None:
         args.exit_translation_mm,
         args.exit_rotation_deg,
         args.enter_frames,
-        args.exit_frames,
+        1 if args.stationary_window > 1 else args.exit_frames,
+        stationary_ready=stationary_ready,
+        stationary_backfill=window,
     )
     frame_dynamic = np.zeros(len(poses), dtype=bool)
     frame_dynamic[0] = edge_dynamic[0]
@@ -366,6 +412,12 @@ def main() -> None:
         "num_edges": len(tracks),
         "translation_speed_mm": distribution(translation_filtered),
         "rotation_speed_deg": distribution(rotation_filtered),
+        "stationary_window_net_translation_mm": distribution(
+            window_net_translation
+        ),
+        "stationary_window_net_rotation_deg": distribution(
+            window_net_rotation
+        ),
         "accepted_static_segments": accepted_static_segments,
         "rejected_static_segments": rejected_static_segments,
         "dynamic_segments": dynamic_segments,
@@ -381,6 +433,17 @@ def main() -> None:
                 "translation_filtered_mm": float(translation_filtered[index]),
                 "rotation_deg": float(rotation_speed[index]),
                 "rotation_filtered_deg": float(rotation_filtered[index]),
+                "stationary_ready": bool(stationary_ready[index]),
+                "window_net_translation_mm": (
+                    float(window_net_translation[index])
+                    if np.isfinite(window_net_translation[index])
+                    else None
+                ),
+                "window_net_rotation_deg": (
+                    float(window_net_rotation[index])
+                    if np.isfinite(window_net_rotation[index])
+                    else None
+                ),
                 "dynamic": bool(edge_dynamic[index]),
                 "pnp_inliers": int(inliers[index]),
             }

@@ -18,6 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-map-json", required=True)
     parser.add_argument("--tapir-npz", required=True)
     parser.add_argument("--motion-audit-json", required=True)
+    parser.add_argument("--segmentation-audit-json")
     parser.add_argument("--out-json", required=True)
     parser.add_argument("--out-audit", required=True)
     parser.add_argument("--start-frame", type=int)
@@ -29,6 +30,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--edge-rotation-deg", type=float, default=3.0)
     parser.add_argument("--correction-smooth-mm", type=float, default=3.0)
     parser.add_argument("--correction-smooth-deg", type=float, default=2.0)
+    parser.add_argument("--adaptive-smoothing", action="store_true")
+    parser.add_argument("--low-speed-mm", type=float, default=4.0)
+    parser.add_argument("--high-speed-mm", type=float, default=15.0)
+    parser.add_argument("--low-speed-smooth-multiplier", type=float, default=2.5)
+    parser.add_argument(
+        "--free-end",
+        action="store_true",
+        help="Keep the first interval pose fixed but optimize the final pose.",
+    )
     parser.add_argument("--candidate-edge-multiplier", type=float, default=2.0)
     parser.add_argument("--max-translation-mm", type=float, default=40.0)
     parser.add_argument("--max-rotation-deg", type=float, default=20.0)
@@ -158,14 +168,29 @@ def main() -> None:
     candidate_indices = {
         int(row["pair_index"]) for row in candidates
     }
-    if args.start_frame is None:
+    segmentation = None
+    if args.segmentation_audit_json:
+        segmentation = json.loads(
+            Path(args.segmentation_audit_json)
+            .expanduser()
+            .resolve()
+            .read_text(encoding="utf-8")
+        )
+    dynamic_segments = (
+        segmentation.get("dynamic_segments", []) if segmentation else []
+    )
+    if args.start_frame is None and dynamic_segments:
+        start = max(0, int(dynamic_segments[0]["output_frames"][0]) - 1)
+    elif args.start_frame is None:
         start = max(
             0,
             min(candidate_indices) - args.candidate_padding,
         ) if candidate_indices else 0
     else:
         start = args.start_frame
-    if args.end_frame is None:
+    if args.end_frame is None and dynamic_segments:
+        end = int(dynamic_segments[-1]["output_frames"][1])
+    elif args.end_frame is None:
         end = min(
             len(poses) - 1,
             max(candidate_indices) + 1 + args.candidate_padding,
@@ -179,7 +204,10 @@ def main() -> None:
 
     base_centers = poses[:, :3, 3].copy()
     base_rotations = poses[:, :3, :3].copy()
-    variable_indices = np.arange(start + 1, end)
+    variable_indices = np.arange(
+        start + 1,
+        end + 1 if args.free_end else end,
+    )
     if not len(variable_indices):
         raise ValueError("Optimization interval has no interior frames")
     variable_lookup = {
@@ -197,6 +225,17 @@ def main() -> None:
     )
     if not len(valid_edges):
         raise RuntimeError("No valid TAPIR PnP edges in optimization interval")
+    track_center_speed = np.full(len(track_transforms), np.nan)
+    for edge_index in valid_edges:
+        track = track_transforms[edge_index]
+        predicted_center = (
+            track[:3, :3] @ base_centers[edge_index]
+            + track[:3, 3]
+        )
+        track_center_speed[edge_index] = (
+            np.linalg.norm(predicted_center - base_centers[edge_index])
+            * 1000.0
+        )
 
     translation_prior_scale = args.prior_translation_mm / 1000.0
     rotation_prior_scale = np.radians(args.prior_rotation_deg)
@@ -259,8 +298,30 @@ def main() -> None:
                 * multiplier
             )
         interval_corrections = np.zeros((end - start + 1, 6))
-        interval_corrections[1:-1] = corrections
+        for frame_index, local_index in variable_lookup.items():
+            interval_corrections[frame_index - start] = corrections[local_index]
         for local_index in range(1, len(interval_corrections) - 1):
+            global_frame = start + local_index
+            local_speed = np.nanmedian(
+                track_center_speed[
+                    max(start, global_frame - 1) : min(end, global_frame + 1)
+                ]
+            )
+            smooth_multiplier = 1.0
+            if args.adaptive_smoothing and np.isfinite(local_speed):
+                denominator = max(
+                    args.high_speed_mm - args.low_speed_mm,
+                    1e-6,
+                )
+                motion_alpha = np.clip(
+                    (local_speed - args.low_speed_mm) / denominator,
+                    0.0,
+                    1.0,
+                )
+                smooth_multiplier = (
+                    args.low_speed_smooth_multiplier * (1.0 - motion_alpha)
+                    + motion_alpha
+                )
             residual.extend(
                 (
                     interval_corrections[local_index + 1, :3]
@@ -268,6 +329,7 @@ def main() -> None:
                     + interval_corrections[local_index - 1, :3]
                 )
                 / translation_smooth_scale
+                * smooth_multiplier
             )
             residual.extend(
                 (
@@ -276,6 +338,7 @@ def main() -> None:
                     + interval_corrections[local_index - 1, 3:]
                 )
                 / rotation_smooth_scale
+                * smooth_multiplier
             )
         return np.asarray(residual, dtype=np.float64)
 
@@ -313,6 +376,7 @@ def main() -> None:
             Path(args.motion_audit_json).expanduser().resolve()
         ),
         "optimization_interval": [start, end],
+        "free_end": args.free_end,
         "uses_gt_object_pose": False,
     }
     out_path = Path(args.out_json).expanduser().resolve()
@@ -336,6 +400,7 @@ def main() -> None:
         "source_foundationpose_json": str(source_path),
         "out_json": str(out_path),
         "optimization_interval": [start, end],
+        "fixed_frames": [start] if args.free_end else [start, end],
         "optimized_original_frames": [frame_ids[start], frame_ids[end]],
         "candidate_pair_indices": sorted(candidate_indices),
         "valid_edge_count": int(len(valid_edges)),

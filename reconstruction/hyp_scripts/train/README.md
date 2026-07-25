@@ -161,13 +161,17 @@ local correction. It fixes both interval endpoints, keeps every interior pose
 near FoundationPose, applies TAPIR PnP center/rotation edge constraints, and
 regularizes the second difference of the pose correction. Boundary-candidate
 edges receive extra weight; frames outside the selected interval are copied
-without modification.
+without modification. It can read a segmentation audit, keep only the
+pre-motion endpoint fixed with `--free-end`, and increase correction smoothness
+continuously at low TAPIR speed with `--adaptive-smoothing`.
 
 `segment_and_consolidate_foundationpose_tapir.py` uses median-filtered TAPIR
 center and rotation speed with hysteresis to label static and dynamic spans.
 Confirmed static spans share one robust translation/SO(3) mean pose after
 trimming transition frames; dynamic spans are reported but left untouched for
-the subsequent local pose-graph pass.
+the subsequent local pose-graph pass. Motion exit requires both low median
+speed and near-zero accumulated translation/rotation over a multi-frame
+window. Coherent low-speed hand-held motion therefore remains dynamic.
 
 Run `audit_stage1_rigid_supervision.py` before training. It reports hand,
 object, and relative residual distributions, 2D projection error, left/right
