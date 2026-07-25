@@ -163,6 +163,12 @@ regularizes the second difference of the pose correction. Boundary-candidate
 edges receive extra weight; frames outside the selected interval are copied
 without modification.
 
+`segment_and_consolidate_foundationpose_tapir.py` uses median-filtered TAPIR
+center and rotation speed with hysteresis to label static and dynamic spans.
+Confirmed static spans share one robust translation/SO(3) mean pose after
+trimming transition frames; dynamic spans are reported but left untouched for
+the subsequent local pose-graph pass.
+
 Run `audit_stage1_rigid_supervision.py` before training. It reports hand,
 object, and relative residual distributions, 2D projection error, left/right
 breakdowns, and streams exceeding the configured residual range.
