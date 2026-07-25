@@ -156,6 +156,13 @@ modifying either trajectory. Translation speed is measured at the tracked
 object center, not from the raw camera-frame SE(3) translation component, which
 would incorrectly amplify rotation at large camera depth.
 
+`refine_foundationpose_with_tapir_pose_graph.py` performs the corresponding
+local correction. It fixes both interval endpoints, keeps every interior pose
+near FoundationPose, applies TAPIR PnP center/rotation edge constraints, and
+regularizes the second difference of the pose correction. Boundary-candidate
+edges receive extra weight; frames outside the selected interval are copied
+without modification.
+
 Run `audit_stage1_rigid_supervision.py` before training. It reports hand,
 object, and relative residual distributions, 2D projection error, left/right
 breakdowns, and streams exceeding the configured residual range.
