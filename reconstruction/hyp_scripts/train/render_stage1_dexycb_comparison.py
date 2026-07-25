@@ -119,8 +119,11 @@ def numeric_frames(path: Path) -> list[Path]:
     for candidate in path.iterdir():
         if candidate.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
             continue
+        stem = candidate.stem
+        if stem.startswith("color_"):
+            stem = stem[len("color_") :]
         try:
-            frame_index = int(candidate.stem)
+            frame_index = int(stem)
         except ValueError:
             continue
         paths.append((frame_index, candidate))
