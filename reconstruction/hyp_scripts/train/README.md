@@ -165,6 +165,12 @@ without modification. It can read a segmentation audit, keep only the
 pre-motion endpoint fixed with `--free-end`, and increase correction smoothness
 continuously at low TAPIR speed with `--adaptive-smoothing`.
 
+`refine_foundationpose_tapir_piecewise.py` reads all dynamic spans from the
+segmentation audit and runs the local pose graph independently on each one.
+Neighboring static poses become fixed endpoints. A dynamic span reaching the
+last frame uses a free endpoint with a soft FoundationPose prior. Segment
+outputs are chained and merged into one final pose JSON.
+
 `segment_and_consolidate_foundationpose_tapir.py` uses median-filtered TAPIR
 center and rotation speed with hysteresis to label static and dynamic spans.
 Confirmed static spans share one robust translation/SO(3) mean pose after
