@@ -17,6 +17,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--foundationpose-json", required=True)
     parser.add_argument("--out-rts-json", required=True)
     parser.add_argument("--out-ekf-json")
+    parser.add_argument(
+        "--segmentation-audit-json",
+        help="Only filter dynamic_segments from this TAPIR segmentation audit.",
+    )
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--translation-measurement-mm", type=float, default=4.0)
     parser.add_argument(
@@ -310,19 +314,69 @@ def main() -> None:
     source_poses = np.stack([item[2] for item in valid])
     ekf_poses = source_poses.copy()
     rts_poses = source_poses.copy()
-    segment_start = 0
-    for index in range(1, len(valid) + 1):
-        segment_end = index == len(valid)
-        if not segment_end:
-            segment_end = int(valid[index][0]) != int(valid[index - 1][0]) + 1
-        if not segment_end:
-            continue
-        segment_ekf, segment_rts = filter_segment(
-            source_poses[segment_start:index], args
+    filtered_segments = []
+    if args.segmentation_audit_json:
+        segmentation_path = (
+            Path(args.segmentation_audit_json).expanduser().resolve()
         )
-        ekf_poses[segment_start:index] = segment_ekf
-        rts_poses[segment_start:index] = segment_rts
-        segment_start = index
+        segmentation = json.loads(
+            segmentation_path.read_text(encoding="utf-8")
+        )
+        for segment_index, segment in enumerate(
+            segmentation.get("dynamic_segments", [])
+        ):
+            start, end = [
+                int(value) for value in segment["output_frames"]
+            ]
+            if not 0 <= start <= end < len(valid):
+                raise ValueError(
+                    f"Invalid dynamic segment [{start}, {end}] for "
+                    f"{len(valid)} poses"
+                )
+            segment_ekf, segment_rts = filter_segment(
+                source_poses[start : end + 1], args
+            )
+            ekf_poses[start : end + 1] = segment_ekf
+            rts_poses[start : end + 1] = segment_rts
+            filtered_segments.append(
+                {
+                    "segment_index": segment_index,
+                    "output_frames": [start, end],
+                    "original_frames": [
+                        valid[start][0],
+                        valid[end][0],
+                    ],
+                    "num_frames": end - start + 1,
+                }
+            )
+    else:
+        segmentation_path = None
+        segment_start = 0
+        for index in range(1, len(valid) + 1):
+            segment_end = index == len(valid)
+            if not segment_end:
+                segment_end = (
+                    int(valid[index][0]) != int(valid[index - 1][0]) + 1
+                )
+            if not segment_end:
+                continue
+            segment_ekf, segment_rts = filter_segment(
+                source_poses[segment_start:index], args
+            )
+            ekf_poses[segment_start:index] = segment_ekf
+            rts_poses[segment_start:index] = segment_rts
+            filtered_segments.append(
+                {
+                    "segment_index": len(filtered_segments),
+                    "output_frames": [segment_start, index - 1],
+                    "original_frames": [
+                        valid[segment_start][0],
+                        valid[index - 1][0],
+                    ],
+                    "num_frames": index - segment_start,
+                }
+            )
+            segment_start = index
 
     ekf_payload = copy.deepcopy(payload)
     rts_payload = copy.deepcopy(payload)
@@ -337,6 +391,10 @@ def main() -> None:
         "out_ekf_json": str(ekf_path),
         "out_rts_json": str(rts_path),
         "num_valid_poses": len(valid),
+        "segmentation_audit_json": (
+            str(segmentation_path) if segmentation_path else None
+        ),
+        "filtered_segments": filtered_segments,
         "settings": vars(args),
         "trajectory": {
             "initial": trajectory_metrics(source_poses),
