@@ -30,6 +30,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--angular-acceleration-deg-s2", type=float, default=90.0
     )
+    parser.add_argument(
+        "--boundary-blend-frames",
+        type=int,
+        default=0,
+        help=(
+            "Align each filtered dynamic segment to adjacent static poses and "
+            "decay the alignment over this many dynamic frames."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -205,6 +214,62 @@ def filter_segment(
     return ekf, rts
 
 
+def cosine_decay(index: int, blend_frames: int) -> float:
+    if blend_frames <= 0 or index >= blend_frames:
+        return 0.0
+    progress = index / float(blend_frames)
+    return float(0.5 * (1.0 + np.cos(np.pi * progress)))
+
+
+def apply_pose_offset(
+    poses: np.ndarray,
+    reference_pose: np.ndarray,
+    at_start: bool,
+    blend_frames: int,
+) -> dict:
+    if blend_frames <= 0 or not len(poses):
+        return {
+            "enabled": False,
+            "translation_mm": 0.0,
+            "rotation_deg": 0.0,
+        }
+    endpoint_index = 0 if at_start else len(poses) - 1
+    endpoint = poses[endpoint_index].copy()
+    translation_offset = reference_pose[:3, 3] - endpoint[:3, 3]
+    rotation_offset = Rotation.from_matrix(
+        reference_pose[:3, :3] @ endpoint[:3, :3].T
+    ).as_rotvec()
+    for local_index in range(min(blend_frames + 1, len(poses))):
+        pose_index = local_index if at_start else len(poses) - 1 - local_index
+        weight = cosine_decay(local_index, blend_frames)
+        poses[pose_index, :3, 3] += weight * translation_offset
+        poses[pose_index, :3, :3] = (
+            Rotation.from_rotvec(weight * rotation_offset).as_matrix()
+            @ poses[pose_index, :3, :3]
+        )
+    return {
+        "enabled": True,
+        "translation_mm": float(np.linalg.norm(translation_offset) * 1000.0),
+        "rotation_deg": float(np.degrees(np.linalg.norm(rotation_offset))),
+    }
+
+
+def boundary_jump(
+    poses: np.ndarray, left_index: int, right_index: int
+) -> dict:
+    translation = np.linalg.norm(
+        poses[right_index, :3, 3] - poses[left_index, :3, 3]
+    )
+    rotation = Rotation.from_matrix(
+        poses[right_index, :3, :3]
+        @ poses[left_index, :3, :3].T
+    ).magnitude()
+    return {
+        "translation_mm": float(translation * 1000.0),
+        "rotation_deg": float(np.degrees(rotation)),
+    }
+
+
 def angular_speed(rotations: np.ndarray) -> np.ndarray:
     if len(rotations) < 2:
         return np.empty(0, dtype=np.float64)
@@ -336,19 +401,60 @@ def main() -> None:
             segment_ekf, segment_rts = filter_segment(
                 source_poses[start : end + 1], args
             )
+            ekf_boundary = {}
+            rts_boundary = {}
+            if start > 0 and args.boundary_blend_frames > 0:
+                ekf_boundary["start"] = apply_pose_offset(
+                    segment_ekf,
+                    source_poses[start - 1],
+                    at_start=True,
+                    blend_frames=args.boundary_blend_frames,
+                )
+                rts_boundary["start"] = apply_pose_offset(
+                    segment_rts,
+                    source_poses[start - 1],
+                    at_start=True,
+                    blend_frames=args.boundary_blend_frames,
+                )
+            if end + 1 < len(source_poses) and args.boundary_blend_frames > 0:
+                ekf_boundary["end"] = apply_pose_offset(
+                    segment_ekf,
+                    source_poses[end + 1],
+                    at_start=False,
+                    blend_frames=args.boundary_blend_frames,
+                )
+                rts_boundary["end"] = apply_pose_offset(
+                    segment_rts,
+                    source_poses[end + 1],
+                    at_start=False,
+                    blend_frames=args.boundary_blend_frames,
+                )
             ekf_poses[start : end + 1] = segment_ekf
             rts_poses[start : end + 1] = segment_rts
-            filtered_segments.append(
-                {
-                    "segment_index": segment_index,
-                    "output_frames": [start, end],
-                    "original_frames": [
-                        valid[start][0],
-                        valid[end][0],
-                    ],
-                    "num_frames": end - start + 1,
+            report = {
+                "segment_index": segment_index,
+                "output_frames": [start, end],
+                "original_frames": [
+                    valid[start][0],
+                    valid[end][0],
+                ],
+                "num_frames": end - start + 1,
+                "ekf_boundary_alignment": ekf_boundary,
+                "rts_boundary_alignment": rts_boundary,
+            }
+            if start > 0:
+                report["start_boundary_jump"] = {
+                    "input": boundary_jump(source_poses, start - 1, start),
+                    "ekf": boundary_jump(ekf_poses, start - 1, start),
+                    "rts": boundary_jump(rts_poses, start - 1, start),
                 }
-            )
+            if end + 1 < len(source_poses):
+                report["end_boundary_jump"] = {
+                    "input": boundary_jump(source_poses, end, end + 1),
+                    "ekf": boundary_jump(ekf_poses, end, end + 1),
+                    "rts": boundary_jump(rts_poses, end, end + 1),
+                }
+            filtered_segments.append(report)
     else:
         segmentation_path = None
         segment_start = 0
