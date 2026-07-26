@@ -398,7 +398,8 @@ def main() -> None:
     )
     visualization = out_dir / "visualization"
     for name, pose_json in (
-        ("input", static_json),
+        ("input", foundationpose_json),
+        ("static_shared", static_json),
         ("ekf", ekf_json),
         ("rts", rts_json),
     ):
@@ -470,7 +471,7 @@ def main() -> None:
         "rts_audit": str(rts_audit),
         "visualization": {
             name: str(visualization / name)
-            for name in ("input", "ekf", "rts")
+            for name in ("input", "static_shared", "ekf", "rts")
         },
         "gt": str(gt_dir) if args.prepare_gt else None,
     }
