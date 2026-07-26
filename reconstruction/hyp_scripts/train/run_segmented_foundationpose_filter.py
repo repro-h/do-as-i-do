@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -50,6 +51,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-points", type=int, default=128)
     parser.add_argument("--preview", action="store_true")
     parser.add_argument("--prepare-gt", action="store_true")
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help=(
+            "Skip visualization adapters and remove temporary frames, TAPIR "
+            "tracks, plots, and CSV files after a successful run."
+        ),
+    )
     parser.add_argument(
         "--mano-data-dir",
         default=(
@@ -391,43 +400,44 @@ def main() -> None:
         overwrite=args.overwrite,
     )
 
-    adapter = (
-        repository
-        / "reconstruction/hyp_scripts/"
-        "prepare_foundationpose_handflow_visualization.py"
-    )
     visualization = out_dir / "visualization"
-    for name, pose_json in (
-        ("input", foundationpose_json),
-        ("static_shared", static_json),
-        ("ekf", ekf_json),
-        ("rts", rts_json),
-    ):
-        adapter_out = visualization / name
-        run(
-            [
-                sys.executable,
-                str(adapter),
-                "--foundationpose-json",
-                str(pose_json),
-                "--frame-map-json",
-                str(frame_map_json),
-                "--handflow-npz",
-                str(handflow_path),
-                "--out-dir",
-                str(adapter_out),
-                "--hand-side",
-                record["hand_side"],
-                "--invalid-hand-mode",
-                "keep",
-            ],
-            adapter_out / "run.log",
-            [
-                adapter_out / "foundationpose_layout_camera_frame.json",
-                adapter_out / "all_hand_meshes_handflow.npz",
-            ],
-            overwrite=args.overwrite,
+    if not args.compact:
+        adapter = (
+            repository
+            / "reconstruction/hyp_scripts/"
+            "prepare_foundationpose_handflow_visualization.py"
         )
+        for name, pose_json in (
+            ("input", foundationpose_json),
+            ("static_shared", static_json),
+            ("ekf", ekf_json),
+            ("rts", rts_json),
+        ):
+            adapter_out = visualization / name
+            run(
+                [
+                    sys.executable,
+                    str(adapter),
+                    "--foundationpose-json",
+                    str(pose_json),
+                    "--frame-map-json",
+                    str(frame_map_json),
+                    "--handflow-npz",
+                    str(handflow_path),
+                    "--out-dir",
+                    str(adapter_out),
+                    "--hand-side",
+                    record["hand_side"],
+                    "--invalid-hand-mode",
+                    "keep",
+                ],
+                adapter_out / "run.log",
+                [
+                    adapter_out / "foundationpose_layout_camera_frame.json",
+                    adapter_out / "all_hand_meshes_handflow.npz",
+                ],
+                overwrite=args.overwrite,
+            )
 
     gt_dir = out_dir / "gt"
     if args.prepare_gt:
@@ -462,23 +472,41 @@ def main() -> None:
         "uses_custom_trained_checkpoint": False,
         "foundationpose_json": str(foundationpose_json),
         "tapir_checkpoint": str(tapir_checkpoint),
-        "tracks_npz": str(tracks_npz),
+        "compact": args.compact,
+        "tracks_npz": None if args.compact else str(tracks_npz),
         "motion_audit": str(motion_json),
         "segmentation_audit": str(segment_audit),
         "static_consolidated_json": str(static_json),
         "ekf_json": str(ekf_json),
         "rts_json": str(rts_json),
         "rts_audit": str(rts_audit),
-        "visualization": {
-            name: str(visualization / name)
-            for name in ("input", "static_shared", "ekf", "rts")
-        },
+        "visualization": (
+            None
+            if args.compact
+            else {
+                name: str(visualization / name)
+                for name in ("input", "static_shared", "ekf", "rts")
+            }
+        ),
         "gt": str(gt_dir) if args.prepare_gt else None,
     }
     summary_path = out_dir / "pipeline_summary.json"
     summary_path.write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
     )
+    if args.compact:
+        shutil.rmtree(frames_dir, ignore_errors=True)
+        shutil.rmtree(tracks_dir, ignore_errors=True)
+        for path in (
+            frame_map_json,
+            camera_json,
+            out_dir / "selected_stream.json",
+            motion_csv,
+            motion_dir / "speed_comparison.png",
+            segment_dir / "motion_segments.png",
+        ):
+            if path.is_file() or path.is_symlink():
+                path.unlink()
     print(json.dumps(summary, indent=2))
     print(f"Done: {summary_path}")
 
