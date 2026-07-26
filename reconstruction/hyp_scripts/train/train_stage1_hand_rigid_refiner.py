@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,6 +53,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-target-center-mm", type=float, default=120.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb-project", default="do-as-i-do-hand-rigid")
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--wandb-name", default=None)
     return parser.parse_args()
 
 
@@ -393,12 +398,18 @@ def compute_loss(model, batch, args, epoch):
     return total, losses, diagnostics, corrected_center
 
 
-def run_epoch(model, loader, args, epoch, optimizer=None):
+def run_epoch(model, loader, args, epoch, optimizer=None, split="train"):
     training = optimizer is not None
     model.train(training)
     sums, count = {}, 0
     initial_errors, corrected_errors = [], []
-    for batch in loader:
+    progress = tqdm(
+        loader,
+        desc=f"epoch {epoch:03d} {split}",
+        dynamic_ncols=True,
+        leave=True,
+    )
+    for batch in progress:
         with torch.set_grad_enabled(training):
             total, losses, diagnostics, corrected = compute_loss(
                 model, batch, args, epoch
@@ -422,6 +433,13 @@ def run_epoch(model, loader, args, epoch, optimizer=None):
         for key, value in values.items():
             sums[key] = sums.get(key, 0.0) + float(value.detach())
         count += 1
+        progress.set_postfix(
+            total=f"{sums['total'] / count:.5f}",
+            center=f"{sums['center'] / count:.5f}",
+            mesh=f"{sums['mesh'] / count:.5f}",
+            pen=f"{sums['penetration'] / count:.5f}",
+            contact=f"{sums['contact'] / count:.5f}",
+        )
     metrics = {key: value / max(count, 1) for key, value in sums.items()}
     if not training and initial_errors:
         initial = torch.cat(initial_errors)
@@ -468,11 +486,31 @@ def main() -> None:
     )
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    wandb_run = None
+    if args.wandb:
+        try:
+            import wandb
+        except ImportError as error:
+            raise RuntimeError(
+                "--wandb was requested but wandb is not installed"
+            ) from error
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_name,
+            config=vars(args),
+            dir=str(out_dir),
+        )
+        wandb.watch(model, log="gradients", log_freq=200)
     history, best = [], float("inf")
     for epoch in range(1, args.epochs + 1):
-        train_metrics = run_epoch(model, train_loader, args, epoch, optimizer)
+        train_metrics = run_epoch(
+            model, train_loader, args, epoch, optimizer, split="train"
+        )
         with torch.no_grad():
-            val_metrics = run_epoch(model, val_loader, args, epoch)
+            val_metrics = run_epoch(
+                model, val_loader, args, epoch, split="val"
+            )
         scheduler.step()
         row = {
             "epoch": epoch,
@@ -482,6 +520,18 @@ def main() -> None:
         }
         history.append(row)
         print(json.dumps(row), flush=True)
+        if wandb_run is not None:
+            flat_metrics = {"epoch": epoch, "lr": row["lr"]}
+            for split_name, metrics in (
+                ("train", train_metrics),
+                ("val", val_metrics),
+            ):
+                for key, value in metrics.items():
+                    if isinstance(value, (int, float)):
+                        flat_metrics[f"{split_name}/{key}"] = value
+                for key, value in metrics.get("center_error", {}).items():
+                    flat_metrics[f"{split_name}/center_error/{key}"] = value
+            wandb_run.log(flat_metrics, step=epoch)
         checkpoint = {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -497,6 +547,8 @@ def main() -> None:
         (out_dir / "history.json").write_text(
             json.dumps(history, indent=2), encoding="utf-8"
         )
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

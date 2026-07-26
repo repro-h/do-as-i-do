@@ -67,7 +67,11 @@ def pose_rows(path: Path) -> dict[str, np.ndarray]:
 
 def mesh(path: Path) -> trimesh.Trimesh:
     loaded = trimesh.load(path, process=False)
-    result = loaded.dump(concatenate=True) if isinstance(loaded, trimesh.Scene) else loaded
+    if isinstance(loaded, trimesh.Scene):
+        geometries = tuple(loaded.geometry.values())
+        result = trimesh.util.concatenate(geometries)
+    else:
+        result = loaded
     if not len(result.vertices) or not len(result.faces):
         raise ValueError(f"Empty mesh: {path}")
     return result
@@ -239,7 +243,8 @@ def prepare_stream(
         record["hand_side"] == "left",
         sample_indices,
     )
-    gt_centers = np.nanmean(gt_vertices, axis=1).astype(np.float32)
+    gt_centers = np.full((count, 3), np.nan, dtype=np.float32)
+    gt_centers[gt_valid] = gt_vertices[gt_valid].mean(axis=1)
 
     filtered_json = (
         filtered_root
