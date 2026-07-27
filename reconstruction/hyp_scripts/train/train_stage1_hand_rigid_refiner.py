@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import random
 from functools import lru_cache
@@ -22,6 +23,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-windows", required=True)
     parser.add_argument("--val-windows", required=True)
     parser.add_argument("--out-dir", required=True)
+    parser.add_argument(
+        "--init-checkpoint",
+        default=None,
+        help=(
+            "Load model weights from this checkpoint, but start a fresh "
+            "optimizer and learning-rate schedule."
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -40,6 +49,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-velocity", type=float, default=0.15)
     parser.add_argument("--w-acceleration", type=float, default=0.25)
     parser.add_argument("--w-residual", type=float, default=0.02)
+    parser.add_argument(
+        "--w-init-anchor",
+        type=float,
+        default=0.0,
+        help=(
+            "Keep fine-tuned translation/rotation residuals near the "
+            "--init-checkpoint predictions."
+        ),
+    )
     parser.add_argument("--w-rotation-smooth", type=float, default=0.05)
     parser.add_argument("--w-penetration", type=float, default=0.5)
     parser.add_argument("--w-contact", type=float, default=0.15)
@@ -310,7 +328,7 @@ def contact_and_penetration(corrected, anchors, normals, candidate, valid, args)
     return contact_loss, penetration_loss, diagnostics
 
 
-def compute_loss(model, batch, args, epoch):
+def compute_loss(model, batch, args, epoch, reference_model=None):
     batch = {key: value.to(args.device) for key, value in batch.items()}
     translation, rotation_vector = model(
         batch["features"],
@@ -364,6 +382,20 @@ def compute_loss(model, batch, args, epoch):
         ) + 0.1 * masked_mean(rotation_vector.square(), valid),
         "rotation_smooth": temporal_zero_loss(rotation_vector, valid, 2),
     }
+    if reference_model is not None:
+        with torch.no_grad():
+            reference_translation, reference_rotation = reference_model(
+                batch["features"],
+                args.max_translation_mm / 1000.0,
+                np.deg2rad(args.max_rotation_deg),
+            )
+        losses["init_anchor"] = masked_mean(
+            (translation - reference_translation).square(), valid
+        ) + 0.1 * masked_mean(
+            (rotation_vector - reference_rotation).square(), valid
+        )
+    else:
+        losses["init_anchor"] = translation.sum() * 0.0
     anchors, normals = transform_object_surface(batch)
     contact, penetration, diagnostics = contact_and_penetration(
         corrected_vertices,
@@ -391,6 +423,7 @@ def compute_loss(model, batch, args, epoch):
         + args.w_velocity * losses["velocity"]
         + args.w_acceleration * losses["acceleration"]
         + args.w_residual * losses["residual"]
+        + args.w_init_anchor * losses["init_anchor"]
         + args.w_rotation_smooth * losses["rotation_smooth"]
         + penetration_scale * args.w_penetration * losses["penetration"]
         + contact_scale * args.w_contact * losses["contact"]
@@ -398,7 +431,15 @@ def compute_loss(model, batch, args, epoch):
     return total, losses, diagnostics, corrected_center
 
 
-def run_epoch(model, loader, args, epoch, optimizer=None, split="train"):
+def run_epoch(
+    model,
+    loader,
+    args,
+    epoch,
+    optimizer=None,
+    split="train",
+    reference_model=None,
+):
     training = optimizer is not None
     model.train(training)
     sums, count = {}, 0
@@ -412,7 +453,7 @@ def run_epoch(model, loader, args, epoch, optimizer=None, split="train"):
     for batch in progress:
         with torch.set_grad_enabled(training):
             total, losses, diagnostics, corrected = compute_loss(
-                model, batch, args, epoch
+                model, batch, args, epoch, reference_model
             )
             if training:
                 optimizer.zero_grad(set_to_none=True)
@@ -478,6 +519,34 @@ def main() -> None:
     model = HandRigidTemporalRefiner(
         input_dim, args.hidden_dim, args.layers, args.heads, args.dropout
     ).to(args.device)
+    initialized_from = None
+    reference_model = None
+    if args.init_checkpoint:
+        init_path = Path(args.init_checkpoint).expanduser().resolve()
+        initial = torch.load(init_path, map_location="cpu")
+        initial_input_dim = int(initial.get("input_dim", input_dim))
+        if initial_input_dim != input_dim:
+            raise ValueError(
+                f"Checkpoint input_dim={initial_input_dim}, "
+                f"current input_dim={input_dim}"
+            )
+        model.load_state_dict(initial["model"], strict=True)
+        initialized_from = {
+            "checkpoint": str(init_path),
+            "epoch": int(initial.get("epoch", -1)),
+            "val_total": float(initial.get("val_total", float("nan"))),
+        }
+        print(
+            "Initialized model from "
+            f"{initialized_from['checkpoint']} "
+            f"(epoch={initialized_from['epoch']}, "
+            f"val_total={initialized_from['val_total']})",
+            flush=True,
+        )
+        if args.w_init_anchor > 0.0:
+            reference_model = copy.deepcopy(model).eval()
+            for parameter in reference_model.parameters():
+                parameter.requires_grad_(False)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
@@ -505,11 +574,22 @@ def main() -> None:
     history, best = [], float("inf")
     for epoch in range(1, args.epochs + 1):
         train_metrics = run_epoch(
-            model, train_loader, args, epoch, optimizer, split="train"
+            model,
+            train_loader,
+            args,
+            epoch,
+            optimizer,
+            split="train",
+            reference_model=reference_model,
         )
         with torch.no_grad():
             val_metrics = run_epoch(
-                model, val_loader, args, epoch, split="val"
+                model,
+                val_loader,
+                args,
+                epoch,
+                split="val",
+                reference_model=reference_model,
             )
         scheduler.step()
         row = {
@@ -537,6 +617,7 @@ def main() -> None:
             "optimizer": optimizer.state_dict(),
             "args": vars(args),
             "input_dim": input_dim,
+            "initialized_from": initialized_from,
             "epoch": epoch,
             "val_total": val_metrics["total"],
         }
