@@ -46,7 +46,10 @@ def load_jsonl(path: Path) -> list[dict]:
 
 
 def relative_median(row: dict, stage: str) -> Optional[float]:
-    value = (row.get("metrics") or {}).get(f"{stage}_relative", {}).get("median_mm")
+    metrics = row.get("metrics") or {}
+    value = metrics.get(f"{stage}_relative", {}).get("median_mm")
+    if value is None:
+        value = metrics.get(f"{stage}_center", {}).get("median_mm")
     return float(value) if value is not None else None
 
 
@@ -175,11 +178,17 @@ def main() -> None:
         path.mkdir(parents=True, exist_ok=True)
 
     prediction_path = Path(
-        prediction.get(
-            "prediction",
-            prediction_root / stream_id / "stage1_rigid_prediction.npz",
+        prediction.get("result")
+        or prediction.get("prediction")
+        or (
+            prediction_root
+            / stream_id
+            / "handflow_camera_result_stage1_hand_rigid.npz"
         )
     ).resolve()
+    prediction_is_corrected_handflow = (
+        prediction_path.name == "handflow_camera_result_stage1_hand_rigid.npz"
+    )
     handflow_path = (handflow_root / stream_id / "handflow_camera_result.npz").resolve()
     foundationpose_path = Path(record["foundationpose_json"]).resolve()
     object_mesh = Path(record["sam3d_glb"]).resolve()
@@ -255,15 +264,21 @@ def main() -> None:
     if args.force_prepare or not original_layout.is_file():
         run(common + ["--out-dir", str(original_out)])
     if args.force_prepare or not corrected_layout.is_file():
-        run(
-            common
-            + [
-                "--stage1-prediction",
-                str(prediction_path),
-                "--out-dir",
-                str(corrected_out),
-            ]
-        )
+        if prediction_is_corrected_handflow:
+            corrected_common = common.copy()
+            handflow_index = corrected_common.index("--handflow-npz") + 1
+            corrected_common[handflow_index] = str(prediction_path)
+            run(corrected_common + ["--out-dir", str(corrected_out)])
+        else:
+            run(
+                common
+                + [
+                    "--stage1-prediction",
+                    str(prediction_path),
+                    "--out-dir",
+                    str(corrected_out),
+                ]
+            )
 
     intrinsics = load_intrinsics(handflow_path, foundationpose_path)
     camera = {
@@ -279,7 +294,12 @@ def main() -> None:
     before = relative_median(prediction, "initial")
     after = relative_median(prediction, "corrected")
     print(f"Selected: {stream_id}")
-    print(f"Relative median: {before:.3f} -> {after:.3f} mm")
+    metric_label = (
+        "Hand-center median"
+        if prediction_is_corrected_handflow
+        else "Relative median"
+    )
+    print(f"{metric_label}: {before:.3f} -> {after:.3f} mm")
     print(f"Prepared: {stream_out}")
     if args.prepare_only:
         return
