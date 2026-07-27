@@ -28,11 +28,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-enter-mm", type=float, default=8.0)
     parser.add_argument("--contact-target-mm", type=float, default=2.0)
     parser.add_argument("--penetration-tolerance-mm", type=float, default=1.5)
+    parser.add_argument(
+        "--penetration-max-distance-mm",
+        type=float,
+        default=20.0,
+        help=(
+            "Only trust nearest-normal penetration signs within this surface "
+            "distance. This avoids classifying distant points by a local "
+            "surface tangent half-space."
+        ),
+    )
     parser.add_argument("--min-contact-points", type=int, default=3)
     parser.add_argument("--contact-topk", type=int, default=12)
     parser.add_argument("--enter-patience", type=int, default=3)
     parser.add_argument("--exit-patience", type=int, default=5)
     parser.add_argument("--contact-update-frames", type=int, default=8)
+    parser.add_argument(
+        "--contact-start-frame",
+        type=int,
+        default=-1,
+        help="Ignore contact candidates before this output frame.",
+    )
+    parser.add_argument(
+        "--contact-end-frame",
+        type=int,
+        default=-1,
+        help="Ignore contact candidates after this output frame.",
+    )
     parser.add_argument("--normal-dot-max", type=float, default=-0.1)
     parser.add_argument(
         "--translation-mode",
@@ -343,6 +365,10 @@ def main() -> None:
             & (normal_dot <= args.normal_dot_max)
             & torch.from_numpy(valid).to(device)[:, None]
         )
+        if args.contact_start_frame >= 0:
+            candidates[: args.contact_start_frame] = False
+        if args.contact_end_frame >= 0:
+            candidates[args.contact_end_frame + 1 :] = False
 
     contact_mask_np, updates = contact_states(
         candidates.cpu().numpy(),
@@ -396,8 +422,12 @@ def main() -> None:
             corrected, object_points, object_normals
         )
 
-        penetration = F.relu(
-            inside - args.penetration_tolerance_mm / 1000.0
+        penetration_trusted = (
+            distance <= args.penetration_max_distance_mm / 1000.0
+        )
+        penetration = (
+            F.relu(inside - args.penetration_tolerance_mm / 1000.0)
+            * penetration_trusted
         )
         penetration_loss = (
             penetration.square() * valid_tensor[:, None]
@@ -514,12 +544,24 @@ def main() -> None:
     np.savez_compressed(output_path, **output)
 
     initial_penetrating = (
-        initial_inside.cpu().numpy()
-        > args.penetration_tolerance_mm / 1000.0
+        (
+            initial_inside.cpu().numpy()
+            > args.penetration_tolerance_mm / 1000.0
+        )
+        & (
+            initial_distance.cpu().numpy()
+            <= args.penetration_max_distance_mm / 1000.0
+        )
     ) & valid[:, None]
     final_penetrating = (
-        final_inside.cpu().numpy()
-        > args.penetration_tolerance_mm / 1000.0
+        (
+            final_inside.cpu().numpy()
+            > args.penetration_tolerance_mm / 1000.0
+        )
+        & (
+            final_distance.cpu().numpy()
+            <= args.penetration_max_distance_mm / 1000.0
+        )
     ) & valid[:, None]
     contact_values_initial = initial_distance.cpu().numpy()[contact_mask_np]
     contact_values_final = final_distance.cpu().numpy()[contact_mask_np]
@@ -527,12 +569,16 @@ def main() -> None:
         initial_inside.cpu().numpy()
         - args.penetration_tolerance_mm / 1000.0,
         0.0,
-    )[valid]
+    )
+    initial_penetration_depth[~initial_penetrating] = 0.0
+    initial_penetration_depth = initial_penetration_depth[valid]
     final_penetration_depth = np.maximum(
         final_inside.cpu().numpy()
         - args.penetration_tolerance_mm / 1000.0,
         0.0,
-    )[valid]
+    )
+    final_penetration_depth[~final_penetrating] = 0.0
+    final_penetration_depth = final_penetration_depth[valid]
     audit = {
         "hand_npz": str(hand_path),
         "supervision_npz": str(supervision_path),

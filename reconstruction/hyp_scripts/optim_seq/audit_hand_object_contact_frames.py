@@ -107,8 +107,11 @@ def main() -> None:
     initial_distance = initial_distance.cpu().numpy() * 1000.0
     final_distance = final_distance.cpu().numpy() * 1000.0
     tolerance = float(settings["penetration_tolerance_mm"])
+    max_distance = float(settings.get("penetration_max_distance_mm", np.inf))
     initial_depth = np.maximum(initial_inside.cpu().numpy() * 1000.0 - tolerance, 0.0)
     final_depth = np.maximum(final_inside.cpu().numpy() * 1000.0 - tolerance, 0.0)
+    initial_depth[initial_distance > max_distance] = 0.0
+    final_depth[final_distance > max_distance] = 0.0
 
     rows = []
     for frame in range(count):
@@ -162,6 +165,19 @@ def main() -> None:
         key=lambda row: row["regression_score"],
         reverse=True,
     )
+    final_ranked = sorted(
+        (
+            row
+            for row in rows
+            if row["valid"] and row["final_penetrating"] > 0
+        ),
+        key=lambda row: (
+            row["final_penetration_max_mm"],
+            row["final_penetration_p90_mm"],
+            row["final_penetrating"],
+        ),
+        reverse=True,
+    )
     summary = {
         "source_audit": str(audit_path),
         "num_frames": count,
@@ -172,6 +188,7 @@ def main() -> None:
             "max_or_contact_tolerance_mm": args.max_regression_tolerance_mm,
         },
         "worst_frames": ranked,
+        "worst_final_frames": final_ranked,
         "frames": rows,
     }
     (out_dir / "frame_audit.json").write_text(
@@ -198,6 +215,15 @@ def main() -> None:
             f"->{row['final_penetration_max_mm']:.2f} mm",
             f"contact {row['initial_contact_median_mm']:.2f}"
             f"->{row['final_contact_median_mm']:.2f} mm",
+        )
+    print("\nworst final frames:")
+    for row in final_ranked[:20]:
+        print(
+            f"{row['frame']:06d}",
+            f"count {row['final_penetrating']}",
+            f"p90 {row['final_penetration_p90_mm']:.2f} mm",
+            f"max {row['final_penetration_max_mm']:.2f} mm",
+            f"contact {row['final_contact_median_mm']:.2f} mm",
         )
     print(f"\nJSON: {out_dir / 'frame_audit.json'}")
     print(f"CSV: {out_dir / 'frame_audit.csv'}")
