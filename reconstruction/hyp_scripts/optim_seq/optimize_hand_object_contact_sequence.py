@@ -34,6 +34,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exit-patience", type=int, default=5)
     parser.add_argument("--contact-update-frames", type=int, default=8)
     parser.add_argument("--normal-dot-max", type=float, default=-0.1)
+    parser.add_argument(
+        "--translation-mode",
+        choices=("xyz", "ray_depth"),
+        default="xyz",
+        help=(
+            "Optimize free camera-space XYZ translation or one signed scalar "
+            "along each frame's initial wrist camera ray."
+        ),
+    )
     parser.add_argument("--max-translation-mm", type=float, default=20.0)
     parser.add_argument("--w-contact", type=float, default=2.0)
     parser.add_argument("--w-penetration", type=float, default=4.0)
@@ -229,6 +238,19 @@ def stats(values: np.ndarray, scale: float = 1.0) -> dict:
     }
 
 
+def signed_stats(values: np.ndarray, scale: float = 1.0) -> dict:
+    values = np.asarray(values, dtype=np.float64).reshape(-1) * scale
+    if not len(values):
+        return {"count": 0}
+    return {
+        "count": int(len(values)),
+        "min": float(values.min()),
+        "median": float(np.median(values)),
+        "p90": float(np.quantile(values, 0.9)),
+        "max": float(values.max()),
+    }
+
+
 def main() -> None:
     args = parse_args()
     np.random.seed(args.seed)
@@ -344,8 +366,15 @@ def main() -> None:
         projection_points = hand_tensor
         projection_target = project(projection_points, intrinsics_tensor)
 
+    wrist_ray = F.normalize(joint_tensor[:, 0], dim=-1, eps=1e-8)
+    translation_parameter_shape = (
+        (count, 1) if args.translation_mode == "ray_depth" else (count, 3)
+    )
     raw_translation = torch.zeros(
-        (count, 3), dtype=torch.float32, device=device, requires_grad=True
+        translation_parameter_shape,
+        dtype=torch.float32,
+        device=device,
+        requires_grad=True,
     )
     optimizer = torch.optim.Adam([raw_translation], lr=args.lr)
     max_translation = args.max_translation_mm / 1000.0
@@ -357,7 +386,11 @@ def main() -> None:
     )
     for step in range(1, args.steps + 1):
         optimizer.zero_grad(set_to_none=True)
-        translation = torch.tanh(raw_translation) * max_translation
+        bounded_translation = torch.tanh(raw_translation) * max_translation
+        if args.translation_mode == "ray_depth":
+            translation = bounded_translation * wrist_ray
+        else:
+            translation = bounded_translation
         corrected = hand_tensor + translation[:, None]
         distance, _, nearest_normal, inside = nearest_surface(
             corrected, object_points, object_normals
@@ -468,6 +501,12 @@ def main() -> None:
     output = dict(hand_payload)
     output["verts_cam"] = corrected_vertices.astype(np.float32)
     output["optim_seq_translation"] = translation_np.astype(np.float32)
+    output["optim_seq_translation_mode"] = np.asarray(args.translation_mode)
+    if args.translation_mode == "ray_depth":
+        ray_np = wrist_ray.cpu().numpy()
+        ray_depth_np = (translation * wrist_ray).sum(dim=-1).cpu().numpy()
+        output["optim_seq_camera_ray"] = ray_np.astype(np.float32)
+        output["optim_seq_ray_depth"] = ray_depth_np.astype(np.float32)
     output["optim_seq_contact_sample_indices"] = hand_indices.astype(np.int64)
     output["optim_seq_contact_mask"] = contact_mask_np
     output["optim_seq_source_hand"] = np.asarray(str(hand_path))
@@ -508,6 +547,14 @@ def main() -> None:
         "best_total": best_total,
         "translation_mm": stats(
             np.linalg.norm(translation_np, axis=-1), 1000.0
+        ),
+        "signed_ray_depth_mm": (
+            signed_stats(
+                (translation * wrist_ray).sum(dim=-1).cpu().numpy(),
+                1000.0,
+            )
+            if args.translation_mode == "ray_depth"
+            else None
         ),
         "contact_distance_mm": {
             "initial": stats(contact_values_initial, 1000.0),
