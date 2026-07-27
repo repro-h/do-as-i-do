@@ -9,6 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 
@@ -30,6 +31,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="val")
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--four-view-grid",
+        action="store_true",
+        help=(
+            "Render camera, side, rear, and top rows with columns ordered "
+            "as raw FoundationPose, DexYCB GT, and final correction."
+        ),
+    )
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
 
@@ -81,6 +90,61 @@ def prepare_frame_map(stream_dir: Path, frames_dir: Path, path: Path) -> dict:
     return payload
 
 
+def stack_view_triptychs(
+    sources: list[tuple[str, Path]],
+    output: Path,
+    fps: float,
+) -> None:
+    captures = [cv2.VideoCapture(str(path)) for _, path in sources]
+    try:
+        if not all(capture.isOpened() for capture in captures):
+            raise RuntimeError(f"Cannot open one of: {[str(path) for _, path in sources]}")
+        widths = [int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)) for capture in captures]
+        heights = [int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)) for capture in captures]
+        if len(set(widths)) != 1 or len(set(heights)) != 1:
+            raise RuntimeError(f"View video dimensions differ: {list(zip(widths, heights))}")
+        width, height = widths[0], heights[0]
+        writer = cv2.VideoWriter(
+            str(output),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (width, height * len(captures)),
+        )
+        if not writer.isOpened():
+            raise RuntimeError(f"Cannot create {output}")
+        try:
+            frame_index = 0
+            while True:
+                rows = []
+                for (label, _), capture in zip(sources, captures):
+                    ok, frame = capture.read()
+                    if not ok:
+                        rows = []
+                        break
+                    cv2.putText(
+                        frame,
+                        label,
+                        (16, 66),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.75,
+                        (40, 40, 40),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                    rows.append(frame)
+                if not rows:
+                    break
+                writer.write(np.concatenate(rows, axis=0))
+                frame_index += 1
+            if frame_index == 0:
+                raise RuntimeError("No frames were stacked")
+        finally:
+            writer.release()
+    finally:
+        for capture in captures:
+            capture.release()
+
+
 def main() -> None:
     args = parse_args()
     repository = Path(__file__).resolve().parents[3]
@@ -118,6 +182,7 @@ def main() -> None:
         / args.stream_id
         / "handflow_camera_result_stage1_hand_rigid.npz"
     )
+    raw_pose = Path(record["foundationpose_json"]).expanduser().resolve()
     filtered_pose = (
         filtered_root
         / args.split
@@ -132,7 +197,7 @@ def main() -> None:
         / "textured_simple.obj"
     )
     for path in (
-        original_handflow, corrected_handflow, filtered_pose,
+        original_handflow, corrected_handflow, raw_pose, filtered_pose,
         object_mesh, gt_object_mesh
     ):
         if not path.is_file():
@@ -143,9 +208,9 @@ def main() -> None:
         / "reconstruction/hyp_scripts/"
         "prepare_foundationpose_handflow_visualization.py"
     )
-    for handflow, out_dir in (
-        (original_handflow, original_out),
-        (corrected_handflow, corrected_out),
+    for handflow, pose_json, out_dir in (
+        (original_handflow, raw_pose, original_out),
+        (corrected_handflow, filtered_pose, corrected_out),
     ):
         expected = [
             out_dir / "foundationpose_layout_camera_frame.json",
@@ -158,7 +223,7 @@ def main() -> None:
                 sys.executable,
                 str(adapter),
                 "--foundationpose-json",
-                str(filtered_pose),
+                str(pose_json),
                 "--frame-map-json",
                 str(frame_map),
                 "--handflow-npz",
@@ -201,9 +266,7 @@ def main() -> None:
         / "reconstruction/hyp_scripts/train/"
         "render_stage1_dexycb_comparison.py"
     )
-    comparison = render_out / "before_after.mp4"
-    run(
-        [
+    render_base = [
             sys.executable,
             "-u",
             str(render_script),
@@ -225,8 +288,6 @@ def main() -> None:
             str(gt_object_mesh),
             "--gt-hand-meshes",
             str(gt_hand),
-            "--out-dir",
-            str(render_out),
             "--hand-side",
             record["hand_side"],
             "--fx",
@@ -239,28 +300,57 @@ def main() -> None:
             str(float(intrinsic[1, 2])),
             "--fps",
             str(args.fps),
-            "--view",
-            "camera_clean",
             "--gt-separate-panel",
             "--original-label",
-            "Original HandFlow + Frozen Object",
+            "Original HandFlow + Raw FoundationPose",
             "--corrected-label",
-            "Stage1 Hand Rigid + Frozen Object",
+            "Stage1 Hand + Filtered Object",
             "--gt-label",
             "DexYCB Ground Truth",
             "--device",
             args.device,
-        ],
-        [] if args.force else [comparison],
+        ]
+    views = (
+        [
+            ("Camera view", "camera_clean"),
+            ("Side view", "side"),
+            ("Rear view", "rear"),
+            ("Top view", "top"),
+        ]
+        if args.four_view_grid
+        else [("Camera view", "camera_clean")]
     )
+    view_outputs = []
+    for view_label, view_name in views:
+        view_out = (
+            stream_out / f"render_{view_name}"
+            if args.four_view_grid
+            else render_out
+        )
+        view_out.mkdir(parents=True, exist_ok=True)
+        triptych = view_out / "foundationpose_gt_rts.mp4"
+        run(
+            render_base + ["--out-dir", str(view_out), "--view", view_name],
+            [] if args.force else [triptych],
+        )
+        view_outputs.append((view_label, triptych))
+    grid_output = None
+    if args.four_view_grid:
+        grid_output = stream_out / "grid_4views_x_3methods.mp4"
+        if args.force or not grid_output.is_file():
+            stack_view_triptychs(view_outputs, grid_output, args.fps)
     summary = {
         "stream_id": args.stream_id,
         "hand_side": record["hand_side"],
         "object_name": record["object_name"],
         "original_handflow": str(original_handflow),
+        "raw_foundationpose": str(raw_pose),
         "corrected_handflow": str(corrected_handflow),
         "filtered_object_pose": str(filtered_pose),
-        "comparison": str(comparison),
+        "four_view_grid": str(grid_output) if grid_output else None,
+        "view_triptychs": {
+            label: str(path) for label, path in view_outputs
+        },
     }
     (stream_out / "render_summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"

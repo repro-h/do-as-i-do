@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--view",
-        choices=("camera", "camera_clean", "side", "orbit"),
+        choices=("camera", "camera_clean", "side", "rear", "top", "orbit"),
         default="camera",
         help=(
             "RGB camera overlay, clean camera-axis 3D view, fixed 3D side "
@@ -200,11 +200,13 @@ def transform_to_view(
     distance: float,
 ) -> torch.Tensor:
     """Map camera-frame points to a synthetic right/down/forward camera."""
-    down = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+    down_hint = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
     forward = np.asarray(forward, dtype=np.float32)
     forward /= np.linalg.norm(forward)
-    right = np.cross(down, forward)
+    right = np.cross(down_hint, forward)
     right /= np.linalg.norm(right)
+    down = np.cross(forward, right)
+    down /= np.linalg.norm(down)
     relative = vertices - torch.as_tensor(center, dtype=torch.float32, device=vertices.device)
     basis = torch.as_tensor(
         np.stack([right, down, forward], axis=1),
@@ -493,12 +495,20 @@ def main() -> None:
                     image = np.full_like(image, 245)
                 if args.view == "side":
                     forward = np.asarray([-1.0, 0.0, 0.0], dtype=np.float32)
+                elif args.view == "rear":
+                    forward = np.asarray([0.0, 0.0, -1.0], dtype=np.float32)
+                elif args.view == "top":
+                    # Keep a small forward component so the synthetic camera
+                    # up vector is not collinear with the viewing direction.
+                    forward = np.asarray(
+                        [0.0, -0.94, 0.342], dtype=np.float32
+                    )
                 elif args.view == "orbit":
                     angle = 2.0 * np.pi * frame_index / max(len(frames), 1)
                     forward = np.asarray(
                         [np.sin(angle), 0.0, np.cos(angle)], dtype=np.float32
                     )
-                if args.view in ("side", "orbit"):
+                if args.view in ("side", "rear", "top", "orbit"):
                     view_spec = (view_center, forward, view_distance)
             overlay_gt = not args.gt_separate_panel
             label_color = (
