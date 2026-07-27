@@ -185,16 +185,13 @@ def contact_states(
         while cursor < end:
             chunk_end = min(cursor + args.contact_update_frames, end)
             score = candidates[cursor:chunk_end].sum(axis=0)
-            mean_distance = np.where(
-                score > 0,
-                np.where(
-                    candidates[cursor:chunk_end],
-                    distances[cursor:chunk_end],
-                    np.nan,
-                ),
-                np.nan,
-            )
-            mean_distance = np.nanmean(mean_distance, axis=0)
+            chunk_candidates = candidates[cursor:chunk_end]
+            distance_sum = np.where(
+                chunk_candidates, distances[cursor:chunk_end], 0.0
+            ).sum(axis=0)
+            mean_distance = np.full(hand_count, np.inf, dtype=np.float64)
+            observed = score > 0
+            mean_distance[observed] = distance_sum[observed] / score[observed]
             valid = np.flatnonzero(score > 0)
             if len(valid):
                 order = np.lexsort((mean_distance[valid], -score[valid]))
@@ -368,9 +365,11 @@ def main() -> None:
             penetration.square() * valid_tensor[:, None]
         ).sum() / valid_tensor.sum().clamp_min(1)
 
+        # signed_inside is positive inside and negative outside. Keep contact
+        # vertices on the exterior side instead of minimizing unsigned distance.
         contact_error = F.smooth_l1_loss(
-            distance,
-            torch.full_like(distance, args.contact_target_mm / 1000.0),
+            inside,
+            torch.full_like(inside, -args.contact_target_mm / 1000.0),
             reduction="none",
             beta=0.002,
         )
@@ -475,6 +474,16 @@ def main() -> None:
     ) & valid[:, None]
     contact_values_initial = initial_distance.cpu().numpy()[contact_mask_np]
     contact_values_final = final_distance.cpu().numpy()[contact_mask_np]
+    initial_penetration_depth = np.maximum(
+        initial_inside.cpu().numpy()
+        - args.penetration_tolerance_mm / 1000.0,
+        0.0,
+    )[valid]
+    final_penetration_depth = np.maximum(
+        final_inside.cpu().numpy()
+        - args.penetration_tolerance_mm / 1000.0,
+        0.0,
+    )[valid]
     audit = {
         "hand_npz": str(hand_path),
         "supervision_npz": str(supervision_path),
@@ -495,6 +504,16 @@ def main() -> None:
         "penetrating_sample_vertices": {
             "initial": int(initial_penetrating.sum()),
             "final": int(final_penetrating.sum()),
+        },
+        "penetration_depth_mm": {
+            "initial": stats(
+                initial_penetration_depth[initial_penetration_depth > 0],
+                1000.0,
+            ),
+            "final": stats(
+                final_penetration_depth[final_penetration_depth > 0],
+                1000.0,
+            ),
         },
         "history": history,
     }
