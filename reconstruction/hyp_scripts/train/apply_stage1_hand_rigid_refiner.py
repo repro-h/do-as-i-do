@@ -176,6 +176,10 @@ def main() -> None:
             np.asarray(supervision["supervision_valid"][:count]).astype(bool)
             & predicted[:count]
         )
+        supervision_valid = np.asarray(
+            supervision["supervision_valid"][:count]
+        ).astype(bool)
+        uncovered_valid = supervision_valid & ~predicted[:count]
         gt_center = np.asarray(
             supervision["gt_hand_center"][:count], dtype=np.float32
         )
@@ -191,6 +195,10 @@ def main() -> None:
             "num_frames": count,
             "num_predicted": int(predicted[:count].sum()),
             "num_evaluated": int(valid.sum()),
+            "num_uncovered_valid": int(uncovered_valid.sum()),
+            "uncovered_valid_frames": np.flatnonzero(
+                uncovered_valid
+            ).astype(int).tolist(),
         }
         stream_out.mkdir(parents=True, exist_ok=True)
         output = dict(handflow)
