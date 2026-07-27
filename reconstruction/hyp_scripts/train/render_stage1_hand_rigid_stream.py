@@ -22,6 +22,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mano-data-dir", required=True)
     parser.add_argument("--object-model-root", required=True)
     parser.add_argument("--out-root", required=True)
+    parser.add_argument(
+        "--gt-python",
+        default=sys.executable,
+        help="Python environment used to decode DexYCB MANO ground truth.",
+    )
     parser.add_argument("--split", default="val")
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--device", default="cuda")
@@ -172,7 +177,7 @@ def main() -> None:
     gt_layout = gt_out / "dexycb_gt_object_layout_camera_frame.json"
     run(
         [
-            sys.executable,
+            str(Path(args.gt_python).expanduser().resolve()),
             str(
                 repository
                 / "reconstruction/hyp_scripts/"
