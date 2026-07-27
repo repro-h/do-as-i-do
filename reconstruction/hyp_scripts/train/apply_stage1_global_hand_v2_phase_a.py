@@ -71,6 +71,7 @@ def main() -> None:
         int(config["layers"]),
         int(config["heads"]),
         float(config["dropout"]),
+        bool(config.get("correction_gate", False)),
     ).to(args.device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
@@ -84,6 +85,7 @@ def main() -> None:
     sums = {
         stream_id: {
             "translation": np.zeros((length, 3), dtype=np.float64),
+            "gate": np.zeros(length, dtype=np.float64),
             "weight": np.zeros(length, dtype=np.float64),
         }
         for stream_id, length in lengths.items()
@@ -92,15 +94,25 @@ def main() -> None:
     with torch.no_grad():
         for batch in loader:
             features = batch["features"].to(args.device)
-            translation = model(
+            prediction = model(
                 features, float(config["max_translation_mm"]) / 1000.0
-            ).cpu().numpy()
+            )
+            if bool(config.get("correction_gate", False)):
+                translation, gate = prediction
+                gate = gate.cpu().numpy()
+            else:
+                translation = prediction
+                gate = np.ones(translation.shape[:2], dtype=np.float32)
+            translation = translation.cpu().numpy()
             for index, stream_id in enumerate(batch["stream_id"]):
                 start = int(batch["start"][index])
                 end = int(batch["end"][index])
                 weights = blend_weights(end - start)
                 sums[stream_id]["translation"][start:end] += (
                     translation[index] * weights[:, None]
+                )
+                sums[stream_id]["gate"][start:end] += (
+                    gate[index] * weights
                 )
                 sums[stream_id]["weight"][start:end] += weights
 
@@ -118,6 +130,9 @@ def main() -> None:
         predicted = weight > 0.0
         translation_normalized = (
             values["translation"] / np.maximum(weight, 1e-8)[:, None]
+        ).astype(np.float32)
+        correction_gate = (
+            values["gate"] / np.maximum(weight, 1e-8)
         ).astype(np.float32)
         with np.load(supervision_paths[stream_id], allow_pickle=False) as raw:
             supervision = {key: np.asarray(raw[key]) for key in raw.files}
@@ -169,6 +184,7 @@ def main() -> None:
         output["verts_cam"] = corrected
         output["stage1_translation_normalized"] = translation_normalized[:count]
         output["stage1_translation_camera"] = translation_camera[:count]
+        output["stage1_correction_gate"] = correction_gate[:count]
         output["stage1_predicted"] = predicted[:count]
         output["stage1_checkpoint"] = np.asarray(str(checkpoint_path))
         output["stage1_source_handflow"] = np.asarray(str(handflow_path))

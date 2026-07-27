@@ -52,6 +52,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anchor-accurate-weight", type=float, default=4.0)
     parser.add_argument("--anchor-medium-weight", type=float, default=1.0)
     parser.add_argument("--anchor-large-error-weight", type=float, default=0.2)
+    parser.add_argument("--correction-gate", action="store_true")
+    parser.add_argument("--gate-zero-error-mm", type=float, default=10.0)
+    parser.add_argument("--gate-full-error-mm", type=float, default=30.0)
+    parser.add_argument("--w-gate", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--wandb", action="store_true")
@@ -154,9 +158,10 @@ class WindowDataset(Dataset):
 class TranslationRefiner(nn.Module):
     def __init__(
         self, input_dim: int, hidden_dim: int, layers: int,
-        heads: int, dropout: float
+        heads: int, dropout: float, correction_gate: bool = False
     ):
         super().__init__()
+        self.correction_gate = correction_gate
         self.input = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -182,10 +187,26 @@ class TranslationRefiner(nn.Module):
         nn.init.trunc_normal_(self.position, std=0.02)
         nn.init.zeros_(self.output[-1].weight)
         nn.init.zeros_(self.output[-1].bias)
+        if correction_gate:
+            self.gate = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 1),
+            )
+            nn.init.zeros_(self.gate[-1].weight)
+            nn.init.zeros_(self.gate[-1].bias)
 
     def forward(self, features: torch.Tensor, max_translation: float):
         token = self.input(features) + self.position[:, : features.shape[1]]
-        return torch.tanh(self.output(self.encoder(token))) * max_translation
+        encoded = self.encoder(token)
+        raw_translation = (
+            torch.tanh(self.output(encoded)) * max_translation
+        )
+        if not self.correction_gate:
+            return raw_translation
+        gate = torch.sigmoid(self.gate(encoded)).squeeze(-1)
+        return raw_translation * gate.unsqueeze(-1), gate
 
 
 def masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -229,9 +250,13 @@ def compute(model, batch, args):
         key: value.to(args.device) if torch.is_tensor(value) else value
         for key, value in batch.items()
     }
-    translation = model(
+    prediction = model(
         batch["features"], args.max_translation_mm / 1000.0
     )
+    if args.correction_gate:
+        translation, gate = prediction
+    else:
+        translation, gate = prediction, None
     pred = batch["pred_joints"]
     gt = batch["gt_joints"]
     valid = batch["valid"]
@@ -298,6 +323,16 @@ def compute(model, batch, args):
             beta,
         ),
     }
+    if gate is not None:
+        gate_range = max(
+            args.gate_full_error_mm - args.gate_zero_error_mm, 1e-6
+        )
+        gate_target = (
+            (initial_error * 1000.0 - args.gate_zero_error_mm) / gate_range
+        ).clamp(0.0, 1.0)
+        losses["gate"] = smooth_l1(
+            gate, gate_target, valid, beta=0.1
+        )
     total = (
         args.w_wrist * losses["wrist"]
         + args.w_palm * losses["palm"]
@@ -306,6 +341,8 @@ def compute(model, batch, args):
         + args.w_acceleration * losses["acceleration"]
         + args.w_residual * losses["residual"]
     )
+    if gate is not None:
+        total = total + args.w_gate * losses["gate"]
     before = torch.linalg.norm(pred[:, :, 0] - gt[:, :, 0], dim=-1)
     after = torch.linalg.norm(corrected[:, :, 0] - gt[:, :, 0], dim=-1)
     return total, losses, before[valid], after[valid]
@@ -374,7 +411,12 @@ def main() -> None:
     )
     input_dim = int(train_dataset[0]["features"].shape[-1])
     model = TranslationRefiner(
-        input_dim, args.hidden_dim, args.layers, args.heads, args.dropout
+        input_dim,
+        args.hidden_dim,
+        args.layers,
+        args.heads,
+        args.dropout,
+        args.correction_gate,
     ).to(args.device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
