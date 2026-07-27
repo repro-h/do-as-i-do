@@ -37,7 +37,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-translation-mm", type=float, default=80.0)
     parser.add_argument("--smooth-l1-beta-mm", type=float, default=5.0)
     parser.add_argument("--max-target-mm", type=float, default=120.0)
-    parser.add_argument("--w-target", type=float, default=1.0)
     parser.add_argument("--w-wrist", type=float, default=1.0)
     parser.add_argument("--w-palm", type=float, default=0.3)
     parser.add_argument("--w-projection", type=float, default=0.2)
@@ -192,6 +191,13 @@ def smooth_l1(value, target, mask, beta):
     return masked_mean(loss, mask)
 
 
+def weighted_smooth_l1(value, target, mask, weight, beta):
+    loss = F.smooth_l1_loss(value, target, reduction="none", beta=beta)
+    while weight.ndim < loss.ndim:
+        weight = weight.unsqueeze(-1)
+    return masked_mean(loss * weight, mask)
+
+
 def temporal(value, target, valid, order, beta):
     for _ in range(order):
         value = value[:, 1:] - value[:, :-1]
@@ -240,7 +246,6 @@ def compute(model, batch, args):
         ),
     )
     losses = {
-        "target": smooth_l1(translation, target, valid, beta),
         "wrist": smooth_l1(corrected[:, :, 0], gt[:, :, 0], valid, beta),
         "palm": smooth_l1(
             corrected[:, :, PALM], gt[:, :, PALM], palm_mask, beta
@@ -257,13 +262,16 @@ def compute(model, batch, args):
         "acceleration": temporal(
             corrected[:, :, 0], gt[:, :, 0], valid, 2, beta
         ),
-        "residual": masked_mean(
-            translation.square() * anchor_weight[:, :, None], valid
+        "residual": weighted_smooth_l1(
+            translation,
+            torch.zeros_like(translation),
+            valid,
+            anchor_weight,
+            beta,
         ),
     }
     total = (
-        args.w_target * losses["target"]
-        + args.w_wrist * losses["wrist"]
+        args.w_wrist * losses["wrist"]
         + args.w_palm * losses["palm"]
         + args.w_projection * losses["projection"]
         + args.w_velocity * losses["velocity"]
@@ -357,7 +365,7 @@ def main() -> None:
             config=vars(args),
             dir=str(out_dir),
         )
-    history, best = [], float("inf")
+    history, best_wrist, best_total = [], float("inf"), float("inf")
     for epoch in range(1, args.epochs + 1):
         train_metrics = run_epoch(
             model, train_loader, args, optimizer, "train"
@@ -395,8 +403,17 @@ def main() -> None:
             "val_total": val_metrics["total"],
         }
         torch.save(checkpoint, out_dir / "last.pt")
-        if val_metrics["total"] < best:
-            best = val_metrics["total"]
+        wrist_median = val_metrics["corrected_wrist"]["median_mm"]
+        is_better = (
+            wrist_median < best_wrist
+            or (
+                wrist_median == best_wrist
+                and val_metrics["total"] < best_total
+            )
+        )
+        if is_better:
+            best_wrist = wrist_median
+            best_total = val_metrics["total"]
             torch.save(checkpoint, out_dir / "best.pt")
         (out_dir / "history.json").write_text(
             json.dumps(history, indent=2), encoding="utf-8"
