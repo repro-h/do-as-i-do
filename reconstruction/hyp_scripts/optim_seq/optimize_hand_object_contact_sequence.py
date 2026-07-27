@@ -350,6 +350,11 @@ def main() -> None:
     optimizer = torch.optim.Adam([raw_translation], lr=args.lr)
     max_translation = args.max_translation_mm / 1000.0
     history = []
+    best_total = float("inf")
+    best_step = 0
+    best_translation = torch.zeros(
+        (count, 3), dtype=torch.float32, device=device
+    )
     for step in range(1, args.steps + 1):
         optimizer.zero_grad(set_to_none=True)
         translation = torch.tanh(raw_translation) * max_translation
@@ -425,6 +430,11 @@ def main() -> None:
             + args.w_final_acceleration * final_acceleration_loss
             + args.w_relative_acceleration * relative_acceleration_loss
         )
+        total_value = float(total.detach())
+        if total_value < best_total:
+            best_total = total_value
+            best_step = step
+            best_translation = translation.detach().clone()
         total.backward()
         optimizer.step()
         if step == 1 or step % 25 == 0 or step == args.steps:
@@ -448,7 +458,7 @@ def main() -> None:
             print(json.dumps(row), flush=True)
 
     with torch.no_grad():
-        translation = torch.tanh(raw_translation) * max_translation
+        translation = best_translation
         corrected = hand_tensor + translation[:, None]
         final_distance, _, _, final_inside = nearest_surface(
             corrected, object_points, object_normals
@@ -494,6 +504,8 @@ def main() -> None:
         "num_valid_frames": int(valid.sum()),
         "num_contact_frame_vertices": int(contact_mask_np.sum()),
         "contact_updates": updates,
+        "best_step": best_step,
+        "best_total": best_total,
         "translation_mm": stats(
             np.linalg.norm(translation_np, axis=-1), 1000.0
         ),
