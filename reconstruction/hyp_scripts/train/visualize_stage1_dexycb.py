@@ -50,6 +50,8 @@ def relative_median(row: dict, stage: str) -> Optional[float]:
     value = metrics.get(f"{stage}_relative", {}).get("median_mm")
     if value is None:
         value = metrics.get(f"{stage}_center", {}).get("median_mm")
+    if value is None:
+        value = metrics.get(f"{stage}_wrist", {}).get("median_mm")
     return float(value) if value is not None else None
 
 
@@ -186,9 +188,10 @@ def main() -> None:
             / "handflow_camera_result_stage1_hand_rigid.npz"
         )
     ).resolve()
-    prediction_is_corrected_handflow = (
-        prediction_path.name == "handflow_camera_result_stage1_hand_rigid.npz"
-    )
+    prediction_is_corrected_handflow = prediction_path.name in {
+        "handflow_camera_result_stage1_hand_rigid.npz",
+        "handflow_camera_result_global_v2_phase_a.npz",
+    }
     handflow_path = (handflow_root / stream_id / "handflow_camera_result.npz").resolve()
     foundationpose_path = Path(record["foundationpose_json"]).resolve()
     object_mesh = Path(record["sam3d_glb"]).resolve()
