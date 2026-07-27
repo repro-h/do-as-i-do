@@ -43,6 +43,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-velocity", type=float, default=0.15)
     parser.add_argument("--w-acceleration", type=float, default=0.25)
     parser.add_argument("--w-residual", type=float, default=0.05)
+    parser.add_argument("--z-axis-weight", type=float, default=2.0)
+    parser.add_argument("--error-weight-reference-mm", type=float, default=20.0)
+    parser.add_argument("--error-weight-min", type=float, default=0.5)
+    parser.add_argument("--error-weight-max", type=float, default=2.0)
+    parser.add_argument("--anchor-accurate-mm", type=float, default=15.0)
+    parser.add_argument("--anchor-large-error-mm", type=float, default=30.0)
+    parser.add_argument("--anchor-accurate-weight", type=float, default=4.0)
+    parser.add_argument("--anchor-medium-weight", type=float, default=1.0)
+    parser.add_argument("--anchor-large-error-weight", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--wandb", action="store_true")
@@ -236,19 +245,38 @@ def compute(model, batch, args):
         & (gt[:, :, PALM, 2] > 1e-4)
     )
     initial_error = torch.linalg.norm(target, dim=-1)
+    supervision_weight = (
+        initial_error
+        / max(args.error_weight_reference_mm / 1000.0, 1e-8)
+    ).clamp(args.error_weight_min, args.error_weight_max)
+    axis_weight = torch.tensor(
+        [1.0, 1.0, args.z_axis_weight],
+        dtype=pred.dtype,
+        device=pred.device,
+    )
     anchor_weight = torch.where(
-        initial_error < 0.005,
-        torch.full_like(initial_error, 4.0),
+        initial_error < args.anchor_accurate_mm / 1000.0,
+        torch.full_like(initial_error, args.anchor_accurate_weight),
         torch.where(
-            initial_error < 0.015,
-            torch.ones_like(initial_error),
-            torch.full_like(initial_error, 0.2),
+            initial_error < args.anchor_large_error_mm / 1000.0,
+            torch.full_like(initial_error, args.anchor_medium_weight),
+            torch.full_like(initial_error, args.anchor_large_error_weight),
         ),
     )
     losses = {
-        "wrist": smooth_l1(corrected[:, :, 0], gt[:, :, 0], valid, beta),
-        "palm": smooth_l1(
-            corrected[:, :, PALM], gt[:, :, PALM], palm_mask, beta
+        "wrist": weighted_smooth_l1(
+            corrected[:, :, 0],
+            gt[:, :, 0],
+            valid,
+            supervision_weight[:, :, None] * axis_weight,
+            beta,
+        ),
+        "palm": weighted_smooth_l1(
+            corrected[:, :, PALM],
+            gt[:, :, PALM],
+            palm_mask,
+            supervision_weight[:, :, None, None] * axis_weight,
+            beta,
         ),
         "projection": smooth_l1(
             project(corrected[:, :, PALM], batch["intrinsics"]) / 100.0,
