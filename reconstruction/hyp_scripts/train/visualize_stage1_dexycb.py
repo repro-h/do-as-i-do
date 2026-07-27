@@ -24,6 +24,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-root", required=True)
     parser.add_argument("--viewer-python", required=True)
     parser.add_argument("--stream-id", default=None)
+    parser.add_argument(
+        "--foundationpose-json",
+        default=None,
+        help="Override the manifest FoundationPose JSON for both viewers.",
+    )
     parser.add_argument("--original-port", type=int, default=8095)
     parser.add_argument("--corrected-port", type=int, default=8096)
     parser.add_argument(
@@ -193,7 +198,9 @@ def main() -> None:
         "handflow_camera_result_global_v2_phase_a.npz",
     }
     handflow_path = (handflow_root / stream_id / "handflow_camera_result.npz").resolve()
-    foundationpose_path = Path(record["foundationpose_json"]).resolve()
+    foundationpose_path = Path(
+        args.foundationpose_json or record["foundationpose_json"]
+    ).expanduser().resolve()
     object_mesh = Path(record["sam3d_glb"]).resolve()
     gt_object_mesh = (
         Path(args.object_model_root).expanduser().resolve()
