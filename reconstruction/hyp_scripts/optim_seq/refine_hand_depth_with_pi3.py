@@ -85,13 +85,6 @@ def load_mesh(path: Path, scale: float) -> trimesh.Trimesh:
     return mesh
 
 
-def transform_mesh(mesh: trimesh.Trimesh, pose: np.ndarray) -> trimesh.Trimesh:
-    result = mesh.copy()
-    vertices = np.asarray(result.vertices)
-    result.vertices = vertices @ pose[:3, :3].T + pose[:3, 3]
-    return result
-
-
 def erode(mask: np.ndarray, pixels: int) -> np.ndarray:
     if pixels <= 0:
         return mask
@@ -107,7 +100,13 @@ def sampled_pixels(mask: np.ndarray, maximum: int, rng: np.random.Generator) -> 
     return xs, ys
 
 
-def raycast_depth(mesh: trimesh.Trimesh, xs: np.ndarray, ys: np.ndarray, K: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def raycast_depth(
+    mesh: trimesh.Trimesh,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    K: np.ndarray,
+    object_pose: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     directions = np.stack(
         [
             (xs - K[0, 2]) / K[0, 0],
@@ -116,13 +115,24 @@ def raycast_depth(mesh: trimesh.Trimesh, xs: np.ndarray, ys: np.ndarray, K: np.n
         ],
         axis=1,
     )
+    origins = np.zeros_like(directions)
+    if object_pose is not None:
+        rotation = object_pose[:3, :3]
+        translation = object_pose[:3, 3]
+        origins[:] = -rotation.T @ translation
+        directions = directions @ rotation
     locations, ray_ids, _ = mesh.ray.intersects_location(
-        np.zeros_like(directions), directions, multiple_hits=False
+        origins, directions, multiple_hits=False
     )
     if len(ray_ids) == 0:
         return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.int64)
     locations = np.asarray(locations, dtype=np.float64).reshape(-1, 3)
     ray_ids = np.asarray(ray_ids, dtype=np.int64).reshape(-1)
+    if object_pose is not None:
+        locations = (
+            locations @ object_pose[:3, :3].T
+            + object_pose[:3, 3]
+        )
     return locations[:, 2], ray_ids
 
 
@@ -241,7 +251,12 @@ def main() -> None:
     rng = np.random.default_rng(args.seed)
     observations: list[list[tuple[float, float, dict]]] = [[] for _ in rows]
     window_audits = []
-    for window_path in window_paths:
+    for window_number, window_path in enumerate(window_paths):
+        print(
+            f"[{window_number + 1}/{len(window_paths)}] "
+            f"calibrating {window_path.name}",
+            flush=True,
+        )
         with np.load(window_path, allow_pickle=False) as payload:
             frame_indices = np.asarray(payload["frame_indices"], dtype=int)
             points = np.asarray(payload["local_points"], dtype=np.float32)
@@ -264,8 +279,13 @@ def main() -> None:
             if pose is None:
                 pose = poses.get(str(row["original_frame"]).zfill(6))
             if pose is not None and len(xs):
-                metric_mesh = transform_mesh(canonical_mesh, pose)
-                metric_z, ray_ids = raycast_depth(metric_mesh, xs, ys, K)
+                metric_z, ray_ids = raycast_depth(
+                    canonical_mesh,
+                    xs,
+                    ys,
+                    K,
+                    object_pose=pose,
+                )
                 if len(ray_ids):
                     pi3_z = points[local_index, ys[ray_ids], xs[ray_ids], 2]
                     calibration_source.append(pi3_z)
