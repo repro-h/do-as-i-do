@@ -35,13 +35,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--max-translation-mm", type=float, default=80.0)
+    parser.add_argument(
+        "--prediction-mode",
+        choices=("translation3d", "ray_depth"),
+        default="ray_depth",
+        help="Predict an unconstrained 3D translation or one signed camera-ray depth.",
+    )
+    parser.add_argument(
+        "--include-camera-ray",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Append the normalized wrist camera ray to each frame feature.",
+    )
     parser.add_argument("--smooth-l1-beta-mm", type=float, default=5.0)
     parser.add_argument("--max-target-mm", type=float, default=120.0)
+    parser.add_argument("--w-depth", type=float, default=1.0)
     parser.add_argument("--w-wrist", type=float, default=1.0)
-    parser.add_argument("--w-palm", type=float, default=0.3)
-    parser.add_argument("--w-projection", type=float, default=0.2)
-    parser.add_argument("--w-velocity", type=float, default=0.15)
-    parser.add_argument("--w-acceleration", type=float, default=0.25)
+    parser.add_argument("--w-palm", type=float, default=0.0)
+    parser.add_argument("--w-projection", type=float, default=1.0)
+    parser.add_argument("--w-velocity", type=float, default=0.5)
+    parser.add_argument("--w-acceleration", type=float, default=1.0)
     parser.add_argument("--w-residual", type=float, default=0.05)
     parser.add_argument("--z-axis-weight", type=float, default=2.0)
     parser.add_argument("--error-weight-reference-mm", type=float, default=20.0)
@@ -85,11 +98,17 @@ def rotation_6d_from_rotvec(rotvec: np.ndarray) -> np.ndarray:
 
 
 class WindowDataset(Dataset):
-    def __init__(self, path: Path, max_target_m: float):
+    def __init__(
+        self,
+        path: Path,
+        max_target_m: float,
+        include_camera_ray: bool = False,
+    ):
         self.rows = load_jsonl(path)
         if not self.rows:
             raise RuntimeError(f"No windows in {path}")
         self.max_target_m = max_target_m
+        self.include_camera_ray = include_camera_ray
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -123,6 +142,9 @@ class WindowDataset(Dataset):
         object_velocity[1:] = object_center[1:] - object_center[:-1]
         relative = wrist - object_center
         relative_velocity = hand_velocity - object_velocity
+        camera_ray = wrist / np.maximum(
+            np.linalg.norm(wrist, axis=-1, keepdims=True), 1e-8
+        )
         hand_acceleration = np.zeros_like(wrist)
         hand_acceleration[1:] = hand_velocity[1:] - hand_velocity[:-1]
         features = np.concatenate(
@@ -136,6 +158,7 @@ class WindowDataset(Dataset):
                 object_velocity,
                 relative_velocity,
                 rotation_6d_from_rotvec(initial_root),
+                *([camera_ray] if self.include_camera_ray else []),
                 valid[:, None],
             ],
             axis=-1,
@@ -158,10 +181,14 @@ class WindowDataset(Dataset):
 class TranslationRefiner(nn.Module):
     def __init__(
         self, input_dim: int, hidden_dim: int, layers: int,
-        heads: int, dropout: float, correction_gate: bool = False
+        heads: int,
+        dropout: float,
+        correction_gate: bool = False,
+        prediction_mode: str = "translation3d",
     ):
         super().__init__()
         self.correction_gate = correction_gate
+        self.prediction_mode = prediction_mode
         self.input = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -182,7 +209,7 @@ class TranslationRefiner(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 3),
+            nn.Linear(hidden_dim, 1 if prediction_mode == "ray_depth" else 3),
         )
         nn.init.trunc_normal_(self.position, std=0.02)
         nn.init.zeros_(self.output[-1].weight)
@@ -254,14 +281,23 @@ def compute(model, batch, args):
         batch["features"], args.max_translation_mm / 1000.0
     )
     if args.correction_gate:
-        translation, gate = prediction
+        raw_prediction, gate = prediction
     else:
-        translation, gate = prediction, None
+        raw_prediction, gate = prediction, None
     pred = batch["pred_joints"]
     gt = batch["gt_joints"]
     valid = batch["valid"]
+    camera_ray = pred[:, :, 0]
+    camera_ray = F.normalize(camera_ray, dim=-1, eps=1e-8)
+    target_translation = gt[:, :, 0] - pred[:, :, 0]
+    target_ray_depth = torch.sum(target_translation * camera_ray, dim=-1)
+    if args.prediction_mode == "ray_depth":
+        ray_depth = raw_prediction.squeeze(-1)
+        translation = ray_depth.unsqueeze(-1) * camera_ray
+    else:
+        translation = raw_prediction
+        ray_depth = torch.sum(translation * camera_ray, dim=-1)
     corrected = pred + translation[:, :, None]
-    target = gt[:, :, 0] - pred[:, :, 0]
     beta = args.smooth_l1_beta_mm / 1000.0
     palm_mask = valid[:, :, None]
     projection_mask = (
@@ -269,7 +305,8 @@ def compute(model, batch, args):
         & (corrected[:, :, PALM, 2] > 1e-4)
         & (gt[:, :, PALM, 2] > 1e-4)
     )
-    initial_error = torch.linalg.norm(target, dim=-1)
+    initial_error = torch.linalg.norm(target_translation, dim=-1)
+    initial_ray_error = torch.abs(target_ray_depth)
     supervision_weight = (
         initial_error
         / max(args.error_weight_reference_mm / 1000.0, 1e-8)
@@ -289,6 +326,13 @@ def compute(model, batch, args):
         ),
     )
     losses = {
+        "depth": weighted_smooth_l1(
+            ray_depth,
+            target_ray_depth,
+            valid,
+            supervision_weight,
+            beta,
+        ),
         "wrist": weighted_smooth_l1(
             corrected[:, :, 0],
             gt[:, :, 0],
@@ -316,8 +360,8 @@ def compute(model, batch, args):
             corrected[:, :, 0], gt[:, :, 0], valid, 2, beta
         ),
         "residual": weighted_smooth_l1(
-            translation,
-            torch.zeros_like(translation),
+            ray_depth,
+            torch.zeros_like(ray_depth),
             valid,
             anchor_weight,
             beta,
@@ -328,13 +372,18 @@ def compute(model, batch, args):
             args.gate_full_error_mm - args.gate_zero_error_mm, 1e-6
         )
         gate_target = (
-            (initial_error * 1000.0 - args.gate_zero_error_mm) / gate_range
+            (initial_ray_error * 1000.0 - args.gate_zero_error_mm) / gate_range
         ).clamp(0.0, 1.0)
         losses["gate"] = smooth_l1(
             gate, gate_target, valid, beta=0.1
         )
     total = (
-        args.w_wrist * losses["wrist"]
+        args.w_depth * losses["depth"]
+        + (
+            args.w_wrist * losses["wrist"]
+            if args.prediction_mode == "translation3d"
+            else 0.0
+        )
         + args.w_palm * losses["palm"]
         + args.w_projection * losses["projection"]
         + args.w_velocity * losses["velocity"]
@@ -345,7 +394,15 @@ def compute(model, batch, args):
         total = total + args.w_gate * losses["gate"]
     before = torch.linalg.norm(pred[:, :, 0] - gt[:, :, 0], dim=-1)
     after = torch.linalg.norm(corrected[:, :, 0] - gt[:, :, 0], dim=-1)
-    return total, losses, before[valid], after[valid]
+    ray_after = torch.abs(target_ray_depth - ray_depth)
+    return (
+        total,
+        losses,
+        before[valid],
+        after[valid],
+        initial_ray_error[valid],
+        ray_after[valid],
+    )
 
 
 def quantiles(chunks: list[np.ndarray]) -> dict:
@@ -365,11 +422,14 @@ def run_epoch(model, loader, args, optimizer=None, split="train"):
     model.train(training)
     sums, count = {}, 0
     before_chunks, after_chunks = [], []
+    ray_before_chunks, ray_after_chunks = [], []
     progress = tqdm(loader, desc=split, dynamic_ncols=True)
     for batch in progress:
         if training:
             optimizer.zero_grad(set_to_none=True)
-        total, losses, before, after = compute(model, batch, args)
+        total, losses, before, after, ray_before, ray_after = compute(
+            model, batch, args
+        )
         if training:
             total.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -381,10 +441,14 @@ def run_epoch(model, loader, args, optimizer=None, split="train"):
             sums[key] = sums.get(key, 0.0) + float(value) * batch_size
         before_chunks.append(before.detach().cpu().numpy())
         after_chunks.append(after.detach().cpu().numpy())
+        ray_before_chunks.append(ray_before.detach().cpu().numpy())
+        ray_after_chunks.append(ray_after.detach().cpu().numpy())
         progress.set_postfix(loss=f"{sums['total'] / count:.5f}")
     metrics = {key: value / max(count, 1) for key, value in sums.items()}
     metrics["initial_wrist"] = quantiles(before_chunks)
     metrics["corrected_wrist"] = quantiles(after_chunks)
+    metrics["initial_ray_depth"] = quantiles(ray_before_chunks)
+    metrics["corrected_ray_depth"] = quantiles(ray_after_chunks)
     return metrics
 
 
@@ -396,10 +460,12 @@ def main() -> None:
     train_dataset = WindowDataset(
         Path(args.train_windows).expanduser().resolve(),
         args.max_target_mm / 1000.0,
+        args.include_camera_ray,
     )
     val_dataset = WindowDataset(
         Path(args.val_windows).expanduser().resolve(),
         args.max_target_mm / 1000.0,
+        args.include_camera_ray,
     )
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
@@ -417,6 +483,7 @@ def main() -> None:
         args.heads,
         args.dropout,
         args.correction_gate,
+        args.prediction_mode,
     ).to(args.device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
@@ -435,7 +502,7 @@ def main() -> None:
             config=vars(args),
             dir=str(out_dir),
         )
-    history, best_wrist, best_total = [], float("inf"), float("inf")
+    history, best_primary, best_total = [], float("inf"), float("inf")
     for epoch in range(1, args.epochs + 1):
         train_metrics = run_epoch(
             model, train_loader, args, optimizer, "train"
@@ -462,6 +529,10 @@ def main() -> None:
                         val_metrics["initial_wrist"]["median_mm"],
                     "val/wrist_after_mm":
                         val_metrics["corrected_wrist"]["median_mm"],
+                    "val/ray_depth_before_mm":
+                        val_metrics["initial_ray_depth"]["median_mm"],
+                    "val/ray_depth_after_mm":
+                        val_metrics["corrected_ray_depth"]["median_mm"],
                 },
                 step=epoch,
             )
@@ -473,16 +544,20 @@ def main() -> None:
             "val_total": val_metrics["total"],
         }
         torch.save(checkpoint, out_dir / "last.pt")
-        wrist_median = val_metrics["corrected_wrist"]["median_mm"]
+        primary_median = (
+            val_metrics["corrected_ray_depth"]["median_mm"]
+            if args.prediction_mode == "ray_depth"
+            else val_metrics["corrected_wrist"]["median_mm"]
+        )
         is_better = (
-            wrist_median < best_wrist
+            primary_median < best_primary
             or (
-                wrist_median == best_wrist
+                primary_median == best_primary
                 and val_metrics["total"] < best_total
             )
         )
         if is_better:
-            best_wrist = wrist_median
+            best_primary = primary_median
             best_total = val_metrics["total"]
             torch.save(checkpoint, out_dir / "best.pt")
         (out_dir / "history.json").write_text(

@@ -56,7 +56,9 @@ def main() -> None:
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     config = checkpoint["args"]
     dataset = WindowDataset(
-        windows_path, float(config["max_target_mm"]) / 1000.0
+        windows_path,
+        float(config["max_target_mm"]) / 1000.0,
+        bool(config.get("include_camera_ray", False)),
     )
     loader = DataLoader(
         dataset,
@@ -72,6 +74,7 @@ def main() -> None:
         int(config["heads"]),
         float(config["dropout"]),
         bool(config.get("correction_gate", False)),
+        str(config.get("prediction_mode", "translation3d")),
     ).to(args.device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
@@ -98,12 +101,24 @@ def main() -> None:
                 features, float(config["max_translation_mm"]) / 1000.0
             )
             if bool(config.get("correction_gate", False)):
-                translation, gate = prediction
+                raw_prediction, gate = prediction
                 gate = gate.cpu().numpy()
             else:
-                translation = prediction
-                gate = np.ones(translation.shape[:2], dtype=np.float32)
-            translation = translation.cpu().numpy()
+                raw_prediction = prediction
+                gate = np.ones(
+                    raw_prediction.shape[:2], dtype=np.float32
+                )
+            raw_prediction = raw_prediction.cpu().numpy()
+            wrist = batch["pred_joints"][:, :, 0].numpy()
+            ray = wrist / np.maximum(
+                np.linalg.norm(wrist, axis=-1, keepdims=True), 1e-8
+            )
+            if config.get("prediction_mode", "translation3d") == "ray_depth":
+                ray_depth = raw_prediction[..., 0]
+                translation = ray_depth[..., None] * ray
+            else:
+                translation = raw_prediction
+                ray_depth = np.sum(translation * ray, axis=-1)
             for index, stream_id in enumerate(batch["stream_id"]):
                 start = int(batch["start"][index])
                 end = int(batch["end"][index])
@@ -121,6 +136,7 @@ def main() -> None:
     out_root.mkdir(parents=True, exist_ok=True)
     stream_rows = []
     aggregate_before, aggregate_after = [], []
+    aggregate_ray_before, aggregate_ray_after = [], []
     for stream_id, values in sorted(sums.items()):
         stream_out = out_root / stream_id
         result_path = stream_out / "handflow_camera_result_global_v2_phase_a.npz"
@@ -166,8 +182,23 @@ def main() -> None:
         after = np.linalg.norm(
             corrected_wrist[valid] - gt_wrist[valid], axis=-1
         )
+        camera_ray_normalized = pred_wrist / np.maximum(
+            np.linalg.norm(pred_wrist, axis=-1, keepdims=True), 1e-8
+        )
+        target_ray_depth = np.sum(
+            (gt_wrist - pred_wrist) * camera_ray_normalized, axis=-1
+        )
+        predicted_ray_depth = np.sum(
+            translation_normalized[:count] * camera_ray_normalized, axis=-1
+        )
+        ray_before = np.abs(target_ray_depth[valid])
+        ray_after = np.abs(
+            target_ray_depth[valid] - predicted_ray_depth[valid]
+        )
         aggregate_before.append(before)
         aggregate_after.append(after)
+        aggregate_ray_before.append(ray_before)
+        aggregate_ray_after.append(ray_after)
         uncovered = (
             np.asarray(supervision["hand_valid"][:count]).astype(bool)
             & ~predicted[:count]
@@ -175,6 +206,8 @@ def main() -> None:
         metrics = {
             "initial_wrist": quantiles(before),
             "corrected_wrist": quantiles(after),
+            "initial_ray_depth": quantiles(ray_before),
+            "corrected_ray_depth": quantiles(ray_after),
             "num_frames": count,
             "num_predicted": int(predicted[:count].sum()),
             "uncovered_hand_frames": np.flatnonzero(uncovered).tolist(),
@@ -184,6 +217,15 @@ def main() -> None:
         output["verts_cam"] = corrected
         output["stage1_translation_normalized"] = translation_normalized[:count]
         output["stage1_translation_camera"] = translation_camera[:count]
+        camera_ray = pred_wrist / np.maximum(
+            np.linalg.norm(pred_wrist, axis=-1, keepdims=True), 1e-8
+        )
+        output["stage1_ray_depth"] = np.sum(
+            translation_normalized[:count] * camera_ray, axis=-1
+        ).astype(np.float32)
+        output["stage1_prediction_mode"] = np.asarray(
+            config.get("prediction_mode", "translation3d")
+        )
         output["stage1_correction_gate"] = correction_gate[:count]
         output["stage1_predicted"] = predicted[:count]
         output["stage1_checkpoint"] = np.asarray(str(checkpoint_path))
@@ -206,6 +248,14 @@ def main() -> None:
     after_all = (
         np.concatenate(aggregate_after) if aggregate_after else np.empty(0)
     )
+    ray_before_all = (
+        np.concatenate(aggregate_ray_before)
+        if aggregate_ray_before else np.empty(0)
+    )
+    ray_after_all = (
+        np.concatenate(aggregate_ray_after)
+        if aggregate_ray_after else np.empty(0)
+    )
     summary = {
         "checkpoint": str(checkpoint_path),
         "checkpoint_epoch": int(checkpoint["epoch"]),
@@ -216,6 +266,8 @@ def main() -> None:
         "aggregate_metrics": {
             "initial_wrist": quantiles(before_all),
             "corrected_wrist": quantiles(after_all),
+            "initial_ray_depth": quantiles(ray_before_all),
+            "corrected_ray_depth": quantiles(ray_after_all),
         },
         "streams": stream_rows,
     }
