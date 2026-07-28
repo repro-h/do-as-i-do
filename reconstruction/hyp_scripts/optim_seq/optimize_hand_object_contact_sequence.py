@@ -37,6 +37,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--object-samples", type=int, default=1024)
     parser.add_argument("--contact-enter-mm", type=float, default=8.0)
     parser.add_argument("--contact-target-mm", type=float, default=2.0)
+    parser.add_argument(
+        "--contact-loss-mode",
+        choices=("signed_normal", "unsigned_surface"),
+        default="unsigned_surface",
+        help=(
+            "Use unsigned nearest-surface distance for attraction, or the "
+            "legacy nearest-normal signed target."
+        ),
+    )
     parser.add_argument("--penetration-tolerance-mm", type=float, default=1.5)
     parser.add_argument(
         "--penetration-max-distance-mm",
@@ -65,6 +74,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enter-patience", type=int, default=3)
     parser.add_argument("--exit-patience", type=int, default=5)
     parser.add_argument("--contact-update-frames", type=int, default=8)
+    parser.add_argument(
+        "--contact-persistence-mode",
+        choices=("active_only", "whole_chunk"),
+        default="active_only",
+        help=(
+            "Keep selected semantic IDs within a chunk, but either activate "
+            "them only on frames where they pass contact tests or force them "
+            "through the whole chunk."
+        ),
+    )
     parser.add_argument(
         "--contact-redetect-steps",
         type=int,
@@ -102,6 +121,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--w-contact", type=float, default=2.0)
     parser.add_argument("--w-penetration", type=float, default=4.0)
+    parser.add_argument("--w-penetration-count", type=float, default=0.0)
+    parser.add_argument("--w-penetration-topk", type=float, default=0.0)
+    parser.add_argument("--penetration-count-temperature-mm", type=float, default=1.0)
+    parser.add_argument("--penetration-topk", type=int, default=32)
     parser.add_argument("--w-projection", type=float, default=0.25)
     parser.add_argument(
         "--projection-target",
@@ -301,7 +324,12 @@ def contact_states(
             if len(valid):
                 order = np.lexsort((mean_distance[valid], -score[valid]))
                 chosen = valid[order[: args.contact_topk]]
-                selected[cursor:chunk_end, chosen] = True
+                if args.contact_persistence_mode == "active_only":
+                    selected[cursor:chunk_end, chosen] = chunk_candidates[
+                        :, chosen
+                    ]
+                else:
+                    selected[cursor:chunk_end, chosen] = True
             else:
                 chosen = np.empty(0, dtype=np.int64)
             updates.append(
@@ -337,6 +365,73 @@ def contact_candidates(
     if args.contact_end_frame >= 0:
         candidates[args.contact_end_frame + 1 :] = False
     return candidates
+
+
+def contact_error(
+    distance: torch.Tensor,
+    inside: torch.Tensor,
+    args: argparse.Namespace,
+) -> torch.Tensor:
+    target = torch.full_like(distance, args.contact_target_mm / 1000.0)
+    if args.contact_loss_mode == "unsigned_surface":
+        value = distance
+    else:
+        value = inside
+        target = -target
+    return F.smooth_l1_loss(
+        value,
+        target,
+        reduction="none",
+        beta=0.002,
+    )
+
+
+def penetration_terms(
+    distance: torch.Tensor,
+    inside: torch.Tensor,
+    valid: torch.Tensor,
+    args: argparse.Namespace,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    threshold = args.penetration_tolerance_mm / 1000.0
+    trusted = distance <= args.penetration_max_distance_mm / 1000.0
+    raw = inside - threshold
+    depth = F.relu(raw) * trusted
+    valid_float = valid.float()
+    valid_count = valid_float.sum().clamp_min(1)
+
+    depth_per_frame = depth.square().sum(dim=-1)
+    depth_loss = (depth_per_frame * valid_float).sum() / valid_count
+
+    temperature = max(
+        args.penetration_count_temperature_mm / 1000.0, 1e-6
+    )
+    soft_count_per_frame = (
+        torch.sigmoid(raw / temperature) * trusted
+    ).mean(dim=-1)
+    count_loss = (
+        soft_count_per_frame * valid_float
+    ).sum() / valid_count
+
+    topk = min(max(1, args.penetration_topk), depth.shape[1])
+    topk_per_frame = torch.topk(
+        depth.square(), k=topk, dim=-1
+    ).values.mean(dim=-1)
+    topk_loss = (topk_per_frame * valid_float).sum() / valid_count
+    return (
+        depth,
+        depth_loss,
+        count_loss,
+        topk_loss,
+        depth_per_frame,
+        soft_count_per_frame,
+    )
 
 
 def project(points: torch.Tensor, intrinsics: torch.Tensor) -> torch.Tensor:
@@ -577,27 +672,23 @@ def main() -> None:
                     ]
                 )
 
-        penetration_trusted = (
-            distance <= args.penetration_max_distance_mm / 1000.0
-        )
-        penetration = (
-            F.relu(inside - args.penetration_tolerance_mm / 1000.0)
-            * penetration_trusted
-        )
-        penetration_loss = (
-            penetration.square() * valid_tensor[:, None]
-        ).sum() / valid_tensor.sum().clamp_min(1)
-
-        # signed_inside is positive inside and negative outside. Keep contact
-        # vertices on the exterior side instead of minimizing unsigned distance.
-        contact_error = F.smooth_l1_loss(
+        (
+            penetration,
+            penetration_loss,
+            penetration_count_loss,
+            penetration_topk_loss,
+            _,
+            _,
+        ) = penetration_terms(
+            distance,
             inside,
-            torch.full_like(inside, -args.contact_target_mm / 1000.0),
-            reduction="none",
-            beta=0.002,
+            valid_tensor,
+            args,
         )
+
+        contact_error_value = contact_error(distance, inside, args)
         contact_loss = (
-            contact_error * contact_mask
+            contact_error_value * contact_mask
         ).sum() / contact_mask.sum().clamp_min(1)
 
         projection_geometry = (
@@ -641,6 +732,8 @@ def main() -> None:
         total = (
             args.w_contact * contact_loss
             + args.w_penetration * penetration_loss
+            + args.w_penetration_count * penetration_count_loss
+            + args.w_penetration_topk * penetration_topk_loss
             + args.w_projection * projection_loss
             + args.w_anchor * anchor_loss
             + args.w_velocity * velocity_loss
@@ -662,6 +755,12 @@ def main() -> None:
                 "total": float(total.detach()),
                 "contact": float(contact_loss.detach()),
                 "penetration": float(penetration_loss.detach()),
+                "penetration_count": float(
+                    penetration_count_loss.detach()
+                ),
+                "penetration_topk": float(
+                    penetration_topk_loss.detach()
+                ),
                 "projection": float(projection_loss.detach()),
                 "anchor": float(anchor_loss.detach()),
                 "velocity": float(velocity_loss.detach()),
@@ -696,7 +795,24 @@ def main() -> None:
                 probe_distance, _, _, probe_inside = nearest_surface(
                     probe_hand, object_points, object_normals
                 )
-                probe_penetration = (
+                (
+                    _,
+                    _,
+                    _,
+                    _,
+                    penetration_per_frame,
+                    penetration_count_per_frame,
+                ) = penetration_terms(
+                    probe_distance,
+                    probe_inside,
+                    valid_tensor,
+                    args,
+                )
+                topk = min(
+                    max(1, args.penetration_topk),
+                    probe_distance.shape[1],
+                )
+                trusted_probe_depth = (
                     F.relu(
                         probe_inside
                         - args.penetration_tolerance_mm / 1000.0
@@ -706,14 +822,11 @@ def main() -> None:
                         <= args.penetration_max_distance_mm / 1000.0
                     )
                 )
-                probe_contact = F.smooth_l1_loss(
-                    probe_inside,
-                    torch.full_like(
-                        probe_inside,
-                        -args.contact_target_mm / 1000.0,
-                    ),
-                    reduction="none",
-                    beta=0.002,
+                penetration_topk_per_frame = torch.topk(
+                    trusted_probe_depth.square(), k=topk, dim=-1
+                ).values.mean(dim=-1)
+                probe_contact = contact_error(
+                    probe_distance, probe_inside, args
                 )
                 probe_projection = project(
                     projection_points + probe_translation[:, None],
@@ -726,7 +839,6 @@ def main() -> None:
                     .mean(dim=-1)
                     / (100.0 ** 2)
                 )
-                penetration_per_frame = probe_penetration.square().mean(dim=-1)
                 contact_count = best_contact_mask.sum(dim=-1)
                 contact_per_frame = (
                     (probe_contact * best_contact_mask).sum(dim=-1)
@@ -734,6 +846,10 @@ def main() -> None:
                 )
                 data_total = (
                     args.w_penetration * penetration_per_frame
+                    + args.w_penetration_count
+                    * penetration_count_per_frame
+                    + args.w_penetration_topk
+                    * penetration_topk_per_frame
                     + args.w_contact * contact_per_frame
                     + args.w_projection * projection_per_frame
                 )
@@ -742,6 +858,12 @@ def main() -> None:
                         "label": label,
                         "offset_mm": offset * 1000.0,
                         "penetration": penetration_per_frame.cpu().numpy(),
+                        "penetration_count": (
+                            penetration_count_per_frame.cpu().numpy()
+                        ),
+                        "penetration_topk": (
+                            penetration_topk_per_frame.cpu().numpy()
+                        ),
                         "contact": contact_per_frame.cpu().numpy(),
                         "projection": projection_per_frame.cpu().numpy(),
                         "weighted_data_total": data_total.cpu().numpy(),
@@ -859,6 +981,12 @@ def main() -> None:
                         row["label"]: {
                             "offset_mm": row["offset_mm"],
                             "penetration": float(row["penetration"][frame]),
+                            "penetration_count": float(
+                                row["penetration_count"][frame]
+                            ),
+                            "penetration_topk": float(
+                                row["penetration_topk"][frame]
+                            ),
                             "contact": float(row["contact"][frame]),
                             "projection": float(row["projection"][frame]),
                             "weighted_data_total": float(
