@@ -24,6 +24,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--object-model-root", required=True)
     parser.add_argument("--out-root", required=True)
     parser.add_argument(
+        "--corrected-hand-npz",
+        help="Optional corrected hand NPZ; overrides --prediction-root lookup.",
+    )
+    parser.add_argument(
+        "--corrected-label",
+        default="Stage1 Hand + Filtered Object",
+    )
+    parser.add_argument(
         "--gt-python",
         default=sys.executable,
         help="Python environment used to decode DexYCB MANO ground truth.",
@@ -178,9 +186,13 @@ def main() -> None:
         handflow_root / args.stream_id / "handflow_camera_result.npz"
     )
     corrected_handflow = (
-        prediction_root
-        / args.stream_id
-        / "handflow_camera_result_stage1_hand_rigid.npz"
+        Path(args.corrected_hand_npz).expanduser().resolve()
+        if args.corrected_hand_npz
+        else (
+            prediction_root
+            / args.stream_id
+            / "handflow_camera_result_stage1_hand_rigid.npz"
+        )
     )
     raw_pose = Path(record["foundationpose_json"]).expanduser().resolve()
     filtered_pose = (
@@ -304,7 +316,7 @@ def main() -> None:
             "--original-label",
             "Original HandFlow + Raw FoundationPose",
             "--corrected-label",
-            "Stage1 Hand + Filtered Object",
+            args.corrected_label,
             "--gt-label",
             "DexYCB Ground Truth",
             "--device",
