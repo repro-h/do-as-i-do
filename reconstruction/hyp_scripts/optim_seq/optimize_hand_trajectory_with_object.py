@@ -39,6 +39,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--boundary-blend-frames", type=int, default=4)
     parser.add_argument("--loss", choices=("linear", "soft_l1", "huber"), default="soft_l1")
     parser.add_argument("--f-scale-mm", type=float, default=3.0)
+    parser.add_argument("--carry-start-frame", type=int, default=-1)
+    parser.add_argument("--carry-end-frame", type=int, default=-1)
+    parser.add_argument(
+        "--carry-anchor-start-frame",
+        type=int,
+        default=-1,
+        help="First frame used to estimate the robust hand-object translation anchor.",
+    )
+    parser.add_argument(
+        "--carry-anchor-end-frame",
+        type=int,
+        default=-1,
+        help="Last frame used to estimate the robust hand-object translation anchor.",
+    )
     return parser.parse_args()
 
 
@@ -315,6 +329,86 @@ def main() -> None:
             }
         )
 
+    carry_audit = None
+    if args.carry_start_frame >= 0:
+        carry_start = args.carry_start_frame
+        carry_end = (
+            args.carry_end_frame
+            if args.carry_end_frame >= 0
+            else len(vertices) - 1
+        )
+        anchor_start = (
+            args.carry_anchor_start_frame
+            if args.carry_anchor_start_frame >= 0
+            else max(0, carry_start - 2)
+        )
+        anchor_end = (
+            args.carry_anchor_end_frame
+            if args.carry_anchor_end_frame >= 0
+            else carry_start
+        )
+        if not (
+            0 <= anchor_start <= anchor_end < len(vertices)
+            and 0 <= carry_start <= carry_end < len(vertices)
+        ):
+            raise ValueError(
+                "Invalid carry/anchor interval: "
+                f"anchor={anchor_start}-{anchor_end} "
+                f"carry={carry_start}-{carry_end}"
+            )
+        anchor_indices = np.arange(anchor_start, anchor_end + 1)
+        anchor_indices = anchor_indices[valid[anchor_indices]]
+        carry_indices = np.arange(carry_start, carry_end + 1)
+        carry_indices = carry_indices[valid[carry_indices]]
+        if not len(anchor_indices) or not len(carry_indices):
+            raise ValueError("Carry interval has no valid anchor/carry frames")
+
+        anchor_relative_translation = np.median(
+            hand_centers[anchor_indices] - object_centers[anchor_indices],
+            axis=0,
+        )
+        desired_centers = (
+            object_centers[carry_indices] + anchor_relative_translation
+        )
+        carry_correction = desired_centers - hand_centers[carry_indices]
+        norms = np.linalg.norm(carry_correction, axis=1)
+        over_limit = norms > max_translation
+        if np.any(over_limit):
+            carry_correction[over_limit] *= (
+                max_translation / norms[over_limit]
+            )[:, None]
+        correction[carry_indices] = carry_correction
+
+        raw_steps = np.linalg.norm(
+            np.diff(hand_centers[carry_indices], axis=0), axis=1
+        )
+        carried_centers = hand_centers[carry_indices] + carry_correction
+        carried_steps = np.linalg.norm(
+            np.diff(carried_centers, axis=0), axis=1
+        )
+        object_steps = np.linalg.norm(
+            np.diff(object_centers[carry_indices], axis=0), axis=1
+        )
+        carry_audit = {
+            "anchor_frames": [anchor_start, anchor_end],
+            "carry_frames": [carry_start, carry_end],
+            "anchor_relative_translation": (
+                anchor_relative_translation.tolist()
+            ),
+            "num_clipped_frames": int(over_limit.sum()),
+            "clipped_frames": carry_indices[over_limit].tolist(),
+            "hand_translation_step_mm": {
+                "before": distribution(raw_steps * 1000.0),
+                "after": distribution(carried_steps * 1000.0),
+            },
+            "object_translation_step_mm": distribution(
+                object_steps * 1000.0
+            ),
+            "translation_mm": distribution(
+                np.linalg.norm(carry_correction, axis=1) * 1000.0
+            ),
+        }
+
     corrected_vertices = vertices + correction[:, None, :]
     output = dict(hand)
     output["verts_cam"] = corrected_vertices.astype(np.float32)
@@ -347,6 +441,7 @@ def main() -> None:
         "static_translation_max_mm": float(
             correction_norm[correction_norm <= 1e-9].max(initial=0.0)
         ),
+        "carry": carry_audit,
         "segments": segment_audits,
         "per_frame": [
             {
