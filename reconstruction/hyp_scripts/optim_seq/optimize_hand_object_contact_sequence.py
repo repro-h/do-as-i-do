@@ -5,12 +5,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import pickle
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 import trimesh
+
+
+DISTAL_MANO_JOINTS = {
+    "thumb": 15,
+    "index": 3,
+    "middle": 6,
+    "ring": 12,
+    "pinky": 9,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,9 +50,27 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--min-contact-points", type=int, default=3)
     parser.add_argument("--contact-topk", type=int, default=12)
+    parser.add_argument(
+        "--contact-vertex-scope",
+        choices=("sampled", "mano_semantic"),
+        default="sampled",
+        help=(
+            "Choose contact vertices from every sampled hand vertex or from "
+            "MANO distal-finger and palm regions derived from LBS weights."
+        ),
+    )
+    parser.add_argument("--mano-data-dir", default=None)
+    parser.add_argument("--contact-per-finger-vertices", type=int, default=32)
+    parser.add_argument("--contact-palm-vertices", type=int, default=64)
     parser.add_argument("--enter-patience", type=int, default=3)
     parser.add_argument("--exit-patience", type=int, default=5)
     parser.add_argument("--contact-update-frames", type=int, default=8)
+    parser.add_argument(
+        "--contact-redetect-steps",
+        type=int,
+        default=50,
+        help="Re-detect active contacts from the current hand every N steps; 0 disables.",
+    )
     parser.add_argument(
         "--contact-start-frame",
         type=int,
@@ -66,6 +94,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--max-translation-mm", type=float, default=20.0)
+    parser.add_argument(
+        "--ray-probe-mm",
+        type=float,
+        default=2.0,
+        help="Audit data losses at best ray depth minus/plus this offset.",
+    )
     parser.add_argument("--w-contact", type=float, default=2.0)
     parser.add_argument("--w-penetration", type=float, default=4.0)
     parser.add_argument("--w-projection", type=float, default=0.25)
@@ -144,6 +178,46 @@ def sampled_vertex_normals(
         )
         output[frame] = normals[indices]
     return output
+
+
+def mano_semantic_contact_indices(
+    mano_data_dir: Path,
+    hand_side: str,
+    per_finger: int,
+    palm_count: int,
+) -> tuple[np.ndarray, dict[str, list[int]]]:
+    model_name = "MANO_LEFT.pkl" if hand_side == "left" else "MANO_RIGHT.pkl"
+    model_path = mano_data_dir / model_name
+    with model_path.open("rb") as handle:
+        raw = pickle.load(handle, encoding="latin1")
+    weights = raw.get("weights", raw.get("lbs_weights"))
+    if weights is None:
+        raise KeyError(f"No MANO skinning weights in {model_path}")
+    if hasattr(weights, "toarray"):
+        weights = weights.toarray()
+    weights = np.asarray(weights, dtype=np.float32)
+    if weights.shape[0] != 778 or weights.shape[1] < 16:
+        raise ValueError(f"Unexpected MANO weights shape: {weights.shape}")
+
+    groups: dict[str, list[int]] = {}
+    for name, joint_index in DISTAL_MANO_JOINTS.items():
+        count = min(max(1, per_finger), len(weights))
+        indices = np.argpartition(weights[:, joint_index], -count)[-count:]
+        indices = indices[np.argsort(weights[indices, joint_index])[::-1]]
+        groups[name] = indices.astype(int).tolist()
+    count = min(max(0, palm_count), len(weights))
+    if count:
+        palm = np.argpartition(weights[:, 0], -count)[-count:]
+        palm = palm[np.argsort(weights[palm, 0])[::-1]]
+    else:
+        palm = np.empty(0, dtype=np.int64)
+    groups["palm"] = palm.astype(int).tolist()
+    combined = np.unique(
+        np.concatenate(
+            [np.asarray(value, dtype=np.int64) for value in groups.values()]
+        )
+    )
+    return combined, groups
 
 
 def transform_surface(
@@ -241,6 +315,30 @@ def contact_states(
     return selected, updates
 
 
+def contact_candidates(
+    distance: torch.Tensor,
+    inside: torch.Tensor,
+    hand_normals: torch.Tensor,
+    object_normals: torch.Tensor,
+    valid: torch.Tensor,
+    semantic_mask: torch.Tensor,
+    args: argparse.Namespace,
+) -> torch.Tensor:
+    normal_dot = (hand_normals * object_normals).sum(dim=-1)
+    candidates = (
+        (distance <= args.contact_enter_mm / 1000.0)
+        & (inside <= args.penetration_tolerance_mm / 1000.0)
+        & (normal_dot <= args.normal_dot_max)
+        & valid[:, None]
+        & semantic_mask[None]
+    )
+    if args.contact_start_frame >= 0:
+        candidates[: args.contact_start_frame] = False
+    if args.contact_end_frame >= 0:
+        candidates[args.contact_end_frame + 1 :] = False
+    return candidates
+
+
 def project(points: torch.Tensor, intrinsics: torch.Tensor) -> torch.Tensor:
     z = points[..., 2].clamp_min(1e-4)
     u = intrinsics[0, 0] * points[..., 0] / z + intrinsics[0, 2]
@@ -335,11 +433,39 @@ def main() -> None:
             & np.isfinite(gt_joints_2d).all(axis=(1, 2))
         )
 
-    hand_indices = np.linspace(
-        0, vertices.shape[1] - 1,
-        min(args.hand_samples, vertices.shape[1]),
-        dtype=np.int64,
-    )
+    semantic_groups: dict[str, list[int]] = {}
+    if args.contact_vertex_scope == "mano_semantic":
+        if not args.mano_data_dir:
+            raise ValueError(
+                "--mano-data-dir is required with "
+                "--contact-vertex-scope mano_semantic"
+            )
+        hand_indices = np.arange(vertices.shape[1], dtype=np.int64)
+        hand_side = str(
+            np.asarray(
+                hand_payload.get(
+                    "hand_side",
+                    supervision.get("hand_side", "right"),
+                )
+            ).item()
+        ).lower()
+        semantic_indices, semantic_groups = mano_semantic_contact_indices(
+            Path(args.mano_data_dir).expanduser().resolve(),
+            hand_side,
+            args.contact_per_finger_vertices,
+            args.contact_palm_vertices,
+        )
+        semantic_mask_np = np.zeros(len(hand_indices), dtype=bool)
+        semantic_mask_np[semantic_indices] = True
+    else:
+        hand_indices = np.linspace(
+            0,
+            vertices.shape[1] - 1,
+            min(args.hand_samples, vertices.shape[1]),
+            dtype=np.int64,
+        )
+        semantic_indices = hand_indices.copy()
+        semantic_mask_np = np.ones(len(hand_indices), dtype=bool)
     sampled_hand = vertices[:, hand_indices]
     hand_normals = sampled_vertex_normals(vertices, faces, hand_indices)
     mesh = load_mesh(mesh_path, args.mesh_scale)
@@ -355,28 +481,28 @@ def main() -> None:
         torch.from_numpy(local_normals).to(device),
         pose_tensor,
     )
+    valid_tensor = torch.from_numpy(valid).to(device)
+    semantic_mask = torch.from_numpy(semantic_mask_np).to(device)
     with torch.no_grad():
         initial = nearest_surface(hand_tensor, object_points, object_normals)
         initial_distance, initial_point, initial_normal, initial_inside = initial
-        normal_dot = (hand_normal_tensor * initial_normal).sum(dim=-1)
-        candidates = (
-            (initial_distance <= args.contact_enter_mm / 1000.0)
-            & (initial_inside <= args.penetration_tolerance_mm / 1000.0)
-            & (normal_dot <= args.normal_dot_max)
-            & torch.from_numpy(valid).to(device)[:, None]
+        candidates = contact_candidates(
+            initial_distance,
+            initial_inside,
+            hand_normal_tensor,
+            initial_normal,
+            valid_tensor,
+            semantic_mask,
+            args,
         )
-        if args.contact_start_frame >= 0:
-            candidates[: args.contact_start_frame] = False
-        if args.contact_end_frame >= 0:
-            candidates[args.contact_end_frame + 1 :] = False
 
     contact_mask_np, updates = contact_states(
         candidates.cpu().numpy(),
         initial_distance.cpu().numpy(),
         args,
     )
+    updates = [{"optimization_step": 0, **row} for row in updates]
     contact_mask = torch.from_numpy(contact_mask_np).to(device)
-    valid_tensor = torch.from_numpy(valid).to(device)
     intrinsics_tensor = torch.from_numpy(intrinsics).to(device)
     joint_tensor = torch.from_numpy(pred_joints).to(device)
     object_center = pose_tensor[:, :3, 3]
@@ -410,6 +536,7 @@ def main() -> None:
     best_translation = torch.zeros(
         (count, 3), dtype=torch.float32, device=device
     )
+    best_contact_mask_np = contact_mask_np.copy()
     for step in range(1, args.steps + 1):
         optimizer.zero_grad(set_to_none=True)
         bounded_translation = torch.tanh(raw_translation) * max_translation
@@ -421,6 +548,34 @@ def main() -> None:
         distance, _, nearest_normal, inside = nearest_surface(
             corrected, object_points, object_normals
         )
+        if (
+            args.contact_redetect_steps > 0
+            and step > 1
+            and (step - 1) % args.contact_redetect_steps == 0
+        ):
+            with torch.no_grad():
+                refreshed_candidates = contact_candidates(
+                    distance.detach(),
+                    inside.detach(),
+                    hand_normal_tensor,
+                    nearest_normal.detach(),
+                    valid_tensor,
+                    semantic_mask,
+                    args,
+                )
+                refreshed_mask_np, refreshed_updates = contact_states(
+                    refreshed_candidates.cpu().numpy(),
+                    distance.detach().cpu().numpy(),
+                    args,
+                )
+                contact_mask_np = refreshed_mask_np
+                contact_mask = torch.from_numpy(contact_mask_np).to(device)
+                updates.extend(
+                    [
+                        {"optimization_step": step, **row}
+                        for row in refreshed_updates
+                    ]
+                )
 
         penetration_trusted = (
             distance <= args.penetration_max_distance_mm / 1000.0
@@ -498,6 +653,7 @@ def main() -> None:
             best_total = total_value
             best_step = step
             best_translation = translation.detach().clone()
+            best_contact_mask_np = contact_mask_np.copy()
         total.backward()
         optimizer.step()
         if step == 1 or step % 25 == 0 or step == args.steps:
@@ -526,7 +682,73 @@ def main() -> None:
         final_distance, _, _, final_inside = nearest_surface(
             corrected, object_points, object_normals
         )
+        ray_probe = []
+        if args.translation_mode == "ray_depth" and args.ray_probe_mm > 0:
+            probe_m = args.ray_probe_mm / 1000.0
+            best_contact_mask = torch.from_numpy(best_contact_mask_np).to(device)
+            for label, offset in (
+                ("minus", -probe_m),
+                ("center", 0.0),
+                ("plus", probe_m),
+            ):
+                probe_translation = translation + offset * wrist_ray
+                probe_hand = hand_tensor + probe_translation[:, None]
+                probe_distance, _, _, probe_inside = nearest_surface(
+                    probe_hand, object_points, object_normals
+                )
+                probe_penetration = (
+                    F.relu(
+                        probe_inside
+                        - args.penetration_tolerance_mm / 1000.0
+                    )
+                    * (
+                        probe_distance
+                        <= args.penetration_max_distance_mm / 1000.0
+                    )
+                )
+                probe_contact = F.smooth_l1_loss(
+                    probe_inside,
+                    torch.full_like(
+                        probe_inside,
+                        -args.contact_target_mm / 1000.0,
+                    ),
+                    reduction="none",
+                    beta=0.002,
+                )
+                probe_projection = project(
+                    projection_points + probe_translation[:, None],
+                    intrinsics_tensor,
+                )
+                projection_per_frame = (
+                    (probe_projection - projection_target)
+                    .square()
+                    .sum(dim=-1)
+                    .mean(dim=-1)
+                    / (100.0 ** 2)
+                )
+                penetration_per_frame = probe_penetration.square().mean(dim=-1)
+                contact_count = best_contact_mask.sum(dim=-1)
+                contact_per_frame = (
+                    (probe_contact * best_contact_mask).sum(dim=-1)
+                    / contact_count.clamp_min(1)
+                )
+                data_total = (
+                    args.w_penetration * penetration_per_frame
+                    + args.w_contact * contact_per_frame
+                    + args.w_projection * projection_per_frame
+                )
+                ray_probe.append(
+                    {
+                        "label": label,
+                        "offset_mm": offset * 1000.0,
+                        "penetration": penetration_per_frame.cpu().numpy(),
+                        "contact": contact_per_frame.cpu().numpy(),
+                        "projection": projection_per_frame.cpu().numpy(),
+                        "weighted_data_total": data_total.cpu().numpy(),
+                    }
+                )
     translation_np = translation.cpu().numpy()
+    contact_mask_np = best_contact_mask_np
     corrected_vertices = vertices + translation_np[:, None]
     output = dict(hand_payload)
     output["verts_cam"] = corrected_vertices.astype(np.float32)
@@ -538,6 +760,9 @@ def main() -> None:
         output["optim_seq_camera_ray"] = ray_np.astype(np.float32)
         output["optim_seq_ray_depth"] = ray_depth_np.astype(np.float32)
     output["optim_seq_contact_sample_indices"] = hand_indices.astype(np.int64)
+    output["optim_seq_semantic_contact_indices"] = semantic_indices.astype(
+        np.int64
+    )
     output["optim_seq_contact_mask"] = contact_mask_np
     output["optim_seq_source_hand"] = np.asarray(str(hand_path))
     output_path = out_dir / "hand_contact_optimized.npz"
@@ -588,6 +813,8 @@ def main() -> None:
         "num_frames": count,
         "num_valid_frames": int(valid.sum()),
         "num_contact_frame_vertices": int(contact_mask_np.sum()),
+        "num_semantic_contact_vertices": int(len(semantic_indices)),
+        "semantic_contact_groups": semantic_groups,
         "contact_updates": updates,
         "best_step": best_step,
         "best_total": best_total,
@@ -620,6 +847,32 @@ def main() -> None:
                 1000.0,
             ),
         },
+        "ray_direction_probe": (
+            [
+                {
+                    "frame": frame,
+                    "best_offset": min(
+                        ray_probe,
+                        key=lambda row: row["weighted_data_total"][frame],
+                    )["label"],
+                    "values": {
+                        row["label"]: {
+                            "offset_mm": row["offset_mm"],
+                            "penetration": float(row["penetration"][frame]),
+                            "contact": float(row["contact"][frame]),
+                            "projection": float(row["projection"][frame]),
+                            "weighted_data_total": float(
+                                row["weighted_data_total"][frame]
+                            ),
+                        }
+                        for row in ray_probe
+                    },
+                }
+                for frame in range(count)
+            ]
+            if ray_probe
+            else []
+        ),
         "history": history,
     }
     audit_path = out_dir / "audit.json"
