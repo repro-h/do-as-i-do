@@ -114,6 +114,37 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-translation-mm", type=float, default=20.0)
     parser.add_argument(
+        "--optimize-start-frame",
+        type=int,
+        default=-1,
+        help="Force translation to zero before this output frame.",
+    )
+    parser.add_argument(
+        "--optimize-end-frame",
+        type=int,
+        default=-1,
+        help="Force translation to zero after this output frame.",
+    )
+    parser.add_argument(
+        "--penetration-safety-gate",
+        action="store_true",
+        help=(
+            "Backtrack each optimized frame toward its initial translation "
+            "until hard penetration count and maximum-depth constraints pass."
+        ),
+    )
+    parser.add_argument(
+        "--safety-max-count-increase",
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
+        "--safety-max-depth-increase-mm",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument("--safety-backtrack-steps", type=int, default=20)
+    parser.add_argument(
         "--ray-probe-mm",
         type=float,
         default=2.0,
@@ -434,6 +465,22 @@ def penetration_terms(
     )
 
 
+def hard_penetration_metrics(
+    distance: torch.Tensor,
+    inside: torch.Tensor,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    penetrating = (
+        (inside > args.penetration_tolerance_mm / 1000.0)
+        & (distance <= args.penetration_max_distance_mm / 1000.0)
+    )
+    depth = (
+        F.relu(inside - args.penetration_tolerance_mm / 1000.0)
+        * penetrating
+    )
+    return penetrating.sum(dim=-1), depth.max(dim=-1).values
+
+
 def project(points: torch.Tensor, intrinsics: torch.Tensor) -> torch.Tensor:
     z = points[..., 2].clamp_min(1e-4)
     u = intrinsics[0, 0] * points[..., 0] / z + intrinsics[0, 2]
@@ -614,6 +661,13 @@ def main() -> None:
         projection_target = project(projection_points, intrinsics_tensor)
 
     wrist_ray = F.normalize(joint_tensor[:, 0], dim=-1, eps=1e-8)
+    optimize_mask = torch.ones(
+        (count, 1), dtype=torch.float32, device=device
+    )
+    if args.optimize_start_frame >= 0:
+        optimize_mask[: args.optimize_start_frame] = 0.0
+    if args.optimize_end_frame >= 0:
+        optimize_mask[args.optimize_end_frame + 1 :] = 0.0
     translation_parameter_shape = (
         (count, 1) if args.translation_mode == "ray_depth" else (count, 3)
     )
@@ -639,6 +693,7 @@ def main() -> None:
             translation = bounded_translation * wrist_ray
         else:
             translation = bounded_translation
+        translation = translation * optimize_mask
         corrected = hand_tensor + translation[:, None]
         distance, _, nearest_normal, inside = nearest_surface(
             corrected, object_points, object_normals
@@ -775,8 +830,66 @@ def main() -> None:
             history.append(row)
             print(json.dumps(row), flush=True)
 
+    safety_audit = {
+        "enabled": bool(args.penetration_safety_gate),
+        "num_backtracked_frames": 0,
+        "alpha": [1.0] * count,
+    }
     with torch.no_grad():
         translation = best_translation
+        if args.penetration_safety_gate:
+            initial_count, initial_max_depth = hard_penetration_metrics(
+                initial_distance, initial_inside, args
+            )
+            selected_translation = torch.zeros_like(translation)
+            selected_alpha = torch.zeros(
+                count, dtype=torch.float32, device=device
+            )
+            unresolved = valid_tensor.clone()
+            steps = max(1, args.safety_backtrack_steps)
+            for alpha in torch.linspace(
+                1.0, 0.0, steps + 1, device=device
+            ):
+                candidate_translation = translation * alpha
+                candidate_hand = (
+                    hand_tensor + candidate_translation[:, None]
+                )
+                candidate_distance, _, _, candidate_inside = nearest_surface(
+                    candidate_hand, object_points, object_normals
+                )
+                candidate_count, candidate_max_depth = (
+                    hard_penetration_metrics(
+                        candidate_distance, candidate_inside, args
+                    )
+                )
+                feasible = (
+                    candidate_count
+                    <= initial_count + args.safety_max_count_increase
+                ) & (
+                    candidate_max_depth
+                    <= initial_max_depth
+                    + args.safety_max_depth_increase_mm / 1000.0
+                )
+                choose = unresolved & feasible
+                selected_translation[choose] = candidate_translation[choose]
+                selected_alpha[choose] = alpha
+                unresolved &= ~choose
+            # Alpha zero reproduces the initial hand and must be feasible,
+            # except for invalid frames which remain unchanged by definition.
+            selected_translation[~valid_tensor] = 0.0
+            selected_alpha[~valid_tensor] = 0.0
+            translation = selected_translation
+            alpha_np = selected_alpha.cpu().numpy()
+            safety_audit = {
+                "enabled": True,
+                "num_backtracked_frames": int(
+                    ((selected_alpha < 1.0) & valid_tensor).sum().item()
+                ),
+                "num_reverted_frames": int(
+                    ((selected_alpha == 0.0) & valid_tensor).sum().item()
+                ),
+                "alpha": alpha_np.astype(float).tolist(),
+            }
         corrected = hand_tensor + translation[:, None]
         final_distance, _, _, final_inside = nearest_surface(
             corrected, object_points, object_normals
@@ -875,6 +988,9 @@ def main() -> None:
     output = dict(hand_payload)
     output["verts_cam"] = corrected_vertices.astype(np.float32)
     output["optim_seq_translation"] = translation_np.astype(np.float32)
+    output["optim_seq_safety_alpha"] = np.asarray(
+        safety_audit["alpha"], dtype=np.float32
+    )
     output["optim_seq_translation_mode"] = np.asarray(args.translation_mode)
     if args.translation_mode == "ray_depth":
         ray_np = wrist_ray.cpu().numpy()
@@ -940,6 +1056,7 @@ def main() -> None:
         "contact_updates": updates,
         "best_step": best_step,
         "best_total": best_total,
+        "penetration_safety": safety_audit,
         "translation_mm": stats(
             np.linalg.norm(translation_np, axis=-1), 1000.0
         ),
