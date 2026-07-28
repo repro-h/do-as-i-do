@@ -79,7 +79,7 @@ def pose_rows(path: Path) -> tuple[dict[str, np.ndarray], float]:
 
 def load_mesh(path: Path, scale: float) -> trimesh.Trimesh:
     loaded = trimesh.load(path, process=False)
-    mesh = loaded.dump(concatenate=True) if isinstance(loaded, trimesh.Scene) else loaded
+    mesh = loaded.to_geometry() if isinstance(loaded, trimesh.Scene) else loaded
     mesh = mesh.copy()
     mesh.vertices = np.asarray(mesh.vertices, dtype=np.float64) * scale
     return mesh
@@ -119,6 +119,10 @@ def raycast_depth(mesh: trimesh.Trimesh, xs: np.ndarray, ys: np.ndarray, K: np.n
     locations, ray_ids, _ = mesh.ray.intersects_location(
         np.zeros_like(directions), directions, multiple_hits=False
     )
+    if len(ray_ids) == 0:
+        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.int64)
+    locations = np.asarray(locations, dtype=np.float64).reshape(-1, 3)
+    ray_ids = np.asarray(ray_ids, dtype=np.int64).reshape(-1)
     return locations[:, 2], ray_ids
 
 
