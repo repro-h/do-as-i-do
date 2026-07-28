@@ -77,6 +77,7 @@ def main() -> None:
         bool(config.get("correction_gate", False)),
         str(config.get("prediction_mode", "translation3d")),
         bool(config.get("signed_magnitude_head", False)),
+        bool(config.get("auxiliary_sign_head", False)),
     ).to(args.device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
@@ -169,7 +170,10 @@ def main() -> None:
         sign_probability = (
             values["sign_probability"] / np.maximum(weight, 1e-8)
         ).astype(np.float32)
-        if not bool(config.get("signed_magnitude_head", False)):
+        if not (
+            bool(config.get("signed_magnitude_head", False))
+            or bool(config.get("auxiliary_sign_head", False))
+        ):
             sign_probability.fill(np.nan)
         with np.load(supervision_paths[stream_id], allow_pickle=False) as raw:
             supervision = {key: np.asarray(raw[key]) for key in raw.files}

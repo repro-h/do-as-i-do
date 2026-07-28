@@ -60,6 +60,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-target-mm", type=float, default=120.0)
     parser.add_argument("--w-depth", type=float, default=1.0)
     parser.add_argument("--signed-magnitude-head", action="store_true")
+    parser.add_argument(
+        "--auxiliary-sign-head",
+        action="store_true",
+        help=(
+            "Keep direct signed ray regression while using a separate sign "
+            "classifier only as auxiliary supervision."
+        ),
+    )
     parser.add_argument("--sign-valid-threshold-mm", type=float, default=5.0)
     parser.add_argument("--w-sign", type=float, default=0.5)
     parser.add_argument("--w-wrist", type=float, default=1.0)
@@ -249,11 +257,17 @@ class TranslationRefiner(nn.Module):
         correction_gate: bool = False,
         prediction_mode: str = "translation3d",
         signed_magnitude_head: bool = False,
+        auxiliary_sign_head: bool = False,
     ):
         super().__init__()
         self.correction_gate = correction_gate
         self.prediction_mode = prediction_mode
         self.signed_magnitude_head = signed_magnitude_head
+        self.auxiliary_sign_head = auxiliary_sign_head
+        if signed_magnitude_head and auxiliary_sign_head:
+            raise ValueError(
+                "Choose either signed_magnitude_head or auxiliary_sign_head"
+            )
         self.input = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -279,10 +293,10 @@ class TranslationRefiner(nn.Module):
         nn.init.trunc_normal_(self.position, std=0.02)
         nn.init.zeros_(self.output[-1].weight)
         nn.init.zeros_(self.output[-1].bias)
-        if signed_magnitude_head:
+        if signed_magnitude_head or auxiliary_sign_head:
             if prediction_mode != "ray_depth":
                 raise ValueError(
-                    "signed_magnitude_head requires prediction_mode=ray_depth"
+                    "sign heads require prediction_mode=ray_depth"
                 )
             self.sign_head = nn.Sequential(
                 nn.LayerNorm(hidden_dim),
@@ -290,14 +304,15 @@ class TranslationRefiner(nn.Module):
                 nn.GELU(),
                 nn.Linear(hidden_dim, 1),
             )
+            nn.init.zeros_(self.sign_head[-1].weight)
+            nn.init.zeros_(self.sign_head[-1].bias)
+        if signed_magnitude_head:
             self.magnitude_head = nn.Sequential(
                 nn.LayerNorm(hidden_dim),
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.GELU(),
                 nn.Linear(hidden_dim, 1),
             )
-            nn.init.zeros_(self.sign_head[-1].weight)
-            nn.init.zeros_(self.sign_head[-1].bias)
             nn.init.zeros_(self.magnitude_head[-1].weight)
             nn.init.constant_(self.magnitude_head[-1].bias, -2.2)
         if correction_gate:
@@ -318,9 +333,12 @@ class TranslationRefiner(nn.Module):
     ):
         token = self.input(features) + self.position[:, : features.shape[1]]
         encoded = self.encoder(token)
-        sign_logits = None
+        sign_logits = (
+            self.sign_head(encoded).squeeze(-1)
+            if self.signed_magnitude_head or self.auxiliary_sign_head
+            else None
+        )
         if self.signed_magnitude_head:
-            sign_logits = self.sign_head(encoded).squeeze(-1)
             magnitude = (
                 torch.sigmoid(self.magnitude_head(encoded).squeeze(-1))
                 * max_translation
@@ -619,6 +637,7 @@ def main() -> None:
         args.correction_gate,
         args.prediction_mode,
         args.signed_magnitude_head,
+        args.auxiliary_sign_head,
     ).to(args.device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
