@@ -59,6 +59,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smooth-l1-beta-mm", type=float, default=5.0)
     parser.add_argument("--max-target-mm", type=float, default=120.0)
     parser.add_argument("--w-depth", type=float, default=1.0)
+    parser.add_argument("--signed-magnitude-head", action="store_true")
+    parser.add_argument("--sign-valid-threshold-mm", type=float, default=5.0)
+    parser.add_argument("--w-sign", type=float, default=0.5)
     parser.add_argument("--w-wrist", type=float, default=1.0)
     parser.add_argument("--w-palm", type=float, default=0.0)
     parser.add_argument("--w-projection", type=float, default=1.0)
@@ -245,10 +248,12 @@ class TranslationRefiner(nn.Module):
         dropout: float,
         correction_gate: bool = False,
         prediction_mode: str = "translation3d",
+        signed_magnitude_head: bool = False,
     ):
         super().__init__()
         self.correction_gate = correction_gate
         self.prediction_mode = prediction_mode
+        self.signed_magnitude_head = signed_magnitude_head
         self.input = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -274,6 +279,27 @@ class TranslationRefiner(nn.Module):
         nn.init.trunc_normal_(self.position, std=0.02)
         nn.init.zeros_(self.output[-1].weight)
         nn.init.zeros_(self.output[-1].bias)
+        if signed_magnitude_head:
+            if prediction_mode != "ray_depth":
+                raise ValueError(
+                    "signed_magnitude_head requires prediction_mode=ray_depth"
+                )
+            self.sign_head = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 1),
+            )
+            self.magnitude_head = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 1),
+            )
+            nn.init.zeros_(self.sign_head[-1].weight)
+            nn.init.zeros_(self.sign_head[-1].bias)
+            nn.init.zeros_(self.magnitude_head[-1].weight)
+            nn.init.constant_(self.magnitude_head[-1].bias, -2.2)
         if correction_gate:
             self.gate = nn.Sequential(
                 nn.LayerNorm(hidden_dim),
@@ -284,16 +310,41 @@ class TranslationRefiner(nn.Module):
             nn.init.zeros_(self.gate[-1].weight)
             nn.init.zeros_(self.gate[-1].bias)
 
-    def forward(self, features: torch.Tensor, max_translation: float):
+    def forward(
+        self,
+        features: torch.Tensor,
+        max_translation: float,
+        return_aux: bool = False,
+    ):
         token = self.input(features) + self.position[:, : features.shape[1]]
         encoded = self.encoder(token)
-        raw_translation = (
-            torch.tanh(self.output(encoded)) * max_translation
-        )
-        if not self.correction_gate:
-            return raw_translation
-        gate = torch.sigmoid(self.gate(encoded)).squeeze(-1)
-        return raw_translation * gate.unsqueeze(-1), gate
+        sign_logits = None
+        if self.signed_magnitude_head:
+            sign_logits = self.sign_head(encoded).squeeze(-1)
+            magnitude = (
+                torch.sigmoid(self.magnitude_head(encoded).squeeze(-1))
+                * max_translation
+            )
+            raw_translation = (
+                torch.tanh(sign_logits) * magnitude
+            ).unsqueeze(-1)
+        else:
+            raw_translation = (
+                torch.tanh(self.output(encoded)) * max_translation
+            )
+        gate = None
+        if self.correction_gate:
+            gate = torch.sigmoid(self.gate(encoded)).squeeze(-1)
+            raw_translation = raw_translation * gate.unsqueeze(-1)
+        if return_aux:
+            return {
+                "prediction": raw_translation,
+                "gate": gate,
+                "sign_logits": sign_logits,
+            }
+        if gate is not None:
+            return raw_translation, gate
+        return raw_translation
 
 
 def masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -337,13 +388,14 @@ def compute(model, batch, args):
         key: value.to(args.device) if torch.is_tensor(value) else value
         for key, value in batch.items()
     }
-    prediction = model(
-        batch["features"], args.max_translation_mm / 1000.0
+    model_output = model(
+        batch["features"],
+        args.max_translation_mm / 1000.0,
+        return_aux=True,
     )
-    if args.correction_gate:
-        raw_prediction, gate = prediction
-    else:
-        raw_prediction, gate = prediction, None
+    raw_prediction = model_output["prediction"]
+    gate = model_output["gate"]
+    sign_logits = model_output["sign_logits"]
     pred = batch["pred_joints"]
     gt = batch["gt_joints"]
     valid = batch["valid"]
@@ -432,6 +484,19 @@ def compute(model, batch, args):
             beta,
         ),
     }
+    if sign_logits is not None:
+        sign_valid = (
+            valid
+            & (
+                initial_ray_error
+                >= args.sign_valid_threshold_mm / 1000.0
+            )
+        )
+        sign_target = (target_ray_depth > 0.0).to(pred.dtype)
+        sign_loss = F.binary_cross_entropy_with_logits(
+            sign_logits, sign_target, reduction="none"
+        )
+        losses["sign"] = masked_mean(sign_loss, sign_valid)
     if gate is not None:
         gate_range = max(
             args.gate_full_error_mm - args.gate_zero_error_mm, 1e-6
@@ -457,6 +522,8 @@ def compute(model, batch, args):
     )
     if gate is not None:
         total = total + args.w_gate * losses["gate"]
+    if sign_logits is not None:
+        total = total + args.w_sign * losses["sign"]
     before = torch.linalg.norm(pred[:, :, 0] - gt[:, :, 0], dim=-1)
     after = torch.linalg.norm(corrected[:, :, 0] - gt[:, :, 0], dim=-1)
     ray_after = torch.abs(target_ray_depth - ray_depth)
@@ -551,6 +618,7 @@ def main() -> None:
         args.dropout,
         args.correction_gate,
         args.prediction_mode,
+        args.signed_magnitude_head,
     ).to(args.device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay

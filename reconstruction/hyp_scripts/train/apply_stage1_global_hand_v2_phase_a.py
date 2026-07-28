@@ -76,6 +76,7 @@ def main() -> None:
         float(config["dropout"]),
         bool(config.get("correction_gate", False)),
         str(config.get("prediction_mode", "translation3d")),
+        bool(config.get("signed_magnitude_head", False)),
     ).to(args.device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
@@ -90,6 +91,7 @@ def main() -> None:
         stream_id: {
             "translation": np.zeros((length, 3), dtype=np.float64),
             "gate": np.zeros(length, dtype=np.float64),
+            "sign_probability": np.zeros(length, dtype=np.float64),
             "weight": np.zeros(length, dtype=np.float64),
         }
         for stream_id, length in lengths.items()
@@ -98,17 +100,26 @@ def main() -> None:
     with torch.no_grad():
         for batch in loader:
             features = batch["features"].to(args.device)
-            prediction = model(
-                features, float(config["max_translation_mm"]) / 1000.0
+            model_output = model(
+                features,
+                float(config["max_translation_mm"]) / 1000.0,
+                return_aux=True,
             )
-            if bool(config.get("correction_gate", False)):
-                raw_prediction, gate = prediction
-                gate = gate.cpu().numpy()
-            else:
-                raw_prediction = prediction
+            raw_prediction = model_output["prediction"]
+            if model_output["gate"] is None:
                 gate = np.ones(
                     raw_prediction.shape[:2], dtype=np.float32
                 )
+            else:
+                gate = model_output["gate"].cpu().numpy()
+            if model_output["sign_logits"] is None:
+                sign_probability = np.full(
+                    raw_prediction.shape[:2], np.nan, dtype=np.float32
+                )
+            else:
+                sign_probability = torch.sigmoid(
+                    model_output["sign_logits"]
+                ).cpu().numpy()
             raw_prediction = raw_prediction.cpu().numpy()
             wrist = batch["pred_joints"][:, :, 0].numpy()
             ray = wrist / np.maximum(
@@ -130,6 +141,10 @@ def main() -> None:
                 sums[stream_id]["gate"][start:end] += (
                     gate[index] * weights
                 )
+                if np.isfinite(sign_probability[index]).all():
+                    sums[stream_id]["sign_probability"][start:end] += (
+                        sign_probability[index] * weights
+                    )
                 sums[stream_id]["weight"][start:end] += weights
 
     handflow_root = Path(args.handflow_root).expanduser().resolve()
@@ -151,6 +166,11 @@ def main() -> None:
         correction_gate = (
             values["gate"] / np.maximum(weight, 1e-8)
         ).astype(np.float32)
+        sign_probability = (
+            values["sign_probability"] / np.maximum(weight, 1e-8)
+        ).astype(np.float32)
+        if not bool(config.get("signed_magnitude_head", False)):
+            sign_probability.fill(np.nan)
         with np.load(supervision_paths[stream_id], allow_pickle=False) as raw:
             supervision = {key: np.asarray(raw[key]) for key in raw.files}
         translation_camera = translation_normalized.copy()
@@ -228,6 +248,7 @@ def main() -> None:
             config.get("prediction_mode", "translation3d")
         )
         output["stage1_correction_gate"] = correction_gate[:count]
+        output["stage1_sign_probability"] = sign_probability[:count]
         output["stage1_predicted"] = predicted[:count]
         output["stage1_checkpoint"] = np.asarray(str(checkpoint_path))
         output["stage1_source_handflow"] = np.asarray(str(handflow_path))
