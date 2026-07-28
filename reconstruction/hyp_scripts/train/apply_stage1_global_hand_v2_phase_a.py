@@ -59,6 +59,7 @@ def main() -> None:
         windows_path,
         float(config["max_target_mm"]) / 1000.0,
         bool(config.get("include_camera_ray", False)),
+        bool(config.get("include_surface_geometry", False)),
     )
     loader = DataLoader(
         dataset,

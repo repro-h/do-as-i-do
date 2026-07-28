@@ -6,15 +6,25 @@ from __future__ import annotations
 import argparse
 import json
 import pickle
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 from scipy.sparse import issparse
+from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
+import trimesh
 
 
 PALM_JOINTS = np.asarray([0, 5, 9, 13, 17], dtype=np.int64)
 MIRROR_X = np.diag([-1.0, 1.0, 1.0]).astype(np.float32)
+DISTAL_MANO_JOINTS = {
+    "thumb": 15,
+    "index": 3,
+    "middle": 6,
+    "ring": 12,
+    "pinky": 9,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,6 +39,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-size", type=int, default=16)
     parser.add_argument("--window-stride", type=int, default=4)
     parser.add_argument("--min-valid-hand-frames", type=int, default=8)
+    parser.add_argument("--geometry-features", action="store_true")
+    parser.add_argument("--object-surface-samples", type=int, default=1024)
+    parser.add_argument("--contact-per-finger-vertices", type=int, default=32)
+    parser.add_argument("--contact-palm-vertices", type=int, default=64)
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0)
@@ -51,6 +65,126 @@ def load_mano_joint_regressor(path: Path) -> np.ndarray:
     if regressor.shape != (16, 778):
         raise ValueError(f"Unexpected MANO J_regressor shape: {regressor.shape}")
     return regressor
+
+
+def load_mano_semantic_groups(
+    path: Path, per_finger: int, palm_count: int
+) -> dict[str, np.ndarray]:
+    with path.open("rb") as handle:
+        raw = pickle.load(handle, encoding="latin1")
+    weights = raw.get("weights", raw.get("lbs_weights"))
+    if hasattr(weights, "toarray"):
+        weights = weights.toarray()
+    weights = np.asarray(weights, dtype=np.float32)
+    if weights.shape[0] != 778 or weights.shape[1] < 16:
+        raise ValueError(f"Unexpected MANO weights shape: {weights.shape}")
+    groups = {}
+    for name, joint_index in DISTAL_MANO_JOINTS.items():
+        count = min(max(1, per_finger), len(weights))
+        indices = np.argpartition(weights[:, joint_index], -count)[-count:]
+        groups[name] = indices.astype(np.int64)
+    count = min(max(1, palm_count), len(weights))
+    groups["palm"] = np.argpartition(weights[:, 0], -count)[-count:].astype(
+        np.int64
+    )
+    return groups
+
+
+@lru_cache(maxsize=32)
+def object_surface(
+    path_string: str, scale: float, sample_count: int
+) -> tuple[np.ndarray, np.ndarray]:
+    loaded = trimesh.load(path_string, process=False)
+    if isinstance(loaded, trimesh.Scene):
+        loaded = trimesh.util.concatenate(tuple(loaded.geometry.values()))
+    vertices = np.asarray(loaded.vertices, dtype=np.float64) * scale
+    faces = np.asarray(loaded.faces, dtype=np.int64)
+    if not len(vertices) or not len(faces):
+        raise ValueError(f"Empty object mesh: {path_string}")
+    triangles = vertices[faces]
+    cross = np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+    )
+    area = np.linalg.norm(cross, axis=-1)
+    cdf = np.cumsum(np.maximum(area, 1e-12))
+    targets = (
+        (np.arange(sample_count, dtype=np.float64) + 0.5)
+        / sample_count
+        * cdf[-1]
+    )
+    selected = np.searchsorted(cdf, targets).clip(0, len(faces) - 1)
+    sequence = np.arange(sample_count, dtype=np.float64)
+    u = np.mod((sequence + 0.5) * 0.7548776662466927, 1.0)
+    v = np.mod((sequence + 0.5) * 0.5698402909980532, 1.0)
+    sqrt_u = np.sqrt(np.maximum(u, 1e-8))
+    barycentric = np.stack(
+        [1.0 - sqrt_u, sqrt_u * (1.0 - v), sqrt_u * v], axis=-1
+    )
+    points = (
+        triangles[selected] * barycentric[:, :, None]
+    ).sum(axis=1).astype(np.float32)
+    extents = (vertices.max(axis=0) - vertices.min(axis=0)).astype(np.float32)
+    return points, extents
+
+
+def surface_geometry_features(
+    hand_vertices: np.ndarray,
+    object_pose: np.ndarray,
+    hand_valid: np.ndarray,
+    object_valid: np.ndarray,
+    object_points: np.ndarray,
+    semantic_groups: dict[str, np.ndarray],
+) -> tuple[np.ndarray, list[str]]:
+    group_names = list(semantic_groups)
+    statistic_names = [
+        "distance_min",
+        "distance_p10",
+        "distance_median",
+        "distance_p90",
+        "distance_lt_5mm",
+        "distance_lt_10mm",
+        "distance_lt_20mm",
+        "ray_direction_p10",
+        "ray_direction_median",
+        "ray_direction_p90",
+        "ray_direction_positive_fraction",
+    ]
+    names = [
+        f"{group}_{statistic}"
+        for group in group_names
+        for statistic in statistic_names
+    ]
+    output = np.zeros((len(hand_vertices), len(names)), dtype=np.float32)
+    tree = cKDTree(object_points)
+    for frame in np.flatnonzero(hand_valid & object_valid):
+        rotation = object_pose[frame, :3, :3]
+        translation = object_pose[frame, :3, 3]
+        local_hand = (hand_vertices[frame] - translation) @ rotation
+        wrist = hand_vertices[frame, 0]
+        ray = wrist / max(float(np.linalg.norm(wrist)), 1e-8)
+        cursor = 0
+        for indices in semantic_groups.values():
+            points = local_hand[indices]
+            distance, nearest_index = tree.query(points, k=1)
+            nearest_local = object_points[nearest_index]
+            nearest_camera = nearest_local @ rotation.T + translation
+            direction = np.sum(
+                (nearest_camera - hand_vertices[frame, indices]) * ray,
+                axis=-1,
+            )
+            values = [
+                distance.min(),
+                *np.quantile(distance, [0.1, 0.5, 0.9]),
+                np.mean(distance < 0.005),
+                np.mean(distance < 0.010),
+                np.mean(distance < 0.020),
+                *np.quantile(direction, [0.1, 0.5, 0.9]),
+                np.mean(direction > 0.0),
+            ]
+            output[frame, cursor : cursor + len(values)] = values
+            cursor += len(values)
+    return output, names
 
 
 def mano16_to_dexycb21(joints: np.ndarray, vertices: np.ndarray) -> np.ndarray:
@@ -170,6 +304,7 @@ def prepare_stream(
     handflow_root: Path,
     filtered_root: Path,
     joint_regressor: np.ndarray,
+    semantic_groups: dict[str, np.ndarray] | None,
     out_path: Path,
 ) -> dict:
     stream_id = record["stream_id"]
@@ -247,6 +382,28 @@ def prepare_stream(
 
     supervision_valid = hand_valid & gt_valid & object_valid
     root_valid = supervision_valid & np.isfinite(initial_root_rotvec).all(axis=1)
+    geometry_features = np.empty((count, 0), dtype=np.float32)
+    geometry_feature_names: list[str] = []
+    object_extents = np.zeros(3, dtype=np.float32)
+    if args.geometry_features:
+        if semantic_groups is None:
+            raise RuntimeError("Missing MANO semantic groups")
+        object_points, object_extents = object_surface(
+            str(Path(record["sam3d_glb"]).resolve()),
+            float(record["foundationpose_source_mesh_scale"]),
+            args.object_surface_samples,
+        )
+        if is_left:
+            object_points = object_points.copy()
+            object_points[:, 0] *= -1.0
+        geometry_features, geometry_feature_names = surface_geometry_features(
+            vertices,
+            object_pose,
+            hand_valid,
+            object_valid,
+            object_points,
+            semantic_groups,
+        )
     np.savez_compressed(
         out_path,
         frame_ids=np.asarray(frame_ids),
@@ -263,6 +420,9 @@ def prepare_stream(
         object_valid=object_valid,
         supervision_valid=supervision_valid,
         root_valid=root_valid,
+        object_extents_metric=object_extents,
+        surface_geometry_features=geometry_features,
+        surface_geometry_feature_names=np.asarray(geometry_feature_names),
         palm_joint_indices=PALM_JOINTS,
         normalized_left=np.asarray(is_left),
         hand_side=np.asarray(record["hand_side"]),
@@ -298,6 +458,13 @@ def main() -> None:
     out_root.mkdir(parents=True, exist_ok=True)
     window_path.parent.mkdir(parents=True, exist_ok=True)
     joint_regressor = load_mano_joint_regressor(mano_root / "MANO_RIGHT.pkl")
+    semantic_groups = None
+    if args.geometry_features:
+        semantic_groups = load_mano_semantic_groups(
+            mano_root / "MANO_RIGHT.pkl",
+            args.contact_per_finger_vertices,
+            args.contact_palm_vertices,
+        )
 
     records = load_jsonl(manifest)
     selected = [
@@ -316,7 +483,7 @@ def main() -> None:
             if args.overwrite or not out_path.is_file():
                 metrics = prepare_stream(
                     record, args, handflow_root, filtered_root,
-                    joint_regressor, out_path
+                    joint_regressor, semantic_groups, out_path
                 )
             else:
                 with np.load(out_path, allow_pickle=False) as raw:

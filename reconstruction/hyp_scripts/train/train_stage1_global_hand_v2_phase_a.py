@@ -47,6 +47,15 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Append the normalized wrist camera ray to each frame feature.",
     )
+    parser.add_argument(
+        "--include-surface-geometry",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Append object rotation/extent, object-local wrist/palm, and "
+            "precomputed semantic hand-to-object surface statistics."
+        ),
+    )
     parser.add_argument("--smooth-l1-beta-mm", type=float, default=5.0)
     parser.add_argument("--max-target-mm", type=float, default=120.0)
     parser.add_argument("--w-depth", type=float, default=1.0)
@@ -97,18 +106,24 @@ def rotation_6d_from_rotvec(rotvec: np.ndarray) -> np.ndarray:
     return matrix[:, :, :2].transpose(0, 2, 1).reshape(len(rotvec), 6)
 
 
+def rotation_6d_from_matrix(matrix: np.ndarray) -> np.ndarray:
+    return matrix[:, :, :2].transpose(0, 2, 1).reshape(len(matrix), 6)
+
+
 class WindowDataset(Dataset):
     def __init__(
         self,
         path: Path,
         max_target_m: float,
         include_camera_ray: bool = False,
+        include_surface_geometry: bool = False,
     ):
         self.rows = load_jsonl(path)
         if not self.rows:
             raise RuntimeError(f"No windows in {path}")
         self.max_target_m = max_target_m
         self.include_camera_ray = include_camera_ray
+        self.include_surface_geometry = include_surface_geometry
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -136,6 +151,7 @@ class WindowDataset(Dataset):
         wrist = pred[:, 0]
         palm_local = pred[:, PALM] - wrist[:, None]
         object_center = object_pose[:, :3, 3]
+        object_rotation = object_pose[:, :3, :3]
         hand_velocity = np.zeros_like(wrist)
         object_velocity = np.zeros_like(object_center)
         hand_velocity[1:] = wrist[1:] - wrist[:-1]
@@ -147,6 +163,49 @@ class WindowDataset(Dataset):
         )
         hand_acceleration = np.zeros_like(wrist)
         hand_acceleration[1:] = hand_velocity[1:] - hand_velocity[:-1]
+        geometry_parts = []
+        if self.include_surface_geometry:
+            required = {
+                "object_extents_metric",
+                "surface_geometry_features",
+                "surface_geometry_feature_names",
+            }
+            missing = required.difference(raw)
+            if missing:
+                raise KeyError(
+                    f"{row['supervision_npz']} lacks geometry fields: "
+                    f"{sorted(missing)}"
+                )
+            extents = np.asarray(
+                raw["object_extents_metric"], dtype=np.float32
+            ).reshape(3)
+            safe_extents = np.maximum(extents, 1e-3)
+            local_wrist = np.einsum(
+                "ti,tij->tj", wrist - object_center, object_rotation
+            )
+            local_palm = np.einsum(
+                "tki,tij->tkj",
+                pred[:, PALM] - object_center[:, None],
+                object_rotation,
+            )
+            surface = np.asarray(
+                raw["surface_geometry_features"][start:end],
+                dtype=np.float32,
+            ).copy()
+            names = [
+                str(value)
+                for value in raw["surface_geometry_feature_names"].tolist()
+            ]
+            for column, name in enumerate(names):
+                if "distance_" in name or "ray_direction_" in name:
+                    surface[:, column] /= 0.1
+            geometry_parts = [
+                rotation_6d_from_matrix(object_rotation),
+                np.broadcast_to(extents / 0.2, (len(wrist), 3)),
+                local_wrist / safe_extents,
+                (local_palm / safe_extents).reshape(len(wrist), -1),
+                surface,
+            ]
         features = np.concatenate(
             [
                 wrist,
@@ -159,6 +218,7 @@ class WindowDataset(Dataset):
                 relative_velocity,
                 rotation_6d_from_rotvec(initial_root),
                 *([camera_ray] if self.include_camera_ray else []),
+                *geometry_parts,
                 valid[:, None],
             ],
             axis=-1,
@@ -466,11 +526,13 @@ def main() -> None:
         Path(args.train_windows).expanduser().resolve(),
         args.max_target_mm / 1000.0,
         args.include_camera_ray,
+        args.include_surface_geometry,
     )
     val_dataset = WindowDataset(
         Path(args.val_windows).expanduser().resolve(),
         args.max_target_mm / 1000.0,
         args.include_camera_ray,
+        args.include_surface_geometry,
     )
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
