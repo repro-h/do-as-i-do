@@ -307,8 +307,13 @@ def compute(model, batch, args):
     )
     initial_error = torch.linalg.norm(target_translation, dim=-1)
     initial_ray_error = torch.abs(target_ray_depth)
+    weighting_error = (
+        initial_ray_error
+        if args.prediction_mode == "ray_depth"
+        else initial_error
+    )
     supervision_weight = (
-        initial_error
+        weighting_error
         / max(args.error_weight_reference_mm / 1000.0, 1e-8)
     ).clamp(args.error_weight_min, args.error_weight_max)
     axis_weight = torch.tensor(
@@ -317,10 +322,10 @@ def compute(model, batch, args):
         device=pred.device,
     )
     anchor_weight = torch.where(
-        initial_error < args.anchor_accurate_mm / 1000.0,
+        weighting_error < args.anchor_accurate_mm / 1000.0,
         torch.full_like(initial_error, args.anchor_accurate_weight),
         torch.where(
-            initial_error < args.anchor_large_error_mm / 1000.0,
+            weighting_error < args.anchor_large_error_mm / 1000.0,
             torch.full_like(initial_error, args.anchor_medium_weight),
             torch.full_like(initial_error, args.anchor_large_error_weight),
         ),
