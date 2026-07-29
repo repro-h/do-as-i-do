@@ -25,6 +25,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--object-label", type=int, required=True)
     parser.add_argument("--hand-label", type=int, default=255)
     parser.add_argument("--confidence-threshold", type=float, default=0.25)
+    parser.add_argument("--full-confidence-threshold", type=float, default=0.1)
+    parser.add_argument("--show-full-point-cloud", action="store_true")
+    parser.add_argument("--export-dir", default=None)
     parser.add_argument("--mesh-scale", type=float, default=-1.0)
     parser.add_argument("--object-surface-points", type=int, default=50000)
     parser.add_argument("--point-size", type=float, default=0.0025)
@@ -127,10 +130,25 @@ def main() -> None:
         ],
         axis=-1,
     )
+    image = cv2.imread(
+        str(Path(row["image_path"]).expanduser().resolve()),
+        cv2.IMREAD_COLOR,
+    )
+    if image is None:
+        raise OSError(f"Cannot read RGB frame: {row['image_path']}")
+    image = cv2.cvtColor(
+        cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA),
+        cv2.COLOR_BGR2RGB,
+    )
     segmentation = load_segmentation(Path(row["label_path"]).expanduser().resolve())
     segmentation = cv2.resize(segmentation, (width, height), interpolation=cv2.INTER_NEAREST)
     finite = np.isfinite(calibrated).all(axis=-1) & (calibrated[..., 2] > 0)
     confident = confidence >= args.confidence_threshold
+    full_valid = finite & (
+        confidence >= args.full_confidence_threshold
+    )
+    full_points = calibrated[full_valid]
+    full_colors = image[full_valid]
     object_points = calibrated[(segmentation == args.object_label) & finite & confident]
     hand_points = calibrated[(segmentation == args.hand_label) & finite & confident]
 
@@ -154,8 +172,43 @@ def main() -> None:
         hand_vertices = np.asarray(payload["verts_cam"][args.frame], dtype=np.float32)
         hand_faces = np.asarray(payload["faces"], dtype=np.int64)
 
+    if args.export_dir:
+        export_dir = Path(args.export_dir).expanduser().resolve()
+        export_dir.mkdir(parents=True, exist_ok=True)
+        trimesh.points.PointCloud(
+            vertices=full_points,
+            colors=full_colors,
+        ).export(export_dir / f"frame_{args.frame:06d}_full_pointcloud.ply")
+        trimesh.points.PointCloud(
+            vertices=object_points,
+            colors=np.tile(
+                np.asarray([[255, 60, 190]], dtype=np.uint8),
+                (len(object_points), 1),
+            ),
+        ).export(export_dir / f"frame_{args.frame:06d}_object_points.ply")
+        trimesh.points.PointCloud(
+            vertices=hand_points,
+            colors=np.tile(
+                np.asarray([[255, 210, 40]], dtype=np.uint8),
+                (len(hand_points), 1),
+            ),
+        ).export(export_dir / f"frame_{args.frame:06d}_hand_points.ply")
+        trimesh.Trimesh(
+            vertices=hand_vertices,
+            faces=hand_faces,
+            process=False,
+        ).export(export_dir / f"frame_{args.frame:06d}_handflow_hand.obj")
+        print(f"Exported debug assets: {export_dir}")
+
     server = viser.ViserServer(port=args.port)
     server.scene.set_up_direction("-y")
+    if args.show_full_point_cloud:
+        server.scene.add_point_cloud(
+            "/pi3_full_rgb_pointcloud",
+            points=full_points.astype(np.float32),
+            colors=full_colors.astype(np.uint8),
+            point_size=args.point_size,
+        )
     server.scene.add_point_cloud(
         "/object_mesh_surface",
         points=object_surface.astype(np.float32),
@@ -187,6 +240,7 @@ def main() -> None:
     print(f"scale={window['scale']:.6f} shift={window['shift_m'] * 1000:+.3f}mm")
     print(f"Pi3 object points={len(object_points)}")
     print(f"Pi3 hand points={len(hand_points)}")
+    print(f"Pi3 full points={len(full_points)}")
     print(f"Viewer: http://localhost:{args.port}")
     print("Green=tracked object mesh surface, magenta=Pi3 object points")
     print("Blue=HandFlow mesh, yellow=Pi3 hand points")
