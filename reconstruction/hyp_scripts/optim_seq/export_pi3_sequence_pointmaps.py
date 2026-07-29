@@ -23,6 +23,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-stride", type=int, default=8)
     parser.add_argument("--pixel-limit", type=int, default=180000)
     parser.add_argument("--confidence-threshold", type=float, default=0.1)
+    parser.add_argument("--frame-start", type=int, default=0)
+    parser.add_argument(
+        "--frame-end",
+        type=int,
+        default=-1,
+        help="Exclusive output-frame end; -1 uses the full sequence.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -60,7 +67,21 @@ def main() -> None:
     from pi3_wilor_hand.pi3_runner import run_pi3
 
     rows = load_frame_rows(frame_map_path)
-    image_paths = [str(Path(row["image_path"]).expanduser().resolve()) for row in rows]
+    selected_start = max(0, args.frame_start)
+    selected_end = (
+        len(rows)
+        if args.frame_end < 0
+        else min(len(rows), args.frame_end)
+    )
+    if not selected_start < selected_end:
+        raise ValueError(
+            f"Invalid frame range [{selected_start}, {selected_end})"
+        )
+    selected_rows = rows[selected_start:selected_end]
+    image_paths = [
+        str(Path(row["image_path"]).expanduser().resolve())
+        for row in selected_rows
+    ]
     missing = [path for path in image_paths if not Path(path).is_file()]
     if missing:
         raise FileNotFoundError(f"Missing RGB frame: {missing[0]}")
@@ -71,13 +92,18 @@ def main() -> None:
         intrinsics = intrinsics[0]
     intrinsics = intrinsics.reshape(3, 3)
 
-    size = min(max(2, args.window_size), len(rows))
+    size = min(max(1, args.window_size), len(selected_rows))
     stride = max(1, min(args.window_stride, size))
-    starts = window_starts(len(rows), size, stride)
+    starts = window_starts(len(selected_rows), size, stride)
     records = []
     for number, start in enumerate(starts):
         end = min(len(rows), start + size)
-        output_path = windows_dir / f"window_{start:06d}_{end:06d}.npz"
+        global_start = selected_start + start
+        global_end = selected_start + end
+        output_path = (
+            windows_dir
+            / f"window_{global_start:06d}_{global_end:06d}.npz"
+        )
         if output_path.is_file() and not args.overwrite:
             print(f"[{number + 1}/{len(starts)}] cached {start}:{end}")
         else:
@@ -93,9 +119,11 @@ def main() -> None:
             )
             np.savez_compressed(
                 output_path,
-                start=np.int32(start),
-                end=np.int32(end),
-                frame_indices=np.arange(start, end, dtype=np.int32),
+                start=np.int32(global_start),
+                end=np.int32(global_end),
+                frame_indices=np.arange(
+                    global_start, global_end, dtype=np.int32
+                ),
                 local_points=result.local_points.astype(np.float16),
                 confidence=result.conf.astype(np.float16),
                 valid_mask=result.masks.astype(np.uint8),
@@ -111,8 +139,8 @@ def main() -> None:
             )
         records.append(
             {
-                "start": start,
-                "end": end,
+                "start": global_start,
+                "end": global_end,
                 "path": str(output_path),
             }
         )
@@ -122,7 +150,9 @@ def main() -> None:
         "hand_npz": str(hand_path),
         "pi3_root": str(Path(args.pi3_root).expanduser().resolve()),
         "checkpoint": str(Path(args.checkpoint).expanduser().resolve()),
-        "num_frames": len(rows),
+        "num_frames": len(selected_rows),
+        "frame_start": selected_start,
+        "frame_end": selected_end,
         "num_windows": len(records),
         "window_size": size,
         "window_stride": stride,

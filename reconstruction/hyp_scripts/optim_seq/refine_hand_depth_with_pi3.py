@@ -102,14 +102,10 @@ def sampled_pixels(mask: np.ndarray, maximum: int, rng: np.random.Generator) -> 
     return xs, ys
 
 
-def raycast_locations(
-    mesh: trimesh.Trimesh,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    K: np.ndarray,
-    object_pose: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    directions = np.stack(
+def pixel_rays(
+    xs: np.ndarray, ys: np.ndarray, K: np.ndarray
+) -> np.ndarray:
+    return np.stack(
         [
             (xs - K[0, 2]) / K[0, 0],
             (ys - K[1, 2]) / K[1, 1],
@@ -117,6 +113,16 @@ def raycast_locations(
         ],
         axis=1,
     )
+
+
+def raycast_locations(
+    mesh: trimesh.Trimesh,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    K: np.ndarray,
+    object_pose: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    directions = pixel_rays(xs, ys, K)
     origins = np.zeros_like(directions)
     if object_pose is not None:
         rotation = object_pose[:3, :3]
@@ -141,42 +147,61 @@ def raycast_locations(
     return locations, ray_ids
 
 
-def robust_scale_shift_3d(
-    source: np.ndarray, target: np.ndarray
+def robust_ray_depth_affine(
+    source_depth: np.ndarray,
+    rays: np.ndarray,
+    target: np.ndarray,
 ) -> tuple[float, float, float, int]:
-    source = np.asarray(source, dtype=np.float64).reshape(-1, 3)
+    source_depth = np.asarray(source_depth, dtype=np.float64).reshape(-1)
+    rays = np.asarray(rays, dtype=np.float64).reshape(-1, 3)
     target = np.asarray(target, dtype=np.float64).reshape(-1, 3)
     keep = (
-        np.isfinite(source).all(axis=1)
+        np.isfinite(source_depth)
+        & np.isfinite(rays).all(axis=1)
         & np.isfinite(target).all(axis=1)
-        & (source[:, 2] > 1e-6)
+        & (source_depth > 1e-6)
         & (target[:, 2] > 1e-6)
     )
-    source, target = source[keep], target[keep]
-    if len(source) < 8:
+    source_depth, rays, target = (
+        source_depth[keep],
+        rays[keep],
+        target[keep],
+    )
+    if len(source_depth) < 8:
         raise ValueError("too_few_calibration_values")
     for _ in range(4):
-        source_xy = source[:, :2].reshape(-1)
-        target_xy = target[:, :2].reshape(-1)
-        denominator = float(source_xy @ source_xy)
-        if denominator <= 1e-12:
-            raise ValueError("degenerate_object_xy")
-        scale = float((source_xy @ target_xy) / denominator)
-        shift = float(np.median(target[:, 2] - scale * source[:, 2]))
-        calibrated = scale * source
-        calibrated[:, 2] += shift
+        scale_column = rays * source_depth[:, None]
+        shift_column = rays
+        design = np.stack(
+            [scale_column.reshape(-1), shift_column.reshape(-1)],
+            axis=1,
+        )
+        scale, shift = np.linalg.lstsq(
+            design, target.reshape(-1), rcond=None
+        )[0]
+        calibrated = rays * (
+            scale * source_depth + shift
+        )[:, None]
         residual = np.linalg.norm(target - calibrated, axis=1)
         median = np.median(residual)
         mad = np.median(np.abs(residual - median))
         threshold = max(3.0 * 1.4826 * mad, 0.003)
         inlier = residual <= median + threshold
-        source, target = source[inlier], target[inlier]
-        if len(source) < 8:
+        source_depth, rays, target = (
+            source_depth[inlier],
+            rays[inlier],
+            target[inlier],
+        )
+        if len(source_depth) < 8:
             break
-    calibrated = scale * source
-    calibrated[:, 2] += shift
+    calibrated = rays * (scale * source_depth + shift)[:, None]
     residual = np.linalg.norm(target - calibrated, axis=1)
-    return scale, shift, float(np.median(residual)), int(len(source))
+    return (
+        float(scale),
+        float(shift),
+        float(np.median(residual)),
+        int(len(source_depth)),
+    )
 
 
 def robust_location(values: np.ndarray) -> tuple[float, float, int]:
@@ -288,6 +313,7 @@ def main() -> None:
             width, height = np.asarray(payload["resized_wh"], dtype=int)
 
         calibration_source = []
+        calibration_rays = []
         calibration_target = []
         prepared = []
         for local_index, frame_index in enumerate(frame_indices):
@@ -319,7 +345,10 @@ def main() -> None:
                     pi3_points = points[
                         local_index, ys[ray_ids], xs[ray_ids]
                     ]
-                    calibration_source.append(pi3_points)
+                    calibration_source.append(pi3_points[:, 2])
+                    calibration_rays.append(
+                        pixel_rays(xs[ray_ids], ys[ray_ids], K)
+                    )
                     calibration_target.append(metric_points)
             prepared.append((segmentation, conf))
 
@@ -328,9 +357,10 @@ def main() -> None:
             if not calibration_source:
                 raise ValueError("no_object_calibration_hits")
             source = np.concatenate(calibration_source)
+            rays = np.concatenate(calibration_rays)
             target = np.concatenate(calibration_target)
             scale, shift, calibration_mad, calibration_count = (
-                robust_scale_shift_3d(source, target)
+                robust_ray_depth_affine(source, rays, target)
             )
             if calibration_count < args.min_object_hits:
                 raise ValueError(f"object_hits_{calibration_count}")

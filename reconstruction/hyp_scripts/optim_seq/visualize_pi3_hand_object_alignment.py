@@ -111,10 +111,22 @@ def main() -> None:
         local_index = int(np.where(frame_indices == args.frame)[0][0])
         pi3_points = np.asarray(payload["local_points"][local_index], dtype=np.float32)
         confidence = np.asarray(payload["confidence"][local_index], dtype=np.float32)
+        K = np.asarray(payload["intrinsics_resized"], dtype=np.float32)
         width, height = np.asarray(payload["resized_wh"], dtype=int)
 
-    calibrated = float(window["scale"]) * pi3_points
-    calibrated[..., 2] += float(window["shift_m"])
+    ys_grid, xs_grid = np.indices((height, width))
+    calibrated_depth = (
+        float(window["scale"]) * pi3_points[..., 2]
+        + float(window["shift_m"])
+    )
+    calibrated = np.stack(
+        [
+            (xs_grid - K[0, 2]) / K[0, 0] * calibrated_depth,
+            (ys_grid - K[1, 2]) / K[1, 1] * calibrated_depth,
+            calibrated_depth,
+        ],
+        axis=-1,
+    )
     segmentation = load_segmentation(Path(row["label_path"]).expanduser().resolve())
     segmentation = cv2.resize(segmentation, (width, height), interpolation=cv2.INTER_NEAREST)
     finite = np.isfinite(calibrated).all(axis=-1) & (calibrated[..., 2] > 0)
