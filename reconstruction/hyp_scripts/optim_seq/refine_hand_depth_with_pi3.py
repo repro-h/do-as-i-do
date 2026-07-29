@@ -102,7 +102,7 @@ def sampled_pixels(mask: np.ndarray, maximum: int, rng: np.random.Generator) -> 
     return xs, ys
 
 
-def raycast_depth(
+def raycast_locations(
     mesh: trimesh.Trimesh,
     xs: np.ndarray,
     ys: np.ndarray,
@@ -127,7 +127,10 @@ def raycast_depth(
         origins, directions, multiple_hits=False
     )
     if len(ray_ids) == 0:
-        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.int64)
+        return (
+            np.empty((0, 3), dtype=np.float64),
+            np.empty(0, dtype=np.int64),
+        )
     locations = np.asarray(locations, dtype=np.float64).reshape(-1, 3)
     ray_ids = np.asarray(ray_ids, dtype=np.int64).reshape(-1)
     if object_pose is not None:
@@ -135,27 +138,45 @@ def raycast_depth(
             locations @ object_pose[:3, :3].T
             + object_pose[:3, 3]
         )
-    return locations[:, 2], ray_ids
+    return locations, ray_ids
 
 
-def robust_affine(source: np.ndarray, target: np.ndarray) -> tuple[float, float, float, int]:
-    keep = np.isfinite(source) & np.isfinite(target) & (source > 1e-6) & (target > 1e-6)
+def robust_scale_shift_3d(
+    source: np.ndarray, target: np.ndarray
+) -> tuple[float, float, float, int]:
+    source = np.asarray(source, dtype=np.float64).reshape(-1, 3)
+    target = np.asarray(target, dtype=np.float64).reshape(-1, 3)
+    keep = (
+        np.isfinite(source).all(axis=1)
+        & np.isfinite(target).all(axis=1)
+        & (source[:, 2] > 1e-6)
+        & (target[:, 2] > 1e-6)
+    )
     source, target = source[keep], target[keep]
     if len(source) < 8:
         raise ValueError("too_few_calibration_values")
     for _ in range(4):
-        matrix = np.stack([source, np.ones(len(source))], axis=1)
-        scale, shift = np.linalg.lstsq(matrix, target, rcond=None)[0]
-        residual = target - (scale * source + shift)
+        source_xy = source[:, :2].reshape(-1)
+        target_xy = target[:, :2].reshape(-1)
+        denominator = float(source_xy @ source_xy)
+        if denominator <= 1e-12:
+            raise ValueError("degenerate_object_xy")
+        scale = float((source_xy @ target_xy) / denominator)
+        shift = float(np.median(target[:, 2] - scale * source[:, 2]))
+        calibrated = scale * source
+        calibrated[:, 2] += shift
+        residual = np.linalg.norm(target - calibrated, axis=1)
         median = np.median(residual)
         mad = np.median(np.abs(residual - median))
         threshold = max(3.0 * 1.4826 * mad, 0.003)
-        inlier = np.abs(residual - median) <= threshold
+        inlier = residual <= median + threshold
         source, target = source[inlier], target[inlier]
         if len(source) < 8:
             break
-    residual = target - (scale * source + shift)
-    return float(scale), float(shift), float(np.median(np.abs(residual))), int(len(source))
+    calibrated = scale * source
+    calibrated[:, 2] += shift
+    residual = np.linalg.norm(target - calibrated, axis=1)
+    return scale, shift, float(np.median(residual)), int(len(source))
 
 
 def robust_location(values: np.ndarray) -> tuple[float, float, int]:
@@ -287,7 +308,7 @@ def main() -> None:
                 or local_index == len(frame_indices) - 1
             )
             if pose is not None and len(xs) and use_calibration_frame:
-                metric_z, ray_ids = raycast_depth(
+                metric_points, ray_ids = raycast_locations(
                     canonical_mesh,
                     xs,
                     ys,
@@ -295,9 +316,11 @@ def main() -> None:
                     object_pose=pose,
                 )
                 if len(ray_ids):
-                    pi3_z = points[local_index, ys[ray_ids], xs[ray_ids], 2]
-                    calibration_source.append(pi3_z)
-                    calibration_target.append(metric_z)
+                    pi3_points = points[
+                        local_index, ys[ray_ids], xs[ray_ids]
+                    ]
+                    calibration_source.append(pi3_points)
+                    calibration_target.append(metric_points)
             prepared.append((segmentation, conf))
 
         audit = {"path": str(window_path), "frames": frame_indices.tolist(), "status": "invalid"}
@@ -306,7 +329,9 @@ def main() -> None:
                 raise ValueError("no_object_calibration_hits")
             source = np.concatenate(calibration_source)
             target = np.concatenate(calibration_target)
-            scale, shift, calibration_mad, calibration_count = robust_affine(source, target)
+            scale, shift, calibration_mad, calibration_count = (
+                robust_scale_shift_3d(source, target)
+            )
             if calibration_count < args.min_object_hits:
                 raise ValueError(f"object_hits_{calibration_count}")
             if calibration_mad * 1000.0 > args.max_calibration_mad_mm:
@@ -335,9 +360,12 @@ def main() -> None:
                 if not len(xs):
                     continue
                 hand_mesh = trimesh.Trimesh(vertices=vertices[frame_index], faces=faces, process=False)
-                predicted_z, ray_ids = raycast_depth(hand_mesh, xs, ys, K)
+                predicted_points, ray_ids = raycast_locations(
+                    hand_mesh, xs, ys, K
+                )
                 if not len(ray_ids):
                     continue
+                predicted_z = predicted_points[:, 2]
                 pi3_z = points[local_index, ys[ray_ids], xs[ray_ids], 2]
                 observed_z = scale * pi3_z + shift
                 residual = observed_z - predicted_z
