@@ -24,6 +24,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pixel-limit", type=int, default=180000)
     parser.add_argument("--confidence-threshold", type=float, default=0.1)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--feature-dtype",
+        choices=("float16", "float32"),
+        default="float16",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -106,6 +111,18 @@ def main() -> None:
         freeze_pi3=True,
         use_intrinsics=True,
     ).to(device).eval()
+    point_decoder_output: dict[str, torch.Tensor] = {}
+
+    def capture_point_decoder(
+        _module: torch.nn.Module,
+        _inputs: tuple[torch.Tensor, ...],
+        output: torch.Tensor,
+    ) -> None:
+        point_decoder_output["tokens"] = output.detach()
+
+    point_decoder_hook = model.point_decoder.register_forward_hook(
+        capture_point_decoder
+    )
     images_device = images[None].to(device)
     intrinsics_device = (
         torch.from_numpy(K_resized)
@@ -116,7 +133,24 @@ def main() -> None:
         windows_dir
         / f"window_{args.frame:06d}_{args.frame + 1:06d}.npz"
     )
+    feature_summary: dict[str, object]
     if output_path.is_file() and not args.overwrite:
+        point_decoder_hook.remove()
+        with np.load(output_path, allow_pickle=False) as cached:
+            if "geometry_patch_features" not in cached:
+                raise RuntimeError(
+                    f"Cached file has no geometry features: {output_path}. "
+                    "Run again with --overwrite."
+                )
+            cached_features = cached["geometry_patch_features"]
+            feature_summary = {
+                "key": "geometry_patch_features",
+                "layer": str(cached["geometry_feature_layer"]),
+                "shape": list(cached_features.shape),
+                "dtype": str(cached_features.dtype),
+                "patch_size": int(model.patch_size),
+                "patch_start_idx": int(model.patch_start_idx),
+            }
         print(f"Cached: {output_path}")
     else:
         print(
@@ -128,6 +162,38 @@ def main() -> None:
                 images_device,
                 intrinsics=intrinsics_device,
             )
+        point_decoder_hook.remove()
+        if "tokens" not in point_decoder_output:
+            raise RuntimeError("Pi3X point_decoder feature hook was not called")
+        point_tokens = point_decoder_output["tokens"]
+        patch_start_idx = int(model.patch_start_idx)
+        point_tokens = point_tokens[:, patch_start_idx:]
+        resized_w, resized_h = resized_wh
+        patch_h = int(resized_h) // int(model.patch_size)
+        patch_w = int(resized_w) // int(model.patch_size)
+        expected_tokens = patch_h * patch_w
+        if point_tokens.shape[1] != expected_tokens:
+            raise RuntimeError(
+                "Unexpected Pi3X geometry token count: "
+                f"{point_tokens.shape[1]} != {patch_h}*{patch_w}"
+            )
+        geometry_features = point_tokens.reshape(
+            1,
+            patch_h,
+            patch_w,
+            point_tokens.shape[-1],
+        )
+        feature_dtype = (
+            np.float16 if args.feature_dtype == "float16" else np.float32
+        )
+        feature_summary = {
+            "key": "geometry_patch_features",
+            "layer": "point_decoder.final_output",
+            "shape": list(geometry_features.shape),
+            "dtype": args.feature_dtype,
+            "patch_size": int(model.patch_size),
+            "patch_start_idx": int(model.patch_start_idx),
+        }
         confidence = torch.sigmoid(outputs["conf"][0, 0, ..., 0])
         local_points = outputs["local_points"][0, 0]
         camera_pose = outputs["camera_poses"][0, 0]
@@ -137,6 +203,19 @@ def main() -> None:
             start=np.int32(args.frame),
             end=np.int32(args.frame + 1),
             frame_indices=np.asarray([args.frame], dtype=np.int32),
+            geometry_patch_features=geometry_features
+            .float()
+            .cpu()
+            .numpy()
+            .astype(feature_dtype),
+            geometry_feature_layer=np.asarray(
+                "point_decoder.final_output"
+            ),
+            geometry_feature_grid_hw=np.asarray(
+                [patch_h, patch_w], dtype=np.int32
+            ),
+            geometry_feature_dim=np.int32(geometry_features.shape[-1]),
+            geometry_feature_dtype=np.asarray(args.feature_dtype),
             local_points=local_points[None]
             .detach()
             .float()
@@ -182,6 +261,7 @@ def main() -> None:
         "K_original": intrinsics.tolist(),
         "K_resized": K_resized.tolist(),
         "resized_wh": list(resized_wh),
+        "geometry_feature": feature_summary,
         "pointmap": str(output_path),
     }
     summary_path = out_dir / "summary.json"
