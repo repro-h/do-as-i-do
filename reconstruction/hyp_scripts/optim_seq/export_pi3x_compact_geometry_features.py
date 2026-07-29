@@ -240,6 +240,8 @@ def main() -> None:
 
     try:
         for window_number, local_start in enumerate(starts):
+            if window_number > 0 and device.type == "cuda":
+                torch.cuda.empty_cache()
             local_end = min(frame_count, local_start + size)
             window_rows = selected_rows[local_start:local_end]
             image_paths = [
@@ -396,6 +398,17 @@ def main() -> None:
                 )
                 metric_output[sequence_index] = metric_value
                 intrinsics_output[sequence_index] = K_resized
+
+            captured.clear()
+            del outputs
+            del ret_point
+            del point_tokens
+            del images_device
+            del intrinsics_device
+            if metric is not None:
+                del metric
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
     finally:
         hook.remove()
 
