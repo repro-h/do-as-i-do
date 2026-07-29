@@ -29,6 +29,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--confidence-threshold", type=float, default=0.25)
     parser.add_argument("--mask-erode-px", type=int, default=2)
     parser.add_argument("--max-rays", type=int, default=1024)
+    parser.add_argument("--max-object-rays", type=int, default=256)
+    parser.add_argument("--calibration-frame-stride", type=int, default=4)
     parser.add_argument("--min-object-hits", type=int, default=48)
     parser.add_argument("--min-hand-hits", type=int, default=32)
     parser.add_argument("--max-calibration-mad-mm", type=float, default=30.0)
@@ -273,12 +275,18 @@ def main() -> None:
             segmentation = cv2.resize(segmentation, (width, height), interpolation=cv2.INTER_NEAREST)
             conf = confidence[local_index]
             object_mask = erode((segmentation == object_label) & (conf >= args.confidence_threshold), args.mask_erode_px)
-            xs, ys = sampled_pixels(object_mask, args.max_rays, rng)
+            xs, ys = sampled_pixels(
+                object_mask, args.max_object_rays, rng
+            )
             frame = str(row["output_index"]).zfill(6)
             pose = poses.get(frame)
             if pose is None:
                 pose = poses.get(str(row["original_frame"]).zfill(6))
-            if pose is not None and len(xs):
+            use_calibration_frame = (
+                local_index % max(1, args.calibration_frame_stride) == 0
+                or local_index == len(frame_indices) - 1
+            )
+            if pose is not None and len(xs) and use_calibration_frame:
                 metric_z, ray_ids = raycast_depth(
                     canonical_mesh,
                     xs,
