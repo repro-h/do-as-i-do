@@ -22,6 +22,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--export-script", required=True)
     parser.add_argument("--out-root", required=True)
     parser.add_argument("--limit", type=int, default=20)
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--window-size", type=int, default=16)
     parser.add_argument("--window-stride", type=int, default=8)
     parser.add_argument("--pixel-limit", type=int, default=180000)
@@ -99,6 +101,13 @@ def main() -> None:
     rows = load_jsonl(manifest_path)
     if args.limit > 0:
         rows = rows[: args.limit]
+    if args.num_shards <= 0:
+        raise ValueError("--num-shards must be positive")
+    if not 0 <= args.shard_index < args.num_shards:
+        raise ValueError(
+            f"--shard-index must be in [0, {args.num_shards})"
+        )
+    rows = rows[args.shard_index :: args.num_shards]
     if not rows:
         raise RuntimeError(f"No records in {manifest_path}")
 
@@ -106,6 +115,8 @@ def main() -> None:
     failures = []
     status = {
         "manifest": str(manifest_path),
+        "num_shards": args.num_shards,
+        "shard_index": args.shard_index,
         "num_requested": len(rows),
         "num_completed": 0,
         "num_failed": 0,
@@ -182,7 +193,15 @@ def main() -> None:
         status["num_completed"] = len(completed)
         status["num_failed"] = len(failures)
         out_root.mkdir(parents=True, exist_ok=True)
-        (out_root / "status.json").write_text(
+        status_name = (
+            "status.json"
+            if args.num_shards == 1
+            else (
+                f"status_shard_{args.shard_index:02d}_of_"
+                f"{args.num_shards:02d}.json"
+            )
+        )
+        (out_root / status_name).write_text(
             json.dumps(status, indent=2),
             encoding="utf-8",
         )
