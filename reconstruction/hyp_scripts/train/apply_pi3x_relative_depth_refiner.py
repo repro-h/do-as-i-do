@@ -60,6 +60,7 @@ def main() -> None:
         int(checkpoint["scalar_dim"]),
         int(checkpoint["feature_dim"]),
         int(checkpoint["metadata_dim"]),
+        int(checkpoint["motion_dim"]),
         int(config["hidden_dim"]),
         int(config["spatial_layers"]),
         int(config["temporal_layers"]),
@@ -79,8 +80,9 @@ def main() -> None:
     sums = {
         stream_id: {
             "depth": np.zeros(length, dtype=np.float64),
-            "gate": np.zeros(length, dtype=np.float64),
-            "sign_probability": np.zeros(length, dtype=np.float64),
+            "geometry": np.zeros(length, dtype=np.float64),
+            "motion": np.zeros(length, dtype=np.float64),
+            "anomaly_probability": np.zeros(length, dtype=np.float64),
             "magnitude": np.zeros(length, dtype=np.float64),
             "weight": np.zeros(length, dtype=np.float64),
         }
@@ -95,13 +97,18 @@ def main() -> None:
                 batch["token_metadata"].to(args.device),
                 batch["token_valid"].to(args.device),
                 batch["token_types"].to(args.device),
+                batch["motion"].to(args.device),
                 float(config["max_correction_mm"]) / 1000.0,
+                float(config["max_motion_residual_mm"]) / 1000.0,
                 return_aux=True,
             )
             depth = model_output["prediction"].cpu().numpy()
-            gate = model_output["gate"].cpu().numpy()
-            sign_probability = torch.sigmoid(
-                model_output["sign_logits"]
+            geometry = model_output[
+                "geometry_prediction"
+            ].cpu().numpy()
+            motion = model_output["motion_residual"].cpu().numpy()
+            anomaly_probability = torch.sigmoid(
+                model_output["anomaly_logits"]
             ).cpu().numpy()
             magnitude = model_output["magnitude"].cpu().numpy()
             for index, stream_id in enumerate(batch["stream_id"]):
@@ -109,9 +116,14 @@ def main() -> None:
                 end = int(batch["end"][index])
                 weight = blend_weights(end - start)
                 sums[stream_id]["depth"][start:end] += depth[index] * weight
-                sums[stream_id]["gate"][start:end] += gate[index] * weight
-                sums[stream_id]["sign_probability"][start:end] += (
-                    sign_probability[index] * weight
+                sums[stream_id]["geometry"][start:end] += (
+                    geometry[index] * weight
+                )
+                sums[stream_id]["motion"][start:end] += (
+                    motion[index] * weight
+                )
+                sums[stream_id]["anomaly_probability"][start:end] += (
+                    anomaly_probability[index] * weight
                 )
                 sums[stream_id]["magnitude"][start:end] += (
                     magnitude[index] * weight
@@ -136,11 +148,14 @@ def main() -> None:
         depth = (
             values["depth"] / np.maximum(weight, 1e-8)
         ).astype(np.float32)
-        gate = (
-            values["gate"] / np.maximum(weight, 1e-8)
+        geometry = (
+            values["geometry"] / np.maximum(weight, 1e-8)
         ).astype(np.float32)
-        sign_probability = (
-            values["sign_probability"] / np.maximum(weight, 1e-8)
+        motion = (
+            values["motion"] / np.maximum(weight, 1e-8)
+        ).astype(np.float32)
+        anomaly_probability = (
+            values["anomaly_probability"] / np.maximum(weight, 1e-8)
         ).astype(np.float32)
         magnitude = (
             values["magnitude"] / np.maximum(weight, 1e-8)
@@ -211,8 +226,11 @@ def main() -> None:
         output = dict(handflow)
         output["verts_cam"] = corrected_vertices
         output["pi3x_depth_correction"] = depth[:count]
-        output["pi3x_depth_gate"] = gate[:count]
-        output["pi3x_depth_sign_probability"] = sign_probability[:count]
+        output["pi3x_geometry_depth_correction"] = geometry[:count]
+        output["pi3x_motion_depth_residual"] = motion[:count]
+        output["pi3x_motion_anomaly_probability"] = (
+            anomaly_probability[:count]
+        )
         output["pi3x_depth_magnitude"] = magnitude[:count]
         output["pi3x_translation_normalized"] = (
             translation_normalized[:count]
