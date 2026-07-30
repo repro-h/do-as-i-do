@@ -19,6 +19,12 @@ from tqdm import tqdm
 
 PALM = np.asarray([0, 5, 9, 13, 17], dtype=np.int64)
 TOKEN_GROUPS = ("hand", "object", "context")
+CAMERA_POSITION_SCALE_M = 1.0
+PALM_OFFSET_SCALE_M = 0.2
+RELATIVE_POSITION_SCALE_M = 0.3
+VELOCITY_SCALE_M_PER_FRAME = 0.05
+ACCELERATION_SCALE_M_PER_FRAME2 = 0.05
+OBJECT_EXTENT_SCALE_M = 0.2
 
 
 def parse_args() -> argparse.Namespace:
@@ -160,6 +166,12 @@ class Pi3XWindowDataset(Dataset):
         object_velocity[1:] = object_center[1:] - object_center[:-1]
         relative = wrist - object_center
         relative_velocity = hand_velocity - object_velocity
+        hand_acceleration = np.zeros_like(wrist)
+        relative_acceleration = np.zeros_like(relative_velocity)
+        hand_acceleration[1:] = hand_velocity[1:] - hand_velocity[:-1]
+        relative_acceleration[1:] = (
+            relative_velocity[1:] - relative_velocity[:-1]
+        )
         palm_local = pred[:, PALM] - wrist[:, None]
         object_extents = np.asarray(
             supervision["object_extents_metric"], dtype=np.float32
@@ -182,17 +194,22 @@ class Pi3XWindowDataset(Dataset):
         )
         scalar = np.concatenate(
             [
-                wrist,
-                palm_local.reshape(len(wrist), -1),
-                hand_velocity,
-                object_center,
-                object_velocity,
-                relative,
-                relative_velocity,
+                wrist / CAMERA_POSITION_SCALE_M,
+                (
+                    palm_local / PALM_OFFSET_SCALE_M
+                ).reshape(len(wrist), -1),
+                hand_velocity / VELOCITY_SCALE_M_PER_FRAME,
+                hand_acceleration / ACCELERATION_SCALE_M_PER_FRAME2,
+                object_center / CAMERA_POSITION_SCALE_M,
+                object_velocity / VELOCITY_SCALE_M_PER_FRAME,
+                relative / RELATIVE_POSITION_SCALE_M,
+                relative_velocity / VELOCITY_SCALE_M_PER_FRAME,
+                relative_acceleration / ACCELERATION_SCALE_M_PER_FRAME2,
                 rotation_6d(object_rotation),
                 camera_ray,
                 np.broadcast_to(
-                    object_extents / 0.2, (len(wrist), 3)
+                    object_extents / OBJECT_EXTENT_SCALE_M,
+                    (len(wrist), 3),
                 ),
                 object_local_wrist / safe_extents,
                 (object_local_palm / safe_extents).reshape(len(wrist), -1),
@@ -704,6 +721,16 @@ def main() -> None:
             "scalar_dim": scalar_dim,
             "feature_dim": feature_dim,
             "metadata_dim": metadata_dim,
+            "scalar_feature_version": "v2_normalized_dynamics",
+            "scalar_feature_scales": {
+                "camera_position_m": CAMERA_POSITION_SCALE_M,
+                "palm_offset_m": PALM_OFFSET_SCALE_M,
+                "relative_position_m": RELATIVE_POSITION_SCALE_M,
+                "velocity_m_per_frame": VELOCITY_SCALE_M_PER_FRAME,
+                "acceleration_m_per_frame2":
+                    ACCELERATION_SCALE_M_PER_FRAME2,
+                "object_extent_m": OBJECT_EXTENT_SCALE_M,
+            },
             "epoch": epoch,
             "val_total": val_metrics["total"],
             "val_metrics": val_metrics,
