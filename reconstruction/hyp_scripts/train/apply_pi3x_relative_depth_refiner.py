@@ -59,6 +59,7 @@ def main() -> None:
     model = Pi3XRelativeDepthRefiner(
         int(checkpoint["scalar_dim"]),
         int(checkpoint["feature_dim"]),
+        int(checkpoint["metadata_dim"]),
         int(config["hidden_dim"]),
         int(config["spatial_layers"]),
         int(config["temporal_layers"]),
@@ -78,6 +79,9 @@ def main() -> None:
     sums = {
         stream_id: {
             "depth": np.zeros(length, dtype=np.float64),
+            "gate": np.zeros(length, dtype=np.float64),
+            "sign_probability": np.zeros(length, dtype=np.float64),
+            "magnitude": np.zeros(length, dtype=np.float64),
             "weight": np.zeros(length, dtype=np.float64),
         }
         for stream_id, length in lengths.items()
@@ -85,19 +89,33 @@ def main() -> None:
 
     with torch.no_grad():
         for batch in loader:
-            depth = model(
+            model_output = model(
                 batch["scalar"].to(args.device),
                 batch["token_features"].to(args.device),
                 batch["token_metadata"].to(args.device),
                 batch["token_valid"].to(args.device),
                 batch["token_types"].to(args.device),
                 float(config["max_correction_mm"]) / 1000.0,
+                return_aux=True,
+            )
+            depth = model_output["prediction"].cpu().numpy()
+            gate = model_output["gate"].cpu().numpy()
+            sign_probability = torch.sigmoid(
+                model_output["sign_logits"]
             ).cpu().numpy()
+            magnitude = model_output["magnitude"].cpu().numpy()
             for index, stream_id in enumerate(batch["stream_id"]):
                 start = int(batch["start"][index])
                 end = int(batch["end"][index])
                 weight = blend_weights(end - start)
                 sums[stream_id]["depth"][start:end] += depth[index] * weight
+                sums[stream_id]["gate"][start:end] += gate[index] * weight
+                sums[stream_id]["sign_probability"][start:end] += (
+                    sign_probability[index] * weight
+                )
+                sums[stream_id]["magnitude"][start:end] += (
+                    magnitude[index] * weight
+                )
                 sums[stream_id]["weight"][start:end] += weight
 
     handflow_root = Path(args.handflow_root).expanduser().resolve()
@@ -117,6 +135,15 @@ def main() -> None:
         predicted = weight > 0.0
         depth = (
             values["depth"] / np.maximum(weight, 1e-8)
+        ).astype(np.float32)
+        gate = (
+            values["gate"] / np.maximum(weight, 1e-8)
+        ).astype(np.float32)
+        sign_probability = (
+            values["sign_probability"] / np.maximum(weight, 1e-8)
+        ).astype(np.float32)
+        magnitude = (
+            values["magnitude"] / np.maximum(weight, 1e-8)
         ).astype(np.float32)
         with np.load(
             supervision_paths[stream_id], allow_pickle=False
@@ -184,6 +211,9 @@ def main() -> None:
         output = dict(handflow)
         output["verts_cam"] = corrected_vertices
         output["pi3x_depth_correction"] = depth[:count]
+        output["pi3x_depth_gate"] = gate[:count]
+        output["pi3x_depth_sign_probability"] = sign_probability[:count]
+        output["pi3x_depth_magnitude"] = magnitude[:count]
         output["pi3x_translation_normalized"] = (
             translation_normalized[:count]
         )

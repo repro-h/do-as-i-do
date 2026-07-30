@@ -47,6 +47,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-velocity", type=float, default=0.5)
     parser.add_argument("--w-acceleration", type=float, default=1.0)
     parser.add_argument("--w-residual", type=float, default=0.05)
+    parser.add_argument("--w-gate", type=float, default=0.5)
+    parser.add_argument("--w-sign", type=float, default=0.5)
+    parser.add_argument("--w-gate-temporal", type=float, default=0.1)
+    parser.add_argument("--gate-zero-error-mm", type=float, default=15.0)
+    parser.add_argument("--gate-full-error-mm", type=float, default=25.0)
+    parser.add_argument("--sign-valid-threshold-mm", type=float, default=8.0)
+    parser.add_argument("--accurate-anchor-mm", type=float, default=15.0)
+    parser.add_argument("--w-accurate-anchor", type=float, default=1.0)
     parser.add_argument("--error-weight-reference-mm", type=float, default=20.0)
     parser.add_argument("--error-weight-min", type=float, default=0.5)
     parser.add_argument("--error-weight-max", type=float, default=2.0)
@@ -153,6 +161,25 @@ class Pi3XWindowDataset(Dataset):
         relative = wrist - object_center
         relative_velocity = hand_velocity - object_velocity
         palm_local = pred[:, PALM] - wrist[:, None]
+        object_extents = np.asarray(
+            supervision["object_extents_metric"], dtype=np.float32
+        ).reshape(3)
+        if not np.isfinite(object_extents).all() or np.any(
+            object_extents <= 1e-5
+        ):
+            raise ValueError(
+                f"{row['supervision_npz']} has invalid object extents: "
+                f"{object_extents.tolist()}"
+            )
+        safe_extents = np.maximum(object_extents, 1e-3)
+        object_local_wrist = np.einsum(
+            "ti,tij->tj", wrist - object_center, object_rotation
+        )
+        object_local_palm = np.einsum(
+            "tki,tij->tkj",
+            pred[:, PALM] - object_center[:, None],
+            object_rotation,
+        )
         scalar = np.concatenate(
             [
                 wrist,
@@ -164,6 +191,11 @@ class Pi3XWindowDataset(Dataset):
                 relative_velocity,
                 rotation_6d(object_rotation),
                 camera_ray,
+                np.broadcast_to(
+                    object_extents / 0.2, (len(wrist), 3)
+                ),
+                object_local_wrist / safe_extents,
+                (object_local_palm / safe_extents).reshape(len(wrist), -1),
                 valid[:, None],
             ],
             axis=-1,
@@ -181,6 +213,16 @@ class Pi3XWindowDataset(Dataset):
             if mirrored:
                 points = points.copy()
                 points[..., 0] *= -1.0
+            object_local_points = np.einsum(
+                "tki,tij->tkj",
+                points - object_center[:, None],
+                object_rotation,
+            )
+            object_local_points = np.clip(
+                object_local_points / safe_extents[None, None],
+                -4.0,
+                4.0,
+            )
             coverage = np.asarray(
                 pi3x[f"{prefix}_coverage"][positions], dtype=np.float32
             )
@@ -198,6 +240,7 @@ class Pi3XWindowDataset(Dataset):
             metadata = np.concatenate(
                 [
                     points,
+                    object_local_points,
                     coverage[..., None],
                     confidence[..., None],
                     indices,
@@ -246,6 +289,7 @@ class Pi3XRelativeDepthRefiner(nn.Module):
         self,
         scalar_dim: int,
         feature_dim: int,
+        metadata_dim: int,
         hidden_dim: int,
         spatial_layers: int,
         temporal_layers: int,
@@ -258,7 +302,7 @@ class Pi3XRelativeDepthRefiner(nn.Module):
             nn.Linear(feature_dim, hidden_dim),
         )
         self.metadata_projection = nn.Sequential(
-            nn.Linear(7, hidden_dim),
+            nn.Linear(metadata_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
@@ -298,15 +342,31 @@ class Pi3XRelativeDepthRefiner(nn.Module):
             temporal_layer, num_layers=temporal_layers
         )
         self.position = nn.Parameter(torch.zeros(1, 256, hidden_dim))
-        self.output = nn.Sequential(
+        self.magnitude_head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.sign_head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.gate_head = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
         nn.init.trunc_normal_(self.position, std=0.02)
-        nn.init.zeros_(self.output[-1].weight)
-        nn.init.zeros_(self.output[-1].bias)
+        nn.init.zeros_(self.magnitude_head[-1].weight)
+        nn.init.constant_(self.magnitude_head[-1].bias, -2.2)
+        nn.init.zeros_(self.sign_head[-1].weight)
+        nn.init.zeros_(self.sign_head[-1].bias)
+        nn.init.zeros_(self.gate_head[-1].weight)
+        nn.init.constant_(self.gate_head[-1].bias, -1.0)
 
     @staticmethod
     def masked_pool(
@@ -323,7 +383,8 @@ class Pi3XRelativeDepthRefiner(nn.Module):
         token_valid: torch.Tensor,
         token_types: torch.Tensor,
         max_correction: float,
-    ) -> torch.Tensor:
+        return_aux: bool = False,
+    ):
         batch, frames, tokens, _ = token_features.shape
         token = self.feature_projection(token_features)
         token = token + self.metadata_projection(token_metadata)
@@ -341,10 +402,21 @@ class Pi3XRelativeDepthRefiner(nn.Module):
         )
         frame_token = frame_token + self.position[:, :frames]
         temporal = self.temporal_encoder(frame_token)
-        return (
-            torch.tanh(self.output(temporal).squeeze(-1))
+        magnitude = (
+            torch.sigmoid(self.magnitude_head(temporal).squeeze(-1))
             * max_correction
         )
+        sign_logits = self.sign_head(temporal).squeeze(-1)
+        gate = torch.sigmoid(self.gate_head(temporal).squeeze(-1))
+        prediction = gate * torch.tanh(sign_logits) * magnitude
+        if return_aux:
+            return {
+                "prediction": prediction,
+                "gate": gate,
+                "sign_logits": sign_logits,
+                "magnitude": magnitude,
+            }
+        return prediction
 
 
 def masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -388,14 +460,18 @@ def compute(model, batch, args):
         key: value.to(args.device) if torch.is_tensor(value) else value
         for key, value in batch.items()
     }
-    ray_depth = model(
+    model_output = model(
         batch["scalar"],
         batch["token_features"],
         batch["token_metadata"],
         batch["token_valid"],
         batch["token_types"],
         args.max_correction_mm / 1000.0,
+        return_aux=True,
     )
+    ray_depth = model_output["prediction"]
+    gate = model_output["gate"]
+    sign_logits = model_output["sign_logits"]
     pred = batch["pred_joints"]
     gt = batch["gt_joints"]
     valid = batch["valid"]
@@ -442,6 +518,35 @@ def compute(model, batch, args):
             ray_depth, torch.zeros_like(ray_depth), valid, beta
         ),
     }
+    gate_range = max(
+        args.gate_full_error_mm - args.gate_zero_error_mm, 1e-6
+    )
+    gate_target = (
+        (initial_depth_error * 1000.0 - args.gate_zero_error_mm)
+        / gate_range
+    ).clamp(0.0, 1.0)
+    losses["gate"] = smooth_l1(gate, gate_target, valid, beta=0.1)
+    sign_valid = valid & (
+        initial_depth_error >= args.sign_valid_threshold_mm / 1000.0
+    )
+    sign_target = (target_depth > 0.0).to(pred.dtype)
+    sign_loss = F.binary_cross_entropy_with_logits(
+        sign_logits, sign_target, reduction="none"
+    )
+    losses["sign"] = masked_mean(sign_loss, sign_valid)
+    losses["gate_temporal"] = temporal(
+        gate,
+        gate_target,
+        valid,
+        1,
+        beta=0.1,
+    )
+    accurate = valid & (
+        initial_depth_error < args.accurate_anchor_mm / 1000.0
+    )
+    losses["accurate_anchor"] = smooth_l1(
+        ray_depth, torch.zeros_like(ray_depth), accurate, beta
+    )
     total = (
         args.w_depth * losses["depth"]
         + args.w_wrist * losses["wrist"]
@@ -449,6 +554,10 @@ def compute(model, batch, args):
         + args.w_velocity * losses["velocity"]
         + args.w_acceleration * losses["acceleration"]
         + args.w_residual * losses["residual"]
+        + args.w_gate * losses["gate"]
+        + args.w_sign * losses["sign"]
+        + args.w_gate_temporal * losses["gate_temporal"]
+        + args.w_accurate_anchor * losses["accurate_anchor"]
     )
     before = torch.linalg.norm(pred[:, :, 0] - gt[:, :, 0], dim=-1)
     after = torch.linalg.norm(corrected[:, :, 0] - gt[:, :, 0], dim=-1)
@@ -540,9 +649,11 @@ def main() -> None:
     sample = train_dataset[0]
     scalar_dim = int(sample["scalar"].shape[-1])
     feature_dim = int(sample["token_features"].shape[-1])
+    metadata_dim = int(sample["token_metadata"].shape[-1])
     model = Pi3XRelativeDepthRefiner(
         scalar_dim,
         feature_dim,
+        metadata_dim,
         args.hidden_dim,
         args.spatial_layers,
         args.temporal_layers,
@@ -601,6 +712,7 @@ def main() -> None:
             "args": vars(args),
             "scalar_dim": scalar_dim,
             "feature_dim": feature_dim,
+            "metadata_dim": metadata_dim,
             "epoch": epoch,
             "val_total": val_metrics["total"],
             "val_metrics": val_metrics,
