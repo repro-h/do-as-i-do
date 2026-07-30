@@ -100,6 +100,8 @@ def main() -> None:
                 batch["motion"].to(args.device),
                 float(config["max_correction_mm"]) / 1000.0,
                 float(config["max_motion_residual_mm"]) / 1000.0,
+                float(config.get("carry_gate_start", 0.0)),
+                float(config.get("carry_gate_full", 1.0)),
                 return_aux=True,
             )
             depth = model_output["prediction"].cpu().numpy()

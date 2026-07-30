@@ -60,6 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anomaly-full-mm", type=float, default=10.0)
     parser.add_argument("--carry-zero-mm", type=float, default=5.0)
     parser.add_argument("--carry-full-mm", type=float, default=15.0)
+    parser.add_argument("--carry-gate-start", type=float, default=0.5)
+    parser.add_argument("--carry-gate-full", type=float, default=0.9)
     parser.add_argument("--anomaly-depth-boost", type=float, default=3.0)
     parser.add_argument("--w-anomaly", type=float, default=0.5)
     parser.add_argument("--w-boundary", type=float, default=1.0)
@@ -462,6 +464,8 @@ class Pi3XRelativeDepthRefiner(nn.Module):
         motion: torch.Tensor,
         max_correction: float,
         max_motion_residual: float,
+        carry_gate_start: float,
+        carry_gate_full: float,
         return_aux: bool = False,
     ):
         batch, frames, tokens, _ = token_features.shape
@@ -498,10 +502,14 @@ class Pi3XRelativeDepthRefiner(nn.Module):
         )
         anomaly_logits = self.anomaly_head(motion_encoded).squeeze(-1)
         carry_probability = torch.sigmoid(anomaly_logits)
+        carry_gate = (
+            (carry_probability - carry_gate_start)
+            / max(carry_gate_full - carry_gate_start, 1e-6)
+        ).clamp(0.0, 1.0)
         motion_steps = [motion_innovation[:, 0]]
         for frame_index in range(1, frames):
             carried = (
-                carry_probability[:, frame_index]
+                carry_gate[:, frame_index]
                 * motion_steps[-1]
             )
             motion_steps.append(
@@ -524,6 +532,7 @@ class Pi3XRelativeDepthRefiner(nn.Module):
                 "motion_residual": motion_residual,
                 "motion_innovation": motion_innovation,
                 "anomaly_logits": anomaly_logits,
+                "carry_gate": carry_gate,
                 "magnitude": torch.abs(prediction),
             }
         return prediction
@@ -579,6 +588,8 @@ def compute(model, batch, args):
         batch["motion"],
         args.max_correction_mm / 1000.0,
         args.max_motion_residual_mm / 1000.0,
+        args.carry_gate_start,
+        args.carry_gate_full,
         return_aux=True,
     )
     ray_depth = model_output["prediction"]
@@ -870,7 +881,7 @@ def main() -> None:
             "feature_dim": feature_dim,
             "metadata_dim": metadata_dim,
             "motion_dim": motion_dim,
-            "scalar_feature_version": "v6_recurrent_motion_carry",
+            "scalar_feature_version": "v7_thresholded_recurrent_carry",
             "scalar_feature_scales": {
                 "camera_position_m": CAMERA_POSITION_SCALE_M,
                 "palm_offset_m": PALM_OFFSET_SCALE_M,
