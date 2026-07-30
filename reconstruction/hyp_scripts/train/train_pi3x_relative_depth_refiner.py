@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-gate-temporal", type=float, default=0.1)
     parser.add_argument("--gate-zero-error-mm", type=float, default=15.0)
     parser.add_argument("--gate-full-error-mm", type=float, default=25.0)
-    parser.add_argument("--sign-valid-threshold-mm", type=float, default=8.0)
+    parser.add_argument("--sign-valid-threshold-mm", type=float, default=15.0)
     parser.add_argument("--accurate-anchor-mm", type=float, default=15.0)
     parser.add_argument("--w-accurate-anchor", type=float, default=1.0)
     parser.add_argument("--error-weight-reference-mm", type=float, default=20.0)
@@ -213,16 +213,6 @@ class Pi3XWindowDataset(Dataset):
             if mirrored:
                 points = points.copy()
                 points[..., 0] *= -1.0
-            object_local_points = np.einsum(
-                "tki,tij->tkj",
-                points - object_center[:, None],
-                object_rotation,
-            )
-            object_local_points = np.clip(
-                object_local_points / safe_extents[None, None],
-                -4.0,
-                4.0,
-            )
             coverage = np.asarray(
                 pi3x[f"{prefix}_coverage"][positions], dtype=np.float32
             )
@@ -240,7 +230,6 @@ class Pi3XWindowDataset(Dataset):
             metadata = np.concatenate(
                 [
                     points,
-                    object_local_points,
                     coverage[..., None],
                     confidence[..., None],
                     indices,
@@ -342,7 +331,7 @@ class Pi3XRelativeDepthRefiner(nn.Module):
             temporal_layer, num_layers=temporal_layers
         )
         self.position = nn.Parameter(torch.zeros(1, 256, hidden_dim))
-        self.magnitude_head = nn.Sequential(
+        self.depth_head = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
@@ -361,8 +350,8 @@ class Pi3XRelativeDepthRefiner(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
         nn.init.trunc_normal_(self.position, std=0.02)
-        nn.init.zeros_(self.magnitude_head[-1].weight)
-        nn.init.constant_(self.magnitude_head[-1].bias, -2.2)
+        nn.init.zeros_(self.depth_head[-1].weight)
+        nn.init.zeros_(self.depth_head[-1].bias)
         nn.init.zeros_(self.sign_head[-1].weight)
         nn.init.zeros_(self.sign_head[-1].bias)
         nn.init.zeros_(self.gate_head[-1].weight)
@@ -402,19 +391,18 @@ class Pi3XRelativeDepthRefiner(nn.Module):
         )
         frame_token = frame_token + self.position[:, :frames]
         temporal = self.temporal_encoder(frame_token)
-        magnitude = (
-            torch.sigmoid(self.magnitude_head(temporal).squeeze(-1))
+        prediction = (
+            torch.tanh(self.depth_head(temporal).squeeze(-1))
             * max_correction
         )
         sign_logits = self.sign_head(temporal).squeeze(-1)
         gate = torch.sigmoid(self.gate_head(temporal).squeeze(-1))
-        prediction = gate * torch.tanh(sign_logits) * magnitude
         if return_aux:
             return {
                 "prediction": prediction,
                 "gate": gate,
                 "sign_logits": sign_logits,
-                "magnitude": magnitude,
+                "magnitude": torch.abs(prediction),
             }
         return prediction
 
@@ -525,7 +513,10 @@ def compute(model, batch, args):
         (initial_depth_error * 1000.0 - args.gate_zero_error_mm)
         / gate_range
     ).clamp(0.0, 1.0)
-    losses["gate"] = smooth_l1(gate, gate_target, valid, beta=0.1)
+    gate_loss = F.binary_cross_entropy(
+        gate, gate_target, reduction="none"
+    )
+    losses["gate"] = masked_mean(gate_loss, valid)
     sign_valid = valid & (
         initial_depth_error >= args.sign_valid_threshold_mm / 1000.0
     )
