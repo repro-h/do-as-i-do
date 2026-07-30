@@ -488,7 +488,7 @@ class Pi3XRelativeDepthRefiner(nn.Module):
         motion_encoded = self.motion_encoder(
             self.motion_projection(motion) + self.position[:, :frames]
         )
-        motion_residual = (
+        motion_innovation = (
             torch.tanh(
                 self.motion_head(
                     torch.cat([temporal, motion_encoded], dim=-1)
@@ -497,6 +497,21 @@ class Pi3XRelativeDepthRefiner(nn.Module):
             * max_motion_residual
         )
         anomaly_logits = self.anomaly_head(motion_encoded).squeeze(-1)
+        carry_probability = torch.sigmoid(anomaly_logits)
+        motion_steps = [motion_innovation[:, 0]]
+        for frame_index in range(1, frames):
+            carried = (
+                carry_probability[:, frame_index]
+                * motion_steps[-1]
+            )
+            motion_steps.append(
+                torch.clamp(
+                    carried + motion_innovation[:, frame_index],
+                    -max_motion_residual,
+                    max_motion_residual,
+                )
+            )
+        motion_residual = torch.stack(motion_steps, dim=1)
         prediction = torch.clamp(
             geometry_prediction + motion_residual,
             -max_correction,
@@ -507,6 +522,7 @@ class Pi3XRelativeDepthRefiner(nn.Module):
                 "prediction": prediction,
                 "geometry_prediction": geometry_prediction,
                 "motion_residual": motion_residual,
+                "motion_innovation": motion_innovation,
                 "anomaly_logits": anomaly_logits,
                 "magnitude": torch.abs(prediction),
             }
@@ -854,7 +870,7 @@ def main() -> None:
             "feature_dim": feature_dim,
             "metadata_dim": metadata_dim,
             "motion_dim": motion_dim,
-            "scalar_feature_version": "v5_motion_carry_depth",
+            "scalar_feature_version": "v6_recurrent_motion_carry",
             "scalar_feature_scales": {
                 "camera_position_m": CAMERA_POSITION_SCALE_M,
                 "palm_offset_m": PALM_OFFSET_SCALE_M,
