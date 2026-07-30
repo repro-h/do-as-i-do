@@ -64,6 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-anomaly", type=float, default=0.5)
     parser.add_argument("--w-boundary", type=float, default=1.0)
     parser.add_argument("--w-motion-anchor", type=float, default=0.25)
+    parser.add_argument("--w-carry-depth", type=float, default=1.0)
     parser.add_argument("--error-weight-reference-mm", type=float, default=20.0)
     parser.add_argument("--error-weight-min", type=float, default=0.5)
     parser.add_argument("--error-weight-max", type=float, default=2.0)
@@ -664,6 +665,19 @@ def compute(model, batch, args):
         non_anomaly,
         beta,
     )
+    carry_residual_target = (
+        target_depth - model_output["geometry_prediction"].detach()
+    ).clamp(
+        -args.max_motion_residual_mm / 1000.0,
+        args.max_motion_residual_mm / 1000.0,
+    )
+    losses["carry_depth"] = weighted_smooth_l1(
+        motion_residual,
+        carry_residual_target,
+        motion_valid,
+        motion_state_target,
+        beta,
+    )
     accurate = valid & (
         initial_depth_error < args.accurate_anchor_mm / 1000.0
     )
@@ -681,6 +695,7 @@ def compute(model, batch, args):
         + args.w_anomaly * losses["anomaly"]
         + args.w_boundary * losses["boundary"]
         + args.w_motion_anchor * losses["motion_anchor"]
+        + args.w_carry_depth * losses["carry_depth"]
     )
     before = torch.linalg.norm(pred[:, :, 0] - gt[:, :, 0], dim=-1)
     after = torch.linalg.norm(corrected[:, :, 0] - gt[:, :, 0], dim=-1)
@@ -839,7 +854,7 @@ def main() -> None:
             "feature_dim": feature_dim,
             "metadata_dim": metadata_dim,
             "motion_dim": motion_dim,
-            "scalar_feature_version": "v4_motion_anomaly_carry",
+            "scalar_feature_version": "v5_motion_carry_depth",
             "scalar_feature_scales": {
                 "camera_position_m": CAMERA_POSITION_SCALE_M,
                 "palm_offset_m": PALM_OFFSET_SCALE_M,
