@@ -58,6 +58,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-accurate-anchor", type=float, default=1.0)
     parser.add_argument("--anomaly-zero-mm", type=float, default=3.0)
     parser.add_argument("--anomaly-full-mm", type=float, default=10.0)
+    parser.add_argument("--carry-zero-mm", type=float, default=5.0)
+    parser.add_argument("--carry-full-mm", type=float, default=15.0)
     parser.add_argument("--anomaly-depth-boost", type=float, default=3.0)
     parser.add_argument("--w-anomaly", type=float, default=0.5)
     parser.add_argument("--w-boundary", type=float, default=1.0)
@@ -179,6 +181,9 @@ class Pi3XWindowDataset(Dataset):
         relative_velocity_deviation = (
             relative_velocity - relative_velocity_baseline
         )
+        cumulative_relative_deviation = np.cumsum(
+            relative_velocity_deviation, axis=0
+        )
         hand_speed = np.linalg.norm(hand_velocity, axis=-1, keepdims=True)
         object_speed = np.linalg.norm(
             object_velocity, axis=-1, keepdims=True
@@ -204,6 +209,10 @@ class Pi3XWindowDataset(Dataset):
                 (
                     relative_velocity_deviation
                     / VELOCITY_SCALE_M_PER_FRAME
+                ),
+                (
+                    cumulative_relative_deviation
+                    / RELATIVE_POSITION_SCALE_M
                 ),
                 hand_speed / VELOCITY_SCALE_M_PER_FRAME,
                 object_speed / VELOCITY_SCALE_M_PER_FRAME,
@@ -571,6 +580,10 @@ def compute(model, batch, args):
     motion_error = torch.linalg.norm(
         pred_velocity - gt_velocity, dim=-1
     )
+    cumulative_motion_error = torch.linalg.norm(
+        torch.cumsum(pred_velocity - gt_velocity, dim=1),
+        dim=-1,
+    )
     motion_valid = valid.clone()
     motion_valid[:, 0] = False
     motion_valid[:, 1:] &= valid[:, :-1]
@@ -580,6 +593,12 @@ def compute(model, batch, args):
     anomaly_target = (
         (motion_error * 1000.0 - args.anomaly_zero_mm) / anomaly_range
     ).clamp(0.0, 1.0)
+    carry_range = max(args.carry_full_mm - args.carry_zero_mm, 1e-6)
+    carry_target = (
+        (cumulative_motion_error * 1000.0 - args.carry_zero_mm)
+        / carry_range
+    ).clamp(0.0, 1.0)
+    motion_state_target = torch.maximum(anomaly_target, carry_target)
     translation = ray_depth.unsqueeze(-1) * camera_ray
     corrected = pred + translation[:, :, None]
     beta = args.smooth_l1_beta_mm / 1000.0
@@ -589,7 +608,7 @@ def compute(model, batch, args):
         / max(args.error_weight_reference_mm / 1000.0, 1e-8)
     ).clamp(args.error_weight_min, args.error_weight_max)
     supervision_weight = supervision_weight * (
-        1.0 + args.anomaly_depth_boost * anomaly_target
+        1.0 + args.anomaly_depth_boost * motion_state_target
     )
     projection_mask = (
         valid[:, :, None]
@@ -624,12 +643,12 @@ def compute(model, batch, args):
         ),
     }
     anomaly_loss = F.binary_cross_entropy_with_logits(
-        anomaly_logits, anomaly_target, reduction="none"
+        anomaly_logits, motion_state_target, reduction="none"
     )
     losses["anomaly"] = masked_mean(anomaly_loss, motion_valid)
     boundary_valid = valid[:, 1:] & valid[:, :-1]
     boundary_weight = 1.0 + args.anomaly_depth_boost * torch.maximum(
-        anomaly_target[:, 1:], anomaly_target[:, :-1]
+        motion_state_target[:, 1:], motion_state_target[:, :-1]
     )
     losses["boundary"] = weighted_smooth_l1(
         ray_depth[:, 1:] - ray_depth[:, :-1],
@@ -638,7 +657,7 @@ def compute(model, batch, args):
         boundary_weight,
         beta,
     )
-    non_anomaly = valid & (anomaly_target < 0.1)
+    non_anomaly = valid & (motion_state_target < 0.1)
     losses["motion_anchor"] = smooth_l1(
         motion_residual,
         torch.zeros_like(motion_residual),
@@ -820,7 +839,7 @@ def main() -> None:
             "feature_dim": feature_dim,
             "metadata_dim": metadata_dim,
             "motion_dim": motion_dim,
-            "scalar_feature_version": "v3_motion_anomaly_residual",
+            "scalar_feature_version": "v4_motion_anomaly_carry",
             "scalar_feature_scales": {
                 "camera_position_m": CAMERA_POSITION_SCALE_M,
                 "palm_offset_m": PALM_OFFSET_SCALE_M,
