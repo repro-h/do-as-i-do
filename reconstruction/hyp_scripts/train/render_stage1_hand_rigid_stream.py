@@ -16,7 +16,15 @@ import numpy as np
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
-    parser.add_argument("--stream-id", required=True)
+    sequence = parser.add_mutually_exclusive_group(required=True)
+    sequence.add_argument("--stream-id")
+    sequence.add_argument(
+        "--sequence-dir",
+        help=(
+            "Sequence path ending in subject/sequence/camera; the stream ID "
+            "is derived automatically."
+        ),
+    )
     parser.add_argument("--handflow-root", required=True)
     parser.add_argument("--prediction-root", required=True)
     parser.add_argument("--filtered-object-root", required=True)
@@ -54,6 +62,32 @@ def parse_args() -> argparse.Namespace:
 def load_jsonl(path: Path) -> list[dict]:
     with path.open("r", encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
+
+
+def stream_id_from_sequence_dir(path: str) -> str:
+    sequence_dir = Path(path).expanduser().resolve()
+    if len(sequence_dir.parts) < 3:
+        raise ValueError(
+            "--sequence-dir must end in subject/sequence/camera: "
+            f"{sequence_dir}"
+        )
+    return "__".join(sequence_dir.parts[-3:])
+
+
+def find_corrected_handflow(prediction_root: Path, stream_id: str) -> Path:
+    stream_root = prediction_root / stream_id
+    candidates = [
+        stream_root / "handflow_camera_result_pi3x_depth_refined.npz",
+        stream_root / "handflow_camera_result_stage1_hand_rigid.npz",
+        stream_root / "handflow_camera_result_global_v2_phase_a.npz",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise FileNotFoundError(
+        "No supported Stage1 corrected hand found:\n"
+        + "\n".join(str(path) for path in candidates)
+    )
 
 
 def run(command: list[str], expected: list[Path]) -> None:
@@ -156,18 +190,23 @@ def stack_view_triptychs(
 def main() -> None:
     args = parse_args()
     repository = Path(__file__).resolve().parents[3]
+    stream_id = (
+        args.stream_id
+        if args.stream_id
+        else stream_id_from_sequence_dir(args.sequence_dir)
+    )
     records = {
         row["stream_id"]: row
         for row in load_jsonl(Path(args.manifest).expanduser().resolve())
     }
-    if args.stream_id not in records:
-        raise KeyError(f"Stream is not in manifest: {args.stream_id}")
-    record = records[args.stream_id]
+    if stream_id not in records:
+        raise KeyError(f"Stream is not in manifest: {stream_id}")
+    record = records[stream_id]
     handflow_root = Path(args.handflow_root).expanduser().resolve()
     prediction_root = Path(args.prediction_root).expanduser().resolve()
     filtered_root = Path(args.filtered_object_root).expanduser().resolve()
     stream_out = (
-        Path(args.out_root).expanduser().resolve() / args.stream_id
+        Path(args.out_root).expanduser().resolve() / stream_id
     )
     frames_dir = stream_out / "frames"
     frame_map = stream_out / "dexycb_frame_map.json"
@@ -183,22 +222,18 @@ def main() -> None:
     if args.force or not frame_map.is_file():
         prepare_frame_map(Path(record["stream_dir"]), frames_dir, frame_map)
     original_handflow = (
-        handflow_root / args.stream_id / "handflow_camera_result.npz"
+        handflow_root / stream_id / "handflow_camera_result.npz"
     )
     corrected_handflow = (
         Path(args.corrected_hand_npz).expanduser().resolve()
         if args.corrected_hand_npz
-        else (
-            prediction_root
-            / args.stream_id
-            / "handflow_camera_result_stage1_hand_rigid.npz"
-        )
+        else find_corrected_handflow(prediction_root, stream_id)
     )
     raw_pose = Path(record["foundationpose_json"]).expanduser().resolve()
     filtered_pose = (
         filtered_root
         / args.split
-        / args.stream_id
+        / stream_id
         / "segmented_ekf_rts"
         / "foundationpose_segmented_ekf_rts.json"
     )
@@ -273,6 +308,15 @@ def main() -> None:
     )
     with np.load(original_handflow, allow_pickle=False) as raw:
         intrinsic = np.asarray(raw["intrinsics"], dtype=np.float64).reshape(3, 3)
+    corrected_checkpoint = None
+    with np.load(corrected_handflow, allow_pickle=False) as raw:
+        for key in (
+            "pi3x_depth_checkpoint",
+            "stage1_checkpoint",
+        ):
+            if key in raw.files:
+                corrected_checkpoint = str(np.asarray(raw[key]).item())
+                break
     render_script = (
         repository
         / "reconstruction/hyp_scripts/train/"
@@ -352,12 +396,14 @@ def main() -> None:
         if args.force or not grid_output.is_file():
             stack_view_triptychs(view_outputs, grid_output, args.fps)
     summary = {
-        "stream_id": args.stream_id,
+        "stream_id": stream_id,
+        "requested_sequence_dir": args.sequence_dir,
         "hand_side": record["hand_side"],
         "object_name": record["object_name"],
         "original_handflow": str(original_handflow),
         "raw_foundationpose": str(raw_pose),
         "corrected_handflow": str(corrected_handflow),
+        "corrected_checkpoint": corrected_checkpoint,
         "filtered_object_pose": str(filtered_pose),
         "four_view_grid": str(grid_output) if grid_output else None,
         "view_triptychs": {
