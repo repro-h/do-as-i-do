@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -29,6 +30,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mano-data-dir", required=True)
     parser.add_argument("--object-model-root", required=True)
     parser.add_argument("--out-root", required=True)
+    parser.add_argument(
+        "--video-only-root",
+        help=(
+            "Optional directory that receives only the final MP4, grouped "
+            "under one stream-ID directory per sequence."
+        ),
+    )
     parser.add_argument("--gt-python", default=sys.executable)
     parser.add_argument("--split", default="val")
     parser.add_argument("--fps", type=float, default=10.0)
@@ -70,6 +78,10 @@ def main() -> None:
     ).resolve()
     out_root = Path(args.out_root).expanduser().resolve()
     out_root.mkdir(parents=True, exist_ok=True)
+    video_only_root = None
+    if args.video_only_root:
+        video_only_root = Path(args.video_only_root).expanduser().resolve()
+        video_only_root.mkdir(parents=True, exist_ok=True)
     common = [
         sys.executable,
         "-u",
@@ -115,6 +127,17 @@ def main() -> None:
             subprocess.run(
                 common + ["--sequence-dir", sequence_dir], check=True
             )
+            if video_only_root is not None:
+                source_video = (
+                    out_root
+                    / stream_id
+                    / "grid_4views_x_3methods.mp4"
+                )
+                if not source_video.is_file():
+                    raise FileNotFoundError(source_video)
+                video_dir = video_only_root / stream_id
+                video_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_video, video_dir / source_video.name)
             completed.append(stream_id)
         except Exception as error:
             row = {
@@ -131,6 +154,9 @@ def main() -> None:
         "num_requested": len(sequence_dirs),
         "num_completed": len(completed),
         "num_failed": len(failures),
+        "video_only_root": (
+            str(video_only_root) if video_only_root is not None else None
+        ),
         "completed": completed,
         "failures": failures,
     }
