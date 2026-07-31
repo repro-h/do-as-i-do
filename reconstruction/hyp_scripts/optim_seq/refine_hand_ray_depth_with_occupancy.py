@@ -16,6 +16,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--hand-npz", required=True)
     parser.add_argument("--supervision-npz", required=True)
+    parser.add_argument(
+        "--gt-hand-npz",
+        default=None,
+        help="Optional Stage1 supervision NPZ with gt_hand_vertices for audit.",
+    )
     parser.add_argument("--object-mesh", required=True)
     parser.add_argument("--mesh-scale", type=float, required=True)
     parser.add_argument("--out-dir", required=True)
@@ -247,6 +252,7 @@ def main() -> None:
         )
 
     best = min(candidate_rows, key=lambda row: (row["score"], row["bias_mm"]))
+    baseline = min(candidate_rows, key=lambda row: abs(row["bias_mm"]))
     selected_bias_m = best["bias_mm"] / 1000.0
     translation = (
         camera_ray * selected_bias_m * frame_weight[:, None]
@@ -268,6 +274,32 @@ def main() -> None:
 
     result_path = out_dir / "hand_camera_result_occupancy_depth_refined.npz"
     np.savez_compressed(result_path, **output)
+    gt_audit = None
+    if args.gt_hand_npz:
+        gt_path = Path(args.gt_hand_npz).expanduser().resolve()
+        with np.load(gt_path, allow_pickle=False) as raw:
+            gt_vertices = np.asarray(
+                raw["gt_hand_vertices"], dtype=np.float64
+            )
+            gt_valid = (
+                np.asarray(raw["gt_hand_valid"]).astype(bool)
+                if "gt_hand_valid" in raw.files
+                else np.ones(len(gt_vertices), dtype=bool)
+            )
+        gt_rows = {}
+        for frame in focus_indices:
+            if frame >= len(gt_vertices) or not gt_valid[frame]:
+                continue
+            gt_rows[f"{frame:06d}"] = penetration_metrics(
+                gt_vertices[frame], object_pose[frame], occupancy
+            )
+        gt_audit = {
+            "gt_hand_npz": str(gt_path),
+            "frames": gt_rows,
+            "penetrating_count": int(
+                sum(row["count"] for row in gt_rows.values())
+            ),
+        }
     audit = {
         "hand_npz": str(hand_path),
         "supervision_npz": str(supervision_path),
@@ -276,7 +308,9 @@ def main() -> None:
         "settings": vars(args),
         "voxel_grid_shape": list(occupancy.interior.shape),
         "num_interior_voxels": int(occupancy.interior.sum()),
+        "baseline": baseline,
         "selected": best,
+        "gt_audit": gt_audit,
         "candidates": candidate_rows,
     }
     (out_dir / "audit.json").write_text(
