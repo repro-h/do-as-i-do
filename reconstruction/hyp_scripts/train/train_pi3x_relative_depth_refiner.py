@@ -48,6 +48,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-motion-residual-mm", type=float, default=40.0)
     parser.add_argument("--max-target-mm", type=float, default=120.0)
     parser.add_argument("--smooth-l1-beta-mm", type=float, default=5.0)
+    parser.add_argument(
+        "--objective",
+        choices=("full", "ray_depth_only"),
+        default="full",
+        help=(
+            "Training objective. ray_depth_only supervises only the final "
+            "camera-ray depth and its temporal derivatives."
+        ),
+    )
+    parser.add_argument(
+        "--depth-mse-scale-mm",
+        type=float,
+        default=20.0,
+        help="Normalization scale for ray_depth_only MSE terms.",
+    )
     parser.add_argument("--w-depth", type=float, default=1.0)
     parser.add_argument("--w-wrist", type=float, default=0.25)
     parser.add_argument("--w-projection", type=float, default=0.1)
@@ -565,6 +580,19 @@ def temporal(value, target, valid, order, beta):
     return smooth_l1(value, target, valid, beta)
 
 
+def normalized_mse(value, target, mask, scale):
+    error = (value - target) / scale
+    return masked_mean(error.square(), mask)
+
+
+def temporal_mse(value, target, valid, order, scale):
+    for _ in range(order):
+        value = value[:, 1:] - value[:, :-1]
+        target = target[:, 1:] - target[:, :-1]
+        valid = valid[:, 1:] & valid[:, :-1]
+    return normalized_mse(value, target, valid, scale)
+
+
 def project(points: torch.Tensor, intrinsics: torch.Tensor) -> torch.Tensor:
     z = points[..., 2].clamp_min(1e-4)
     u = intrinsics[:, None, None, 0, 0] * points[..., 0] / z
@@ -601,6 +629,42 @@ def compute(model, batch, args):
     camera_ray = F.normalize(pred[:, :, 0], dim=-1, eps=1e-8)
     target_translation = gt[:, :, 0] - pred[:, :, 0]
     target_depth = torch.sum(target_translation * camera_ray, dim=-1)
+    if args.objective == "ray_depth_only":
+        mse_scale = args.depth_mse_scale_mm / 1000.0
+        if mse_scale <= 0.0:
+            raise ValueError("--depth-mse-scale-mm must be positive")
+        losses = {
+            "depth": normalized_mse(
+                ray_depth, target_depth, valid, mse_scale
+            ),
+            "velocity": temporal_mse(
+                ray_depth, target_depth, valid, 1, mse_scale
+            ),
+            "acceleration": temporal_mse(
+                ray_depth, target_depth, valid, 2, mse_scale
+            ),
+        }
+        total = (
+            args.w_depth * losses["depth"]
+            + args.w_velocity * losses["velocity"]
+            + args.w_acceleration * losses["acceleration"]
+        )
+        translation = ray_depth.unsqueeze(-1) * camera_ray
+        corrected = pred + translation[:, :, None]
+        before = torch.linalg.norm(pred[:, :, 0] - gt[:, :, 0], dim=-1)
+        after = torch.linalg.norm(
+            corrected[:, :, 0] - gt[:, :, 0], dim=-1
+        )
+        initial_depth_error = torch.abs(target_depth)
+        depth_after = torch.abs(target_depth - ray_depth)
+        return (
+            total,
+            losses,
+            before[valid],
+            after[valid],
+            initial_depth_error[valid],
+            depth_after[valid],
+        )
     pred_velocity = torch.zeros_like(pred[:, :, 0])
     gt_velocity = torch.zeros_like(gt[:, :, 0])
     pred_velocity[:, 1:] = pred[:, 1:, 0] - pred[:, :-1, 0]
@@ -881,7 +945,11 @@ def main() -> None:
             "feature_dim": feature_dim,
             "metadata_dim": metadata_dim,
             "motion_dim": motion_dim,
-            "scalar_feature_version": "v7_thresholded_recurrent_carry",
+            "scalar_feature_version": (
+                "v8_ray_depth_only"
+                if args.objective == "ray_depth_only"
+                else "v7_thresholded_recurrent_carry"
+            ),
             "scalar_feature_scales": {
                 "camera_position_m": CAMERA_POSITION_SCALE_M,
                 "palm_offset_m": PALM_OFFSET_SCALE_M,

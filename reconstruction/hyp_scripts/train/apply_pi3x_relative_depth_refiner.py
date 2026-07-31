@@ -242,6 +242,9 @@ def main() -> None:
         output["pi3x_depth_checkpoint"] = np.asarray(
             str(checkpoint_path)
         )
+        output["pi3x_depth_objective"] = np.asarray(
+            config.get("objective", "full")
+        )
         output["pi3x_depth_source_handflow"] = np.asarray(
             str(handflow_path)
         )
@@ -261,6 +264,10 @@ def main() -> None:
         "checkpoint": str(checkpoint_path),
         "checkpoint_epoch": int(checkpoint["epoch"]),
         "checkpoint_val_total": float(checkpoint["val_total"]),
+        "checkpoint_feature_version": checkpoint.get(
+            "scalar_feature_version", "unknown"
+        ),
+        "objective": config.get("objective", "full"),
         "windows": str(windows_path),
         "num_windows": len(dataset),
         "num_streams": len(stream_rows),
