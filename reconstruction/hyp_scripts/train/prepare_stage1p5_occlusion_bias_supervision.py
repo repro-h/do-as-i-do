@@ -334,6 +334,23 @@ def main() -> None:
     core_mask[:] = False
     for start, end in segments:
         core_mask[start : end + 1] = True
+    frame_bias_target = np.where(
+        core_mask,
+        np.clip(
+            remaining_depth,
+            -args.max_bias_mm / 1000.0,
+            args.max_bias_mm / 1000.0,
+        ),
+        0.0,
+    ).astype(np.float32)
+    frame_gate_target = (
+        core_mask
+        & valid
+        & (
+            np.abs(remaining_depth)
+            >= args.gate_threshold_mm / 1000.0
+        )
+    ).astype(np.float32)
 
     size = min(max(1, args.window_size), count)
     stride = max(1, args.window_stride)
@@ -390,7 +407,9 @@ def main() -> None:
         frame_feature_names=feature_names,
         frame_valid=valid,
         remaining_depth_target=remaining_depth.astype(np.float32),
-        carry_core_mask=core_mask,
+        frame_bias_target=frame_bias_target,
+        frame_gate_target=frame_gate_target,
+        carry_core_mask=carry_mask,
         combined_core_mask=core_mask,
         segment_start=np.asarray([row[0] for row in segments], dtype=np.int32),
         segment_end=np.asarray([row[1] for row in segments], dtype=np.int32),
@@ -478,9 +497,14 @@ def main() -> None:
                 "remaining_depth_mm": float(
                     remaining_depth[frame] * 1000.0
                 ),
+                "gate_target": bool(frame_gate_target[frame]),
+                "bias_target_mm": float(
+                    frame_bias_target[frame] * 1000.0
+                ),
             }
             for frame in range(count)
         ],
+        "num_positive_frames": int(frame_gate_target.sum()),
         "num_windows": len(rows),
         "num_positive_windows": int(gate_target.sum()),
         "positive_windows": [
