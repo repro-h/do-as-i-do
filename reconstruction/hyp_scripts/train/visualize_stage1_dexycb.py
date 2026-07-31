@@ -196,6 +196,7 @@ def main() -> None:
     prediction_is_corrected_handflow = prediction_path.name in {
         "handflow_camera_result_stage1_hand_rigid.npz",
         "handflow_camera_result_global_v2_phase_a.npz",
+        "handflow_camera_result_pi3x_depth_refined.npz",
     }
     handflow_path = (handflow_root / stream_id / "handflow_camera_result.npz").resolve()
     foundationpose_path = Path(
