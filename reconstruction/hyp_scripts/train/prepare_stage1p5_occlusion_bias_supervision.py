@@ -29,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gate-threshold-mm", type=float, default=5.0)
     parser.add_argument("--max-bias-mm", type=float, default=25.0)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--quiet", action="store_true")
     return parser.parse_args()
 
 
@@ -522,7 +523,24 @@ def main() -> None:
     audit_path.write_text(
         json.dumps(audit, indent=2), encoding="utf-8"
     )
-    print(json.dumps(audit, indent=2))
+    if args.quiet:
+        print(
+            json.dumps(
+                {
+                    "stream_id": stream_id,
+                    "num_frames": count,
+                    "num_segments": len(segments),
+                    "num_positive_frames": int(
+                        frame_gate_target.sum()
+                    ),
+                    "num_windows": len(rows),
+                    "num_positive_windows": int(gate_target.sum()),
+                    "output": str(output_path),
+                }
+            )
+        )
+    else:
+        print(json.dumps(audit, indent=2))
 
 
 if __name__ == "__main__":

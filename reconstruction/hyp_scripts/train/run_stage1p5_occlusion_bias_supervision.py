@@ -159,6 +159,7 @@ def main() -> None:
                 str(args.gate_threshold_mm),
                 "--max-bias-mm",
                 str(args.max_bias_mm),
+                "--quiet",
             ]
             if args.overwrite:
                 command.append("--overwrite")
