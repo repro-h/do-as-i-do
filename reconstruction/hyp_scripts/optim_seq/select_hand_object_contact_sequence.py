@@ -37,6 +37,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-batch-size", type=int, default=8)
     parser.add_argument("--contact-enter-mm", type=float, default=8.0)
     parser.add_argument("--penetration-tolerance-mm", type=float, default=1.5)
+    parser.add_argument(
+        "--penetration-max-distance-mm", type=float, default=30.0
+    )
     parser.add_argument("--normal-dot-max", type=float, default=-0.1)
     parser.add_argument("--min-contact-points", type=int, default=3)
     parser.add_argument("--contact-topk", type=int, default=12)
@@ -147,7 +150,6 @@ def main() -> None:
         args.contact_per_finger_vertices,
         args.contact_palm_vertices,
     )
-    sampled_hand = vertices[:, semantic_indices]
     hand_normals = sampled_vertex_normals(
         vertices, faces, semantic_indices
     )
@@ -167,10 +169,10 @@ def main() -> None:
     device = torch.device(args.device)
     point_tensor = torch.from_numpy(local_points).to(device)
     normal_tensor = torch.from_numpy(local_normals).to(device)
-    distance_chunks = []
-    point_chunks = []
-    normal_chunks = []
-    inside_chunks = []
+    distance_all_chunks = []
+    point_all_chunks = []
+    normal_all_chunks = []
+    inside_all_chunks = []
     for start in range(0, count, args.frame_batch_size):
         end = min(start + args.frame_batch_size, count)
         pose_tensor = torch.from_numpy(poses[start:end]).to(device)
@@ -179,18 +181,22 @@ def main() -> None:
         )
         with torch.no_grad():
             result = nearest_surface(
-                torch.from_numpy(sampled_hand[start:end]).to(device),
+                torch.from_numpy(vertices[start:end]).to(device),
                 object_points,
                 object_normals,
             )
-        distance_chunks.append(result[0].cpu())
-        point_chunks.append(result[1].cpu())
-        normal_chunks.append(result[2].cpu())
-        inside_chunks.append(result[3].cpu())
-    distance = torch.cat(distance_chunks).to(device)
-    nearest_point = torch.cat(point_chunks).to(device)
-    nearest_normal = torch.cat(normal_chunks).to(device)
-    inside = torch.cat(inside_chunks).to(device)
+        distance_all_chunks.append(result[0].cpu())
+        point_all_chunks.append(result[1].cpu())
+        normal_all_chunks.append(result[2].cpu())
+        inside_all_chunks.append(result[3].cpu())
+    distance_all = torch.cat(distance_all_chunks).to(device)
+    nearest_point_all = torch.cat(point_all_chunks).to(device)
+    nearest_normal_all = torch.cat(normal_all_chunks).to(device)
+    inside_all = torch.cat(inside_all_chunks).to(device)
+    distance = distance_all[:, semantic_indices]
+    nearest_point = nearest_point_all[:, semantic_indices]
+    nearest_normal = nearest_normal_all[:, semantic_indices]
+    inside = inside_all[:, semantic_indices]
     hand_normal_tensor = torch.from_numpy(hand_normals).to(device)
     valid_tensor = torch.from_numpy(valid).to(device)
     semantic_mask = torch.ones(
@@ -213,6 +219,20 @@ def main() -> None:
     normal_dot_np = (
         hand_normal_tensor * nearest_normal
     ).sum(dim=-1).cpu().numpy()
+    penetration_mask = (
+        (inside_all > args.penetration_tolerance_mm / 1000.0)
+        & (
+            distance_all
+            <= args.penetration_max_distance_mm / 1000.0
+        )
+        & valid_tensor[:, None]
+    )
+    penetration_depth = torch.relu(
+        inside_all - args.penetration_tolerance_mm / 1000.0
+    )
+    penetration_depth = penetration_depth * penetration_mask
+    penetration_np = penetration_mask.cpu().numpy()
+    penetration_depth_np = penetration_depth.cpu().numpy()
 
     candidate_full = np.zeros((count, vertices.shape[1]), dtype=bool)
     selected_full = np.zeros_like(candidate_full)
@@ -261,6 +281,11 @@ def main() -> None:
                 "selected_distance_mm": distribution(
                     distance_np[frame, chosen_local] * 1000.0
                 ),
+                "num_penetrating": int(penetration_np[frame].sum()),
+                "penetration_depth_mm": distribution(
+                    penetration_depth_np[frame, penetration_np[frame]]
+                    * 1000.0
+                ),
             }
         )
 
@@ -284,6 +309,13 @@ def main() -> None:
         "num_selected_frame_vertices": int(selected_np.sum()),
         "num_contact_frames": int(selected_np.any(axis=1).sum()),
         "selected_distance_mm": distribution(selected_distance),
+        "num_penetrating_frame_vertices": int(penetration_np.sum()),
+        "num_penetrating_frames": int(
+            penetration_np.any(axis=1).sum()
+        ),
+        "penetration_depth_mm": distribution(
+            penetration_depth_np[penetration_np] * 1000.0
+        ),
         "semantic_groups": semantic_groups,
         "contact_updates": mapped_updates,
         "frames": frame_rows,
@@ -294,6 +326,8 @@ def main() -> None:
         semantic_vertex_indices=semantic_indices.astype(np.int64),
         candidate_mask=candidate_full,
         contact_mask=selected_full,
+        penetration_mask=penetration_np,
+        penetration_depth=penetration_depth_np.astype(np.float32),
         nearest_distance=distance_np.astype(np.float32),
         nearest_object_point=nearest_point.cpu().numpy().astype(np.float32),
         nearest_object_normal=nearest_normal.cpu().numpy().astype(np.float32),

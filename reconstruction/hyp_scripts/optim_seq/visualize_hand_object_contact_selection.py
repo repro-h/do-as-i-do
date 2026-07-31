@@ -74,6 +74,7 @@ def main() -> None:
     semantic = np.asarray(selection["semantic_vertex_indices"], dtype=int)
     candidate = np.asarray(selection["candidate_mask"]).astype(bool)
     contact = np.asarray(selection["contact_mask"]).astype(bool)
+    penetration = np.asarray(selection["penetration_mask"]).astype(bool)
     nearest = np.asarray(selection["nearest_object_point"], dtype=np.float32)
     vertex_to_local = {int(value): index for index, value in enumerate(semantic)}
     vertex_colors = np.tile(
@@ -102,6 +103,9 @@ def main() -> None:
     )
     show_lines = server.gui.add_checkbox(
         "Surface correspondences", initial_value=True
+    )
+    show_penetration = server.gui.add_checkbox(
+        "Penetrating vertices", initial_value=True
     )
     handles = []
     playing = {"value": False}
@@ -165,7 +169,7 @@ def main() -> None:
             hand_points = hand_vertices[frame, contact_ids]
             segments = np.stack([hand_points, object_points], axis=1)
             line_colors = np.tile(
-                np.asarray([[[235, 65, 65], [235, 65, 65]]], dtype=np.uint8),
+                np.asarray([[[40, 225, 235], [40, 225, 235]]], dtype=np.uint8),
                 (len(segments), 1, 1),
             )
             handles.append(
@@ -181,16 +185,30 @@ def main() -> None:
                     "/object_contact_points",
                     points=object_points,
                     colors=np.tile(
-                        np.asarray([[235, 65, 65]], dtype=np.uint8),
+                        np.asarray([[40, 225, 235]], dtype=np.uint8),
                         (len(object_points), 1),
                     ),
                     point_size=args.point_size,
+                )
+            )
+        penetration_ids = np.flatnonzero(penetration[frame])
+        if len(penetration_ids) and show_penetration.value:
+            handles.append(
+                server.scene.add_point_cloud(
+                    "/penetrating_vertices",
+                    points=hand_vertices[frame, penetration_ids],
+                    colors=np.tile(
+                        np.asarray([[255, 25, 25]], dtype=np.uint8),
+                        (len(penetration_ids), 1),
+                    ),
+                    point_size=args.point_size * 1.6,
                 )
             )
         row = audit["frames"][frame]
         print(
             f"frame={frame:06d} candidates={row['num_candidates']} "
             f"selected={row['num_selected']} "
+            f"penetrating={row['num_penetrating']} "
             f"groups={row['selected_groups']}",
             flush=True,
         )
@@ -204,7 +222,9 @@ def main() -> None:
     def _(_) -> None:
         playing["value"] = not playing["value"]
 
-    for checkbox in (show_candidates, show_contacts, show_lines):
+    for checkbox in (
+        show_candidates, show_contacts, show_lines, show_penetration
+    ):
         checkbox.on_update(lambda _: show_frame(frame_slider.value))
 
     def playback() -> None:
@@ -222,7 +242,10 @@ def main() -> None:
     threading.Thread(target=playback, daemon=True).start()
     show_frame(0)
     print(f"Viewer: http://localhost:{args.port}")
-    print("Yellow=candidates, colored=stable contacts, red=object matches")
+    print(
+        "Yellow=candidates, colored=stable contacts, "
+        "red=penetrating vertices, cyan=object matches"
+    )
     print("Press Ctrl+C to stop")
     while True:
         time.sleep(1.0)
