@@ -20,6 +20,7 @@ from optimize_hand_object_contact_sequence import (
     sampled_vertex_normals,
     transform_surface,
 )
+from refine_hand_ray_depth_with_occupancy import Occupancy
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,6 +41,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--penetration-max-distance-mm", type=float, default=30.0
     )
+    parser.add_argument(
+        "--penetration-mode",
+        choices=("occupancy", "nearest_normal"),
+        default="occupancy",
+    )
+    parser.add_argument(
+        "--occupancy-source",
+        choices=("mesh", "convex_hull"),
+        default="mesh",
+    )
+    parser.add_argument("--voxel-mm", type=float, default=2.0)
+    parser.add_argument("--interior-tolerance-mm", type=float, default=1.0)
     parser.add_argument("--normal-dot-max", type=float, default=-0.1)
     parser.add_argument("--min-contact-points", type=int, default=3)
     parser.add_argument("--contact-topk", type=int, default=12)
@@ -166,13 +179,31 @@ def main() -> None:
         local_points[:, 0] *= -1.0
         local_normals[:, 0] *= -1.0
 
+    occupancy = None
+    if args.penetration_mode == "occupancy":
+        occupancy_mesh = mesh.copy()
+        if normalized_left:
+            occupancy_mesh.vertices[:, 0] *= -1.0
+        if args.occupancy_source == "convex_hull":
+            occupancy_mesh = occupancy_mesh.convex_hull
+        occupancy = Occupancy(
+            occupancy_mesh,
+            args.voxel_mm / 1000.0,
+            args.interior_tolerance_mm / 1000.0,
+        )
+
     device = torch.device(args.device)
     point_tensor = torch.from_numpy(local_points).to(device)
     normal_tensor = torch.from_numpy(local_normals).to(device)
-    distance_all_chunks = []
-    point_all_chunks = []
-    normal_all_chunks = []
-    inside_all_chunks = []
+    distance_chunks = []
+    point_chunks = []
+    normal_chunks = []
+    inside_chunks = []
+    nearest_vertices = (
+        vertices
+        if args.penetration_mode == "nearest_normal"
+        else vertices[:, semantic_indices]
+    )
     for start in range(0, count, args.frame_batch_size):
         end = min(start + args.frame_batch_size, count)
         pose_tensor = torch.from_numpy(poses[start:end]).to(device)
@@ -181,22 +212,30 @@ def main() -> None:
         )
         with torch.no_grad():
             result = nearest_surface(
-                torch.from_numpy(vertices[start:end]).to(device),
+                torch.from_numpy(nearest_vertices[start:end]).to(device),
                 object_points,
                 object_normals,
             )
-        distance_all_chunks.append(result[0].cpu())
-        point_all_chunks.append(result[1].cpu())
-        normal_all_chunks.append(result[2].cpu())
-        inside_all_chunks.append(result[3].cpu())
-    distance_all = torch.cat(distance_all_chunks).to(device)
-    nearest_point_all = torch.cat(point_all_chunks).to(device)
-    nearest_normal_all = torch.cat(normal_all_chunks).to(device)
-    inside_all = torch.cat(inside_all_chunks).to(device)
-    distance = distance_all[:, semantic_indices]
-    nearest_point = nearest_point_all[:, semantic_indices]
-    nearest_normal = nearest_normal_all[:, semantic_indices]
-    inside = inside_all[:, semantic_indices]
+        distance_chunks.append(result[0].cpu())
+        point_chunks.append(result[1].cpu())
+        normal_chunks.append(result[2].cpu())
+        inside_chunks.append(result[3].cpu())
+    queried_distance = torch.cat(distance_chunks).to(device)
+    queried_point = torch.cat(point_chunks).to(device)
+    queried_normal = torch.cat(normal_chunks).to(device)
+    queried_inside = torch.cat(inside_chunks).to(device)
+    if args.penetration_mode == "nearest_normal":
+        distance_all = queried_distance
+        inside_all = queried_inside
+        distance = distance_all[:, semantic_indices]
+        nearest_point = queried_point[:, semantic_indices]
+        nearest_normal = queried_normal[:, semantic_indices]
+        inside = inside_all[:, semantic_indices]
+    else:
+        distance = queried_distance
+        nearest_point = queried_point
+        nearest_normal = queried_normal
+        inside = queried_inside
     hand_normal_tensor = torch.from_numpy(hand_normals).to(device)
     valid_tensor = torch.from_numpy(valid).to(device)
     semantic_mask = torch.ones(
@@ -219,20 +258,39 @@ def main() -> None:
     normal_dot_np = (
         hand_normal_tensor * nearest_normal
     ).sum(dim=-1).cpu().numpy()
-    penetration_mask = (
-        (inside_all > args.penetration_tolerance_mm / 1000.0)
-        & (
-            distance_all
-            <= args.penetration_max_distance_mm / 1000.0
+    if args.penetration_mode == "nearest_normal":
+        penetration_mask = (
+            (inside_all > args.penetration_tolerance_mm / 1000.0)
+            & (
+                distance_all
+                <= args.penetration_max_distance_mm / 1000.0
+            )
+            & valid_tensor[:, None]
         )
-        & valid_tensor[:, None]
-    )
-    penetration_depth = torch.relu(
-        inside_all - args.penetration_tolerance_mm / 1000.0
-    )
-    penetration_depth = penetration_depth * penetration_mask
-    penetration_np = penetration_mask.cpu().numpy()
-    penetration_depth_np = penetration_depth.cpu().numpy()
+        penetration_depth = torch.relu(
+            inside_all - args.penetration_tolerance_mm / 1000.0
+        )
+        penetration_depth = penetration_depth * penetration_mask
+        penetration_np = penetration_mask.cpu().numpy()
+        penetration_depth_np = penetration_depth.cpu().numpy()
+    else:
+        penetration_np = np.zeros(
+            (count, vertices.shape[1]), dtype=bool
+        )
+        penetration_depth_np = np.zeros(
+            penetration_np.shape, dtype=np.float32
+        )
+        for frame in range(count):
+            if not valid[frame]:
+                continue
+            rotation = poses[frame, :3, :3]
+            translation = poses[frame, :3, 3]
+            local_vertices = (
+                vertices[frame] - translation[None]
+            ) @ rotation
+            frame_inside, frame_depth = occupancy.query(local_vertices)
+            penetration_np[frame] = frame_inside
+            penetration_depth_np[frame] = frame_depth.astype(np.float32)
 
     candidate_full = np.zeros((count, vertices.shape[1]), dtype=bool)
     selected_full = np.zeros_like(candidate_full)
@@ -315,6 +373,12 @@ def main() -> None:
         ),
         "penetration_depth_mm": distribution(
             penetration_depth_np[penetration_np] * 1000.0
+        ),
+        "occupancy_grid_shape": (
+            list(occupancy.interior.shape) if occupancy is not None else None
+        ),
+        "num_occupancy_interior_voxels": (
+            int(occupancy.interior.sum()) if occupancy is not None else None
         ),
         "semantic_groups": semantic_groups,
         "contact_updates": mapped_updates,
