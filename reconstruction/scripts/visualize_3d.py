@@ -81,6 +81,8 @@ def parse_args():
                         help='Viser server port')
     parser.add_argument('--frustum-scale', type=float, default=0.2,
                         help='Scale of camera frustum visualization')
+    parser.add_argument('--hide-camera', action='store_true',
+                        help='Hide the camera axes, image plane, and frustum')
     parser.add_argument('--fps', type=float, default=30.0,
                         help='Playback FPS for auto-play')
     return parser.parse_args()
@@ -258,7 +260,13 @@ def main():
     )
 
     # Add coordinate frame
-    server.scene.add_frame("/camera/axes", show_axes=True, axes_length=0.1, axes_radius=0.005)
+    if not args.hide_camera:
+        server.scene.add_frame(
+            "/camera/axes",
+            show_axes=True,
+            axes_length=0.1,
+            axes_radius=0.005,
+        )
 
     # GUI controls
     frame_slider = server.gui.add_slider(
@@ -285,22 +293,23 @@ def main():
         if not os.path.exists(img_path):
             return
 
-        frame_bgr = cv2.imread(img_path)
-        if frame_bgr is None:
-            return
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        if not args.hide_camera:
+            frame_bgr = cv2.imread(img_path)
+            if frame_bgr is None:
+                return
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-        # Camera frustum with frame image
-        server.scene.add_camera_frustum(
-            "/camera",
-            fov=fov_y,
-            aspect=aspect,
-            scale=args.frustum_scale,
-            image=frame_rgb,
-            format="jpeg",
-            jpeg_quality=90,
-            color=(30, 30, 30),
-        )
+            # Camera frustum with frame image
+            server.scene.add_camera_frustum(
+                "/camera",
+                fov=fov_y,
+                aspect=aspect,
+                scale=args.frustum_scale,
+                image=frame_rgb,
+                format="jpeg",
+                jpeg_quality=90,
+                color=(30, 30, 30),
+            )
 
         # Get pose from layout
         if frame_idx not in layout:

@@ -37,6 +37,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--port", type=int, default=8098)
     parser.add_argument("--fps", type=float, default=10.0)
+    parser.add_argument(
+        "--show-camera",
+        action="store_true",
+        help="Show the camera axes, image plane, and frustum.",
+    )
     parser.add_argument("--force-prepare", action="store_true")
     return parser.parse_args()
 
@@ -130,7 +135,6 @@ def main() -> None:
         stream_id,
         "--foundationpose-json",
         str(filtered_object),
-        "--hide-gt",
         "--prepare-only",
     ]
     if args.force_prepare:
@@ -142,6 +146,7 @@ def main() -> None:
         (stream_out / "camera.json").read_text(encoding="utf-8")
     )
     corrected = stream_out / "stage1_corrected"
+    gt_out = stream_out / "gt"
     viewer_script = repository / "reconstruction/scripts/visualize_3d.py"
     viewer_command = [
         str(Path(args.viewer_python).expanduser().resolve()),
@@ -155,6 +160,18 @@ def main() -> None:
         str(Path(record["sam3d_glb"]).expanduser().resolve()),
         "--hand-meshes",
         str(corrected / "all_hand_meshes_handflow.npz"),
+        "--gt-hand-meshes",
+        str(gt_out / "dexycb_gt_hand_meshes.npz"),
+        "--gt-object-layout-json",
+        str(gt_out / "dexycb_gt_object_layout_camera_frame.json"),
+        "--gt-object-mesh",
+        str(
+            Path(args.object_model_root).expanduser().resolve()
+            / record["object_name"]
+            / "textured_simple.obj"
+        ),
+        "--gt-object-scale",
+        "1.0",
         "--scale",
         str(record["foundationpose_source_mesh_scale"]),
         "--translation-scale",
@@ -180,6 +197,8 @@ def main() -> None:
         "--port",
         str(args.port),
     ]
+    if not args.show_camera:
+        viewer_command.append("--hide-camera")
     print(f"Stream: {stream_id}")
     print(f"Objective: {objective}")
     print(f"Checkpoint: {checkpoint}")
