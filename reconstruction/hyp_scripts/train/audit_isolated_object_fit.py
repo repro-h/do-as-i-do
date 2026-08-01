@@ -196,9 +196,15 @@ def main() -> None:
     vertices_np, faces_np = load_mesh(
         Path(args.mesh).expanduser().resolve(), args.max_faces
     )
-    scale = float(initial_payload.get("source_mesh_scale", 1.0))
-    vertices = torch.as_tensor(
-        vertices_np * scale, dtype=torch.float32, device=device
+    initial_scale = float(initial_payload.get("source_mesh_scale", 1.0))
+    fitted_scale = float(
+        fitted_payload.get("source_mesh_scale", initial_scale)
+    )
+    initial_vertices = torch.as_tensor(
+        vertices_np * initial_scale, dtype=torch.float32, device=device
+    )
+    fitted_vertices = torch.as_tensor(
+        vertices_np * fitted_scale, dtype=torch.float32, device=device
     )
     faces = torch.as_tensor(faces_np, dtype=torch.int64, device=device)
     first_segmentation = load_segmentation(Path(rows[0]["label_path"]))
@@ -272,10 +278,10 @@ def main() -> None:
             interpolation=cv2.INTER_NEAREST,
         )
         initial_mask, initial_depth = render_pose(
-            vertices, faces, initial_pose, rasterizer
+            initial_vertices, faces, initial_pose, rasterizer
         )
         fitted_mask, fitted_depth = render_pose(
-            vertices, faces, fitted_pose, rasterizer
+            fitted_vertices, faces, fitted_pose, rasterizer
         )
         initial_metrics = frame_metrics(
             initial_mask, initial_depth, object_mask, hand_dilated, observed_depth
