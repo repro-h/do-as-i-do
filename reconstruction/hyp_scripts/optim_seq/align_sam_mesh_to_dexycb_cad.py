@@ -316,11 +316,11 @@ def main() -> None:
     ycb_ids = list(metadata.get("ycb_ids", []) or [])
     grasp_index = int(metadata.get("ycb_grasp_ind", 0))
     object_id = int(ycb_ids[grasp_index])
-    matches = sorted(model_root.glob(f"{object_id:03d}_*"))
-    if len(matches) != 1:
-        raise RuntimeError(f"Expected one YCB model for {object_id}, got {matches}")
-    object_name = matches[0].name
-    ycb_mesh_path = matches[0] / "textured_simple.obj"
+    object_name = str(record["object_name"])
+    ycb_model_dir = model_root / object_name
+    if not ycb_model_dir.is_dir():
+        raise FileNotFoundError(ycb_model_dir)
+    ycb_mesh_path = ycb_model_dir / "textured_simple.obj"
 
     sam_mesh = load_mesh(sam_path)
     ycb_mesh = load_mesh(ycb_mesh_path)
