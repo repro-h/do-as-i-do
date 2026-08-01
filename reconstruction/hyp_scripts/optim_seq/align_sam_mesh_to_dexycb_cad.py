@@ -24,6 +24,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--foundationpose-json", default=None)
     parser.add_argument("--filtered-object-json", default=None)
     parser.add_argument("--out-dir", required=True)
+    parser.add_argument(
+        "--alignment-mode",
+        choices=("pose_consensus", "surface_icp"),
+        default="pose_consensus",
+    )
     parser.add_argument("--samples", type=int, default=12000)
     parser.add_argument("--icp-iterations", type=int, default=30)
     parser.add_argument("--trim-fraction", type=float, default=0.7)
@@ -203,6 +208,74 @@ def load_pose_rows(path: Path) -> dict[str, np.ndarray]:
     return output
 
 
+def load_gt_ycb_poses(
+    sequence_dir: Path, grasp_index: int
+) -> tuple[dict[str, np.ndarray], list[str]]:
+    poses = {}
+    missing = []
+    for label_path in sorted(sequence_dir.glob("labels_*.npz")):
+        frame = label_path.stem.split("_")[-1].zfill(6)
+        with np.load(label_path, allow_pickle=False) as payload:
+            values = np.asarray(payload["pose_y"], dtype=np.float64)
+        if values.ndim == 2:
+            values = values[None]
+        if grasp_index >= len(values):
+            missing.append(frame)
+            continue
+        value = np.asarray(values[grasp_index], dtype=np.float64)
+        matrix = np.eye(4, dtype=np.float64)
+        matrix[:3, :4] = value[:3, :4]
+        if np.isfinite(matrix).all():
+            poses[frame] = matrix
+        else:
+            missing.append(frame)
+    return poses, missing
+
+
+def pose_consensus_alignment(
+    filtered_rows: dict[str, np.ndarray],
+    gt_rows: dict[str, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    transforms = []
+    frames = []
+    for frame, gt_pose in gt_rows.items():
+        predicted = filtered_rows.get(frame)
+        if predicted is None:
+            continue
+        transforms.append(np.linalg.inv(gt_pose) @ predicted)
+        frames.append(frame)
+    if len(transforms) < 3:
+        raise RuntimeError("Need at least three shared GT/filtered pose frames")
+    transforms = np.stack(transforms)
+    rotation = Rotation.from_matrix(transforms[:, :3, :3]).mean().as_matrix()
+    translation = np.median(transforms[:, :3, 3], axis=0)
+
+    rotation_residual = np.asarray(
+        [
+            np.degrees(
+                np.linalg.norm(
+                    Rotation.from_matrix(rotation.T @ value[:3, :3]).as_rotvec()
+                )
+            )
+            for value in transforms
+        ]
+    )
+    translation_residual = (
+        np.linalg.norm(transforms[:, :3, 3] - translation, axis=1) * 1000.0
+    )
+    audit = {
+        "count": len(transforms),
+        "frames": frames,
+        "rotation_consensus_residual_deg": distribution(
+            rotation_residual.tolist()
+        ),
+        "translation_consensus_residual_mm": distribution(
+            translation_residual.tolist()
+        ),
+    }
+    return rotation, translation, audit
+
+
 def stream_id_from_path(path: Path) -> str:
     if len(path.parts) < 3:
         raise ValueError(f"Cannot derive stream ID from {path}")
@@ -251,6 +324,15 @@ def main() -> None:
 
     sam_mesh = load_mesh(sam_path)
     ycb_mesh = load_mesh(ycb_mesh_path)
+    foundationpose = json.loads(foundationpose_path.read_text(encoding="utf-8"))
+    initial_source_scale = float(
+        foundationpose.get(
+            "source_mesh_scale", foundationpose.get("final_global_scale", 1.0)
+        )
+    )
+    gt_ycb_poses, missing_frames = load_gt_ycb_poses(
+        sequence_dir, grasp_index
+    )
     rng = np.random.default_rng(args.seed)
     source = sample_surface(sam_mesh, args.samples, rng)
     target = sample_surface(ycb_mesh, args.samples, rng)
@@ -259,16 +341,19 @@ def main() -> None:
     initial_scale = float(target_radius / max(source_radius, 1e-12))
 
     candidates = []
-    rotations = orientation_candidates(source, target)[: args.max_candidates]
-    for index, initial_rotation in enumerate(rotations):
-        scale, rotation, translation = run_icp(
-            source,
-            target,
-            initial_rotation,
-            args.icp_iterations,
-            args.trim_fraction,
-            initial_scale,
+    consensus_audit = None
+    if args.alignment_mode == "pose_consensus":
+        if not args.filtered_object_json:
+            raise ValueError(
+                "--filtered-object-json is required for pose_consensus"
+            )
+        filtered_rows = load_pose_rows(
+            Path(args.filtered_object_json).expanduser().resolve()
         )
+        rotation, translation, consensus_audit = pose_consensus_alignment(
+            filtered_rows, gt_ycb_poses
+        )
+        scale = initial_source_scale
         score, metrics = alignment_score(
             source,
             target,
@@ -279,10 +364,35 @@ def main() -> None:
         )
         candidates.append((score, scale, rotation, translation, metrics))
         print(
-            f"candidate {index + 1:02d}/{len(rotations):02d} "
-            f"scale={scale:.6f} rmse={score * 1000.0:.3f}mm",
+            f"pose consensus scale={scale:.6f} "
+            f"surface_rmse={score * 1000.0:.3f}mm",
             flush=True,
         )
+    else:
+        rotations = orientation_candidates(source, target)[: args.max_candidates]
+        for index, initial_rotation in enumerate(rotations):
+            scale, rotation, translation = run_icp(
+                source,
+                target,
+                initial_rotation,
+                args.icp_iterations,
+                args.trim_fraction,
+                initial_scale,
+            )
+            score, metrics = alignment_score(
+                source,
+                target,
+                scale,
+                rotation,
+                translation,
+                args.trim_fraction,
+            )
+            candidates.append((score, scale, rotation, translation, metrics))
+            print(
+                f"candidate {index + 1:02d}/{len(rotations):02d} "
+                f"scale={scale:.6f} rmse={score * 1000.0:.3f}mm",
+                flush=True,
+            )
     candidates.sort(key=lambda row: row[0])
     score, scale, rotation, translation, metrics = candidates[0]
 
@@ -295,30 +405,11 @@ def main() -> None:
     )
     aligned_mesh.export(out_dir / "sam_mesh_aligned_to_ycb.obj")
 
-    foundationpose = json.loads(foundationpose_path.read_text(encoding="utf-8"))
-    initial_source_scale = float(
-        foundationpose.get(
-            "source_mesh_scale", foundationpose.get("final_global_scale", 1.0)
-        )
-    )
     sam_to_ycb = np.eye(4, dtype=np.float64)
     sam_to_ycb[:3, :3] = rotation
     sam_to_ycb[:3, 3] = translation
     gt_rows = {}
-    missing_frames = []
-    label_paths = sorted(sequence_dir.glob("labels_*.npz"))
-    for label_path in label_paths:
-        frame = label_path.stem.split("_")[-1].zfill(6)
-        with np.load(label_path, allow_pickle=False) as payload:
-            poses = np.asarray(payload["pose_y"], dtype=np.float64)
-        if poses.ndim == 2:
-            poses = poses[None]
-        if grasp_index >= len(poses):
-            missing_frames.append(frame)
-            continue
-        ycb_pose = np.asarray(poses[grasp_index], dtype=np.float64)
-        matrix = np.eye(4, dtype=np.float64)
-        matrix[:3, :4] = ycb_pose[:3, :4]
+    for frame, matrix in gt_ycb_poses.items():
         sam_pose = matrix @ sam_to_ycb
         gt_rows[frame] = {
             "frame": frame,
@@ -376,6 +467,8 @@ def main() -> None:
         "scale_ratio_to_foundationpose": scale / initial_source_scale,
         "sam_to_ycb_rigid": sam_to_ycb.tolist(),
         "surface_alignment": metrics,
+        "alignment_mode": args.alignment_mode,
+        "pose_consensus": consensus_audit,
         "num_gt_pose_frames": len(gt_rows),
         "missing_gt_pose_frames": missing_frames,
         "gt_pose_json": str(gt_json_path),
