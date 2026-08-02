@@ -8,12 +8,14 @@ import json
 import random
 from functools import lru_cache
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
 
 PALM = np.asarray([0, 5, 9, 13, 17], dtype=np.int64)
@@ -25,6 +27,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-windows", required=True)
     parser.add_argument("--global-train-root", required=True)
     parser.add_argument("--global-val-root", required=True)
+    parser.add_argument("--relative-train-root")
+    parser.add_argument("--relative-val-root")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -90,11 +94,18 @@ def decode_text(value: np.ndarray) -> str:
 
 
 class RelativeWindowDataset(Dataset):
-    def __init__(self, windows: Path, global_root: Path, args: argparse.Namespace):
+    def __init__(
+        self,
+        windows: Path,
+        global_root: Path,
+        args: argparse.Namespace,
+        relative_root: Optional[Path] = None,
+    ):
         self.rows = load_jsonl(windows)
         if not self.rows:
             raise RuntimeError(f"No windows in {windows}")
         self.global_root = global_root
+        self.relative_root = relative_root
         self.max_correction = args.max_correction_mm / 1000.0
         self.max_object_error = args.max_object_center_error_mm / 1000.0
         self.max_projection_shift = args.max_target_projection_shift_px
@@ -106,7 +117,25 @@ class RelativeWindowDataset(Dataset):
         row = self.rows[index]
         stream_id = row["stream_id"]
         start, end = int(row["start"]), int(row["end"])
-        rigid = load_npz(str(Path(row["supervision_npz"]).resolve()))
+        rigid_path = (
+            self.relative_root / f"{stream_id}.npz"
+            if self.relative_root is not None
+            else Path(row["supervision_npz"])
+        ).resolve()
+        rigid = load_npz(str(rigid_path))
+        required = {
+            "pred_hand_center",
+            "pred_object_center",
+            "gt_hand_center",
+            "gt_object_center",
+            "relative_supervision_valid",
+        }
+        missing = required.difference(rigid)
+        if missing:
+            raise KeyError(
+                f"{rigid_path} is not relative-translation supervision; "
+                f"missing {sorted(missing)}"
+            )
         global_path = self.global_root / f"{stream_id}.npz"
         global_data = load_npz(str(global_path.resolve()))
 
@@ -315,7 +344,7 @@ def summarize(values: list[torch.Tensor]) -> dict:
     }
 
 
-def run_epoch(model, loader, args, optimizer=None):
+def run_epoch(model, loader, args, optimizer=None, split="train"):
     training = optimizer is not None
     model.train(training)
     sums, batches = {}, 0
@@ -324,7 +353,8 @@ def run_epoch(model, loader, args, optimizer=None):
     binned_initial = {edge: [] for edge in bin_edges}
     binned_corrected = {edge: [] for edge in bin_edges}
     valid_frames = 0
-    for batch in loader:
+    progress = tqdm(loader, desc=split, dynamic_ncols=True)
+    for batch in progress:
         with torch.set_grad_enabled(training):
             total, losses, values, corrected = compute_loss(model, batch, args)
             if training:
@@ -363,6 +393,7 @@ def run_epoch(model, loader, args, optimizer=None):
         for key, value in {"total": total, **losses}.items():
             sums[key] = sums.get(key, 0.0) + float(value.detach())
         batches += 1
+        progress.set_postfix(loss=f"{sums['total'] / batches:.5f}")
     metrics = {key: value / max(batches, 1) for key, value in sums.items()}
     metrics["valid_frames"] = valid_frames
     metrics["initial_relative"] = summarize(initial_errors)
@@ -386,11 +417,21 @@ def main() -> None:
         Path(args.train_windows).expanduser().resolve(),
         Path(args.global_train_root).expanduser().resolve(),
         args,
+        (
+            Path(args.relative_train_root).expanduser().resolve()
+            if args.relative_train_root
+            else None
+        ),
     )
     val_data = RelativeWindowDataset(
         Path(args.val_windows).expanduser().resolve(),
         Path(args.global_val_root).expanduser().resolve(),
         args,
+        (
+            Path(args.relative_val_root).expanduser().resolve()
+            if args.relative_val_root
+            else None
+        ),
     )
     train_loader = DataLoader(
         train_data,
@@ -422,9 +463,9 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     history, best = [], float("inf")
     for epoch in range(1, args.epochs + 1):
-        train_metrics = run_epoch(model, train_loader, args, optimizer)
+        train_metrics = run_epoch(model, train_loader, args, optimizer, "train")
         with torch.no_grad():
-            val_metrics = run_epoch(model, val_loader, args)
+            val_metrics = run_epoch(model, val_loader, args, split="val")
         scheduler.step()
         row = {
             "epoch": epoch,
