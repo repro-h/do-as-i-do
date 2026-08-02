@@ -79,6 +79,37 @@ def point_errors(left: np.ndarray, right: np.ndarray) -> tuple[float, float]:
     return float(distances[0]), float(np.median(distances[PALM]))
 
 
+def decompose_palm_error(prediction: np.ndarray, target: np.ndarray) -> dict:
+    pred_palm = prediction[PALM]
+    target_palm = target[PALM]
+    translation = target_palm.mean(axis=0) - pred_palm.mean(axis=0)
+    translated = pred_palm + translation
+    translation_residual = np.median(
+        np.linalg.norm(translated - target_palm, axis=-1)
+    ) * 1000.0
+
+    pred_centered = pred_palm - pred_palm.mean(axis=0)
+    target_centered = target_palm - target_palm.mean(axis=0)
+    left, _, right_t = np.linalg.svd(pred_centered.T @ target_centered)
+    rotation = left @ right_t
+    if np.linalg.det(rotation) < 0.0:
+        left[:, -1] *= -1.0
+        rotation = left @ right_t
+    rigid = pred_centered @ rotation + target_palm.mean(axis=0)
+    rigid_residual = np.median(
+        np.linalg.norm(rigid - target_palm, axis=-1)
+    ) * 1000.0
+    rotation_deg = float(np.degrees(np.linalg.norm(
+        Rotation.from_matrix(rotation.T).as_rotvec()
+    )))
+    return {
+        "global_translation_mm": float(np.linalg.norm(translation) * 1000.0),
+        "translation_aligned_residual_mm": float(translation_residual),
+        "rigid_rotation_deg": rotation_deg,
+        "rigid_aligned_residual_mm": float(rigid_residual),
+    }
+
+
 def main() -> None:
     args = parse_args()
     prediction_path = Path(args.prediction_npz).expanduser().resolve()
@@ -152,6 +183,9 @@ def main() -> None:
         raw_hand_wrist, raw_hand_palm = point_errors(
             handflow[index], target_hand
         )
+        hand_decomposition = decompose_palm_error(
+            corrected_hand[index], gt_hand[index]
+        )
         translation_error = float(
             np.linalg.norm(current_pose[:3, 3] - gt_pose[:3, 3]) * 1000.0
         )
@@ -187,6 +221,7 @@ def main() -> None:
             "v8_relative_palm_error_mm": hand_palm,
             "raw_relative_wrist_error_mm": raw_hand_wrist,
             "raw_relative_palm_error_mm": raw_hand_palm,
+            **hand_decomposition,
         })
 
     def values(key: str) -> np.ndarray:
@@ -229,6 +264,18 @@ def main() -> None:
         "raw_relative_palm_error": distribution(
             values("raw_relative_palm_error_mm")
         ),
+        "hand_global_translation": distribution(
+            values("global_translation_mm")
+        ),
+        "hand_translation_aligned_residual": distribution(
+            values("translation_aligned_residual_mm")
+        ),
+        "hand_rigid_rotation_deg": distribution(
+            values("rigid_rotation_deg"), "deg"
+        ),
+        "hand_rigid_aligned_residual": distribution(
+            values("rigid_aligned_residual_mm")
+        ),
         "worst_object_frames": sorted(
             rows,
             key=lambda row: row["object_induced_palm_shift_mm"],
@@ -255,6 +302,10 @@ def main() -> None:
         "translation_only_v8_relative_palm_error",
         "v8_relative_palm_error",
         "raw_relative_palm_error",
+        "hand_global_translation",
+        "hand_translation_aligned_residual",
+        "hand_rigid_rotation_deg",
+        "hand_rigid_aligned_residual",
     ):
         print(key, summary[key])
 
