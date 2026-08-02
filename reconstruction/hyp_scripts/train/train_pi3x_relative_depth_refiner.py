@@ -85,6 +85,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--error-weight-reference-mm", type=float, default=20.0)
     parser.add_argument("--error-weight-min", type=float, default=0.5)
     parser.add_argument("--error-weight-max", type=float, default=2.0)
+    parser.add_argument(
+        "--mirror-left-token-indices",
+        action="store_true",
+        help=(
+            "Mirror Pi3X patch x coordinates for left-hand streams after "
+            "their supervision is normalized into the mirrored camera frame."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--wandb", action="store_true")
@@ -114,12 +122,14 @@ class Pi3XWindowDataset(Dataset):
         windows: Path,
         pi3x_root: Path,
         max_target_m: float,
+        mirror_left_token_indices: bool = False,
     ):
         self.rows = load_jsonl(windows)
         if not self.rows:
             raise RuntimeError(f"No windows in {windows}")
         self.pi3x_root = pi3x_root
         self.max_target_m = max_target_m
+        self.mirror_left_token_indices = mirror_left_token_indices
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -311,6 +321,9 @@ class Pi3XWindowDataset(Dataset):
             grid = np.asarray(
                 pi3x["geometry_feature_grid_hw"], dtype=np.float32
             )
+            if mirrored and self.mirror_left_token_indices:
+                indices = indices.copy()
+                indices[..., 1] = (float(grid[1]) - 1.0) - indices[..., 1]
             indices[..., 0] /= max(float(grid[0] - 1), 1.0)
             indices[..., 1] /= max(float(grid[1] - 1), 1.0)
             metadata = np.concatenate(
@@ -855,11 +868,13 @@ def main() -> None:
         Path(args.train_windows).expanduser().resolve(),
         Path(args.pi3x_train_root).expanduser().resolve(),
         args.max_target_mm / 1000.0,
+        args.mirror_left_token_indices,
     )
     val_dataset = Pi3XWindowDataset(
         Path(args.val_windows).expanduser().resolve(),
         Path(args.pi3x_val_root).expanduser().resolve(),
         args.max_target_mm / 1000.0,
+        args.mirror_left_token_indices,
     )
     train_loader = DataLoader(
         train_dataset,

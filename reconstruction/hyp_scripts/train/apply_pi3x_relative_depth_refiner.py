@@ -48,6 +48,7 @@ def main() -> None:
         windows_path,
         Path(args.pi3x_root).expanduser().resolve(),
         float(config["max_target_mm"]) / 1000.0,
+        bool(config.get("mirror_left_token_indices", False)),
     )
     loader = DataLoader(
         dataset,
