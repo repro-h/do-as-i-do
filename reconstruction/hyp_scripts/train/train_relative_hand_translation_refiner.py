@@ -122,9 +122,13 @@ class RelativeWindowDataset(Dataset):
         object_rot6d = np.asarray(
             rigid["pred_object_rot6d"], dtype=np.float32
         )[start:end]
-        valid = np.asarray(
+        loss_valid = np.asarray(
             rigid["relative_supervision_valid"], dtype=bool
         )[start:end]
+        observed_valid = (
+            np.asarray(rigid["pred_hand_valid"], dtype=bool)[start:end]
+            & np.asarray(rigid["pred_object_valid"], dtype=bool)[start:end]
+        )
         intrinsics = np.asarray(rigid["intrinsics"], dtype=np.float32)
 
         joints = np.asarray(
@@ -145,7 +149,8 @@ class RelativeWindowDataset(Dataset):
         finite = np.logical_and.reduce(
             [np.isfinite(value).all(axis=tuple(range(1, value.ndim))) for value in arrays]
         )
-        valid &= finite
+        loss_valid &= finite
+        observed_valid &= finite
 
         relative_initial = pred_hand - pred_object
         relative_target = gt_hand - gt_object
@@ -155,9 +160,9 @@ class RelativeWindowDataset(Dataset):
         projection_shift = np.linalg.norm(
             project(target_hand, intrinsics) - project(gt_hand, intrinsics), axis=-1
         )
-        valid &= np.linalg.norm(target_delta, axis=-1) <= self.max_correction
-        valid &= np.linalg.norm(object_delta, axis=-1) <= self.max_object_error
-        valid &= projection_shift <= self.max_projection_shift
+        loss_valid &= np.linalg.norm(target_delta, axis=-1) <= self.max_correction
+        loss_valid &= np.linalg.norm(object_delta, axis=-1) <= self.max_object_error
+        loss_valid &= projection_shift <= self.max_projection_shift
 
         joints = np.nan_to_num(joints)
         pred_hand = np.nan_to_num(pred_hand)
@@ -184,7 +189,7 @@ class RelativeWindowDataset(Dataset):
                 object_rot6d,
                 np.broadcast_to(extents, (len(joints), 3)),
                 np.broadcast_to(side_feature, (len(joints), 2)),
-                valid[:, None].astype(np.float32),
+                observed_valid[:, None].astype(np.float32),
             ],
             axis=-1,
         ).astype(np.float32)
@@ -192,7 +197,7 @@ class RelativeWindowDataset(Dataset):
             "features": torch.from_numpy(features),
             "relative_initial": torch.from_numpy(relative_initial),
             "relative_target": torch.from_numpy(relative_target),
-            "valid": torch.from_numpy(valid),
+            "valid": torch.from_numpy(loss_valid),
         }
 
 
