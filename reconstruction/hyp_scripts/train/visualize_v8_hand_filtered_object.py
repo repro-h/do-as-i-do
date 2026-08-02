@@ -17,6 +17,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sequence-dir", required=True)
     parser.add_argument(
+        "--object-pose-json",
+        default=None,
+        help=(
+            "Optional object pose JSON override. The JSON must express the "
+            "SAM3D mesh pose in camera coordinates, for example the "
+            "DexYCB GT pose converted into the SAM canonical frame."
+        ),
+    )
+    parser.add_argument(
         "--viewer-python",
         default=os.environ.get(
             "VIS_PYTHON",
@@ -74,6 +83,11 @@ def main() -> None:
         / stream_id
         / "segmented_ekf_rts/foundationpose_segmented_ekf_rts.json"
     )
+    object_pose_json = (
+        Path(args.object_pose_json).expanduser().resolve()
+        if args.object_pose_json
+        else filtered_object
+    )
     output_root = (
         stage_root / "visualization/pi3x_ray_depth_only_full_v1_val"
     )
@@ -82,7 +96,7 @@ def main() -> None:
         / stream_id
         / "handflow_camera_result_pi3x_depth_refined.npz"
     )
-    for path in (manifest, filtered_object, prediction):
+    for path in (manifest, object_pose_json, prediction):
         if not path.is_file():
             raise FileNotFoundError(path)
 
@@ -134,7 +148,7 @@ def main() -> None:
         "--stream-id",
         stream_id,
         "--foundationpose-json",
-        str(filtered_object),
+        str(object_pose_json),
         "--prepare-only",
     ]
     if args.force_prepare:
@@ -202,6 +216,7 @@ def main() -> None:
     print(f"Stream: {stream_id}")
     print(f"Objective: {objective}")
     print(f"Checkpoint: {checkpoint}")
+    print(f"Object pose: {object_pose_json}")
     print(f"Viewer: http://localhost:{args.port}")
     print("Press Ctrl+C to stop.", flush=True)
     subprocess.run(viewer_command, check=True)
