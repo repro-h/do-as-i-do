@@ -25,6 +25,7 @@ RELATIVE_POSITION_SCALE_M = 0.3
 VELOCITY_SCALE_M_PER_FRAME = 0.05
 ACCELERATION_SCALE_M_PER_FRAME2 = 0.05
 OBJECT_EXTENT_SCALE_M = 0.2
+MIRROR_X = np.diag([-1.0, 1.0, 1.0]).astype(np.float32)
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,11 +51,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smooth-l1-beta-mm", type=float, default=5.0)
     parser.add_argument(
         "--objective",
-        choices=("full", "ray_depth_only"),
+        choices=("full", "ray_depth_only", "ray_depth_guarded"),
         default="full",
         help=(
             "Training objective. ray_depth_only supervises only the final "
-            "camera-ray depth and its temporal derivatives."
+            "camera-ray depth and its temporal derivatives; "
+            "ray_depth_guarded adds direct no-regression, direction, "
+            "overshoot, and near-zero penalties."
         ),
     )
     parser.add_argument(
@@ -69,6 +72,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-velocity", type=float, default=0.5)
     parser.add_argument("--w-acceleration", type=float, default=1.0)
     parser.add_argument("--w-residual", type=float, default=0.05)
+    parser.add_argument("--guard-anchor-mm", type=float, default=5.0)
+    parser.add_argument("--guard-sign-min-mm", type=float, default=5.0)
+    parser.add_argument("--guard-overshoot-margin-mm", type=float, default=3.0)
+    parser.add_argument("--w-degradation-guard", type=float, default=0.5)
+    parser.add_argument("--w-direction", type=float, default=0.2)
+    parser.add_argument("--w-overshoot", type=float, default=0.2)
+    parser.add_argument("--w-near-zero-anchor", type=float, default=1.0)
     parser.add_argument("--accurate-anchor-mm", type=float, default=15.0)
     parser.add_argument("--w-accurate-anchor", type=float, default=1.0)
     parser.add_argument("--anomaly-zero-mm", type=float, default=3.0)
@@ -91,6 +101,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Mirror Pi3X patch x coordinates for left-hand streams after "
             "their supervision is normalized into the mirrored camera frame."
+        ),
+    )
+    parser.add_argument(
+        "--left-coordinate-mode",
+        choices=("normalized", "original"),
+        default="normalized",
+        help=(
+            "Coordinate frame used for left-hand streams. original restores "
+            "the supervision to the unmirrored camera frame so it matches "
+            "the original Pi3X cache."
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -123,6 +143,7 @@ class Pi3XWindowDataset(Dataset):
         pi3x_root: Path,
         max_target_m: float,
         mirror_left_token_indices: bool = False,
+        left_coordinate_mode: str = "normalized",
     ):
         self.rows = load_jsonl(windows)
         if not self.rows:
@@ -130,6 +151,7 @@ class Pi3XWindowDataset(Dataset):
         self.pi3x_root = pi3x_root
         self.max_target_m = max_target_m
         self.mirror_left_token_indices = mirror_left_token_indices
+        self.left_coordinate_mode = left_coordinate_mode
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -173,6 +195,29 @@ class Pi3XWindowDataset(Dataset):
         object_pose = np.asarray(
             supervision["object_pose"][start:end], dtype=np.float32
         )
+        intrinsics = np.asarray(
+            supervision["intrinsics"], dtype=np.float32
+        ).copy()
+        normalized_left = bool(
+            np.asarray(supervision["normalized_left"]).item()
+        )
+        if normalized_left and self.left_coordinate_mode == "original":
+            pred = pred.copy()
+            gt3d = gt3d.copy()
+            gt2d = gt2d.copy()
+            object_pose = object_pose.copy()
+            pred[..., 0] *= -1.0
+            gt3d[..., 0] *= -1.0
+            width = int(np.asarray(pi3x["original_wh"])[0])
+            gt2d[..., 0] = (width - 1) - gt2d[..., 0]
+            intrinsics[0, 2] = (width - 1) - intrinsics[0, 2]
+            object_pose[:, :3, :3] = np.einsum(
+                "ij,tjk,kl->til",
+                MIRROR_X,
+                object_pose[:, :3, :3],
+                MIRROR_X,
+            )
+            object_pose[:, 0, 3] *= -1.0
         valid = np.asarray(
             supervision["supervision_valid"][start:end]
         ).astype(bool)
@@ -298,7 +343,7 @@ class Pi3XWindowDataset(Dataset):
         ).astype(np.float32)
 
         token_features, token_metadata, token_valid, token_types = [], [], [], []
-        mirrored = bool(np.asarray(supervision["normalized_left"]).item())
+        mirrored = normalized_left and self.left_coordinate_mode == "normalized"
         for type_index, prefix in enumerate(TOKEN_GROUPS):
             feature = np.asarray(
                 pi3x[f"{prefix}_features"][positions], dtype=np.float32
@@ -364,7 +409,7 @@ class Pi3XWindowDataset(Dataset):
             "gt_joints": torch.from_numpy(gt3d),
             "gt_joints_2d": torch.from_numpy(gt2d),
             "intrinsics": torch.from_numpy(
-                np.asarray(supervision["intrinsics"], dtype=np.float32)
+                intrinsics
             ),
             "valid": torch.from_numpy(valid),
             "stream_id": row["stream_id"],
@@ -642,14 +687,24 @@ def compute(model, batch, args):
     camera_ray = F.normalize(pred[:, :, 0], dim=-1, eps=1e-8)
     target_translation = gt[:, :, 0] - pred[:, :, 0]
     target_depth = torch.sum(target_translation * camera_ray, dim=-1)
-    if args.objective == "ray_depth_only":
+    if args.objective in ("ray_depth_only", "ray_depth_guarded"):
         mse_scale = args.depth_mse_scale_mm / 1000.0
         if mse_scale <= 0.0:
             raise ValueError("--depth-mse-scale-mm must be positive")
-        losses = {
-            "depth": normalized_mse(
+        if args.objective == "ray_depth_only":
+            depth_loss = normalized_mse(
                 ray_depth, target_depth, valid, mse_scale
-            ),
+            )
+        else:
+            beta = args.smooth_l1_beta_mm / args.depth_mse_scale_mm
+            depth_loss = smooth_l1(
+                ray_depth / mse_scale,
+                target_depth / mse_scale,
+                valid,
+                beta,
+            )
+        losses = {
+            "depth": depth_loss,
             "velocity": temporal_mse(
                 ray_depth, target_depth, valid, 1, mse_scale
             ),
@@ -662,6 +717,44 @@ def compute(model, batch, args):
             + args.w_velocity * losses["velocity"]
             + args.w_acceleration * losses["acceleration"]
         )
+        if args.objective == "ray_depth_guarded":
+            corrected_error = torch.abs(target_depth - ray_depth)
+            initial_error = torch.abs(target_depth)
+            degradation = F.relu(corrected_error - initial_error)
+            losses["degradation_guard"] = masked_mean(
+                (degradation / mse_scale).square(), valid
+            )
+
+            direction_valid = valid & (
+                initial_error >= args.guard_sign_min_mm / 1000.0
+            )
+            wrong_direction = F.relu(-ray_depth * target_depth)
+            losses["direction"] = masked_mean(
+                wrong_direction / (mse_scale * mse_scale), direction_valid
+            )
+
+            overshoot_margin = args.guard_overshoot_margin_mm / 1000.0
+            overshoot = F.relu(
+                torch.abs(ray_depth) - initial_error - overshoot_margin
+            )
+            losses["overshoot"] = masked_mean(
+                (overshoot / mse_scale).square(), valid
+            )
+
+            near_zero = valid & (
+                initial_error < args.guard_anchor_mm / 1000.0
+            )
+            losses["near_zero_anchor"] = masked_mean(
+                (ray_depth / mse_scale).square(), near_zero
+            )
+            total = (
+                total
+                + args.w_degradation_guard
+                * losses["degradation_guard"]
+                + args.w_direction * losses["direction"]
+                + args.w_overshoot * losses["overshoot"]
+                + args.w_near_zero_anchor * losses["near_zero_anchor"]
+            )
         translation = ray_depth.unsqueeze(-1) * camera_ray
         corrected = pred + translation[:, :, None]
         before = torch.linalg.norm(pred[:, :, 0] - gt[:, :, 0], dim=-1)
@@ -869,12 +962,14 @@ def main() -> None:
         Path(args.pi3x_train_root).expanduser().resolve(),
         args.max_target_mm / 1000.0,
         args.mirror_left_token_indices,
+        args.left_coordinate_mode,
     )
     val_dataset = Pi3XWindowDataset(
         Path(args.val_windows).expanduser().resolve(),
         Path(args.pi3x_val_root).expanduser().resolve(),
         args.max_target_mm / 1000.0,
         args.mirror_left_token_indices,
+        args.left_coordinate_mode,
     )
     train_loader = DataLoader(
         train_dataset,
@@ -961,9 +1056,13 @@ def main() -> None:
             "metadata_dim": metadata_dim,
             "motion_dim": motion_dim,
             "scalar_feature_version": (
-                "v8_ray_depth_only"
-                if args.objective == "ray_depth_only"
-                else "v7_thresholded_recurrent_carry"
+                "v9_ray_depth_guarded"
+                if args.objective == "ray_depth_guarded"
+                else (
+                    "v8_ray_depth_only"
+                    if args.objective == "ray_depth_only"
+                    else "v7_thresholded_recurrent_carry"
+                )
             ),
             "scalar_feature_scales": {
                 "camera_position_m": CAMERA_POSITION_SCALE_M,
