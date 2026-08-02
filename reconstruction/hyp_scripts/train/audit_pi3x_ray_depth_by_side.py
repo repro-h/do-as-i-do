@@ -45,6 +45,8 @@ def main() -> None:
             "after": [],
             "ray_before": [],
             "ray_after": [],
+            "target": [],
+            "prediction": [],
             "improved": 0,
             "degraded": 0,
             "wrong_sign": 0,
@@ -105,6 +107,8 @@ def main() -> None:
         group["after"].append(after[indices])
         group["ray_before"].append(ray_before[indices])
         group["ray_after"].append(ray_after[indices])
+        group["target"].append(target[indices] * 1000.0)
+        group["prediction"].append(depth[indices] * 1000.0)
         group["improved"] += int(np.sum(after[indices] < before[indices]))
         group["degraded"] += int(np.sum(after[indices] > before[indices]))
         group["wrong_sign"] += int(np.sum(wrong_sign[indices]))
@@ -131,6 +135,36 @@ def main() -> None:
     sides = {}
     for side, group in grouped.items():
         valid = max(group["valid"], 1)
+        target = np.concatenate(group["target"]).astype(np.float64)
+        prediction = np.concatenate(group["prediction"]).astype(np.float64)
+        absolute_target = np.abs(target)
+        bins = {}
+        for name, lower, upper in (
+            ("0_5", 0.0, 5.0),
+            ("5_15", 5.0, 15.0),
+            ("15_30", 15.0, 30.0),
+            ("30_inf", 30.0, np.inf),
+        ):
+            mask = (absolute_target >= lower) & (absolute_target < upper)
+            count = int(mask.sum())
+            if not count:
+                bins[name] = {"count": 0}
+                continue
+            remaining = np.abs(target[mask] - prediction[mask])
+            bins[name] = {
+                "count": count,
+                "target_median_mm": float(np.median(absolute_target[mask])),
+                "remaining_median_mm": float(np.median(remaining)),
+                "improved_fraction": float(
+                    np.mean(remaining < absolute_target[mask])
+                ),
+                "degraded_fraction": float(
+                    np.mean(remaining > absolute_target[mask])
+                ),
+                "wrong_sign_fraction": float(
+                    np.mean(target[mask] * prediction[mask] < 0.0)
+                ),
+            }
         sides[side] = {
             "num_streams": group["streams"],
             "num_valid_frames": group["valid"],
@@ -141,6 +175,7 @@ def main() -> None:
             "improved_fraction": group["improved"] / valid,
             "degraded_fraction": group["degraded"] / valid,
             "wrong_sign_fraction": group["wrong_sign"] / valid,
+            "by_abs_target_mm": bins,
         }
     worst = sorted(
         stream_rows,
