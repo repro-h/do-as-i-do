@@ -158,6 +158,7 @@ def main() -> None:
     out_root = Path(args.out_root).expanduser().resolve()
     handflow_root = Path(args.handflow_root).expanduser().resolve()
     aggregate = defaultdict(list)
+    aggregate_counts = defaultdict(int)
     stream_rows = []
     for stream_id, values in sorted(sums.items()):
         stream_out = out_root / stream_id
@@ -192,6 +193,12 @@ def main() -> None:
         )
         aggregate["initial_relative"].append(initial_error)
         aggregate["corrected_relative"].append(corrected_error)
+        correction_magnitude = np.linalg.norm(correction[evaluate], axis=-1)
+        aggregate["correction_magnitude"].append(correction_magnitude)
+        improved = corrected_error < initial_error
+        aggregate_counts["evaluated"] += int(len(initial_error))
+        aggregate_counts["improved"] += int(improved.sum())
+        aggregate_counts["degraded"] += int((corrected_error > initial_error).sum())
 
         handflow_path = handflow_root / stream_id / "handflow_camera_result.npz"
         with np.load(handflow_path, allow_pickle=False) as archive:
@@ -212,9 +219,15 @@ def main() -> None:
         metrics = {
             "initial_relative": distribution([initial_error]),
             "corrected_relative": distribution([corrected_error]),
+            "correction_magnitude": distribution([correction_magnitude]),
             "num_frames": count,
             "num_predicted": int(observed[:count].sum()),
             "num_evaluated": int(evaluate[:count].sum()),
+            "num_improved": int(improved.sum()),
+            "num_degraded": int((corrected_error > initial_error).sum()),
+            "degraded_fraction": float(
+                (corrected_error > initial_error).mean()
+            ) if len(corrected_error) else None,
         }
         (stream_out / "metrics.json").write_text(
             json.dumps(metrics, indent=2), encoding="utf-8"
@@ -232,6 +245,14 @@ def main() -> None:
         "num_streams": len(stream_rows),
         "aggregate_metrics": {
             key: distribution(value) for key, value in sorted(aggregate.items())
+        },
+        "aggregate_counts": {
+            **aggregate_counts,
+            "degraded_fraction": (
+                aggregate_counts["degraded"] / aggregate_counts["evaluated"]
+                if aggregate_counts["evaluated"]
+                else None
+            ),
         },
         "streams": stream_rows,
     }
