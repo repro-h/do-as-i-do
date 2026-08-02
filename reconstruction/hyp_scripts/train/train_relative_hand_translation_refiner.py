@@ -42,6 +42,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-velocity", type=float, default=0.1)
     parser.add_argument("--w-acceleration", type=float, default=0.05)
     parser.add_argument("--w-residual", type=float, default=0.001)
+    parser.add_argument("--target-weight-lt5", type=float, default=1.0)
+    parser.add_argument("--target-weight-5-15", type=float, default=1.0)
+    parser.add_argument("--target-weight-15-30", type=float, default=1.0)
+    parser.add_argument("--target-weight-ge30", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     return parser.parse_args()
@@ -198,6 +202,9 @@ class RelativeWindowDataset(Dataset):
             "relative_initial": torch.from_numpy(relative_initial),
             "relative_target": torch.from_numpy(relative_target),
             "valid": torch.from_numpy(loss_valid),
+            "target_magnitude": torch.from_numpy(
+                np.linalg.norm(target_delta, axis=-1).astype(np.float32)
+            ),
         }
 
 
@@ -233,9 +240,11 @@ class RelativeTranslationRefiner(nn.Module):
         return torch.tanh(self.head(temporal)) * max_correction
 
 
-def masked_smooth_l1(value, target, mask, beta):
+def masked_smooth_l1(value, target, mask, beta, sample_weight=None):
     error = F.smooth_l1_loss(value, target, reduction="none", beta=beta).mean(-1)
     weight = mask.float()
+    if sample_weight is not None:
+        weight = weight * sample_weight
     return (error * weight).sum() / weight.sum().clamp_min(1.0)
 
 
@@ -252,9 +261,27 @@ def compute_loss(model, batch, args):
     correction = model(batch["features"], args.max_correction_mm / 1000.0)
     corrected = batch["relative_initial"] + correction
     beta = args.smooth_l1_beta_mm / 1000.0
+    magnitude_mm = batch["target_magnitude"] * 1000.0
+    target_weight = torch.where(
+        magnitude_mm < 5.0,
+        torch.full_like(magnitude_mm, args.target_weight_lt5),
+        torch.where(
+            magnitude_mm < 15.0,
+            torch.full_like(magnitude_mm, args.target_weight_5_15),
+            torch.where(
+                magnitude_mm < 30.0,
+                torch.full_like(magnitude_mm, args.target_weight_15_30),
+                torch.full_like(magnitude_mm, args.target_weight_ge30),
+            ),
+        ),
+    )
     losses = {
         "relative": masked_smooth_l1(
-            corrected, batch["relative_target"], batch["valid"], beta
+            corrected,
+            batch["relative_target"],
+            batch["valid"],
+            beta,
+            target_weight,
         ),
         "velocity": temporal_loss(
             corrected, batch["relative_target"], batch["valid"], 1, beta
@@ -293,6 +320,9 @@ def run_epoch(model, loader, args, optimizer=None):
     model.train(training)
     sums, batches = {}, 0
     initial_errors, corrected_errors = [], []
+    bin_edges = ((0.0, 5.0), (5.0, 15.0), (15.0, 30.0), (30.0, float("inf")))
+    binned_initial = {edge: [] for edge in bin_edges}
+    binned_corrected = {edge: [] for edge in bin_edges}
     valid_frames = 0
     for batch in loader:
         with torch.set_grad_enabled(training):
@@ -315,6 +345,21 @@ def run_epoch(model, loader, args, optimizer=None):
                 corrected[mask] - values["relative_target"][mask], dim=-1
             ).detach().cpu()
         )
+        initial_error = torch.linalg.norm(
+            values["relative_initial"] - values["relative_target"], dim=-1
+        )
+        corrected_error = torch.linalg.norm(
+            corrected - values["relative_target"], dim=-1
+        )
+        magnitude_mm = values["target_magnitude"] * 1000.0
+        for lower, upper in bin_edges:
+            bin_mask = mask & (magnitude_mm >= lower) & (magnitude_mm < upper)
+            binned_initial[(lower, upper)].append(
+                initial_error[bin_mask].detach().cpu()
+            )
+            binned_corrected[(lower, upper)].append(
+                corrected_error[bin_mask].detach().cpu()
+            )
         for key, value in {"total": total, **losses}.items():
             sums[key] = sums.get(key, 0.0) + float(value.detach())
         batches += 1
@@ -322,6 +367,13 @@ def run_epoch(model, loader, args, optimizer=None):
     metrics["valid_frames"] = valid_frames
     metrics["initial_relative"] = summarize(initial_errors)
     metrics["corrected_relative"] = summarize(corrected_errors)
+    metrics["target_bins"] = {}
+    for lower, upper in bin_edges:
+        label = f"{int(lower)}_{'inf' if not np.isfinite(upper) else int(upper)}mm"
+        metrics["target_bins"][label] = {
+            "initial": summarize(binned_initial[(lower, upper)]),
+            "corrected": summarize(binned_corrected[(lower, upper)]),
+        }
     return metrics
 
 
@@ -388,7 +440,7 @@ def main() -> None:
             "input_dim": input_dim,
             "epoch": epoch,
             "val_total": val_metrics["total"],
-            "model_version": "relative_translation_mlp_bigru_v1",
+            "model_version": "relative_translation_mlp_bigru_weighted_v2",
         }
         torch.save(checkpoint, out_dir / "last.pt")
         if val_metrics["total"] < best:
