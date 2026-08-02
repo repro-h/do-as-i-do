@@ -43,6 +43,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-target-hand-mm", type=float, default=120.0)
     parser.add_argument("--max-target-object-mm", type=float, default=100.0)
     parser.add_argument("--max-target-relative-mm", type=float, default=150.0)
+    parser.add_argument(
+        "--max-object-center-error-mm",
+        type=float,
+        default=1.0e9,
+        help="Reject relative labels whose filtered-vs-GT object centers differ more.",
+    )
+    parser.add_argument(
+        "--max-target-projection-shift-px",
+        type=float,
+        default=1.0e9,
+        help="Reject transported hand targets that move too far from GT in the image.",
+    )
     parser.add_argument("--smooth-l1-beta-mm", type=float, default=10.0)
     parser.add_argument("--delta-smooth-beta-mm", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
@@ -74,6 +86,8 @@ class WindowDataset(Dataset):
         max_target_hand_m: float,
         max_target_object_m: float,
         max_target_relative_m: float,
+        max_object_center_error_m: float,
+        max_target_projection_shift_px: float,
     ):
         self.rows = load_jsonl(path)
         if not self.rows:
@@ -81,6 +95,8 @@ class WindowDataset(Dataset):
         self.max_target_hand_m = max_target_hand_m
         self.max_target_object_m = max_target_object_m
         self.max_target_relative_m = max_target_relative_m
+        self.max_object_center_error_m = max_object_center_error_m
+        self.max_target_projection_shift_px = max_target_projection_shift_px
 
     def __len__(self):
         return len(self.rows)
@@ -119,6 +135,17 @@ class WindowDataset(Dataset):
         relative_mask &= hand_mask & object_mask
         relative_mask &= (
             np.linalg.norm(relative_delta, axis=-1) <= self.max_target_relative_m
+        )
+        relative_mask &= (
+            np.linalg.norm(object_delta, axis=-1)
+            <= self.max_object_center_error_m
+        )
+        target_hand = gt_hand_safe - object_delta
+        target_uv = project_points_numpy(target_hand, intrinsics)
+        gt_hand_uv = project_points_numpy(gt_hand_safe, intrinsics)
+        projection_shift = np.linalg.norm(target_uv - gt_hand_uv, axis=-1)
+        relative_mask &= (
+            projection_shift <= self.max_target_projection_shift_px
         )
         rot_safe = np.nan_to_num(rot6d)
         hand_velocity = np.zeros_like(hand_safe)
@@ -239,6 +266,17 @@ def project_points(points, intrinsics):
     return torch.stack((fx * x + cx, fy * y + cy), dim=-1)
 
 
+def project_points_numpy(points: np.ndarray, intrinsics: np.ndarray) -> np.ndarray:
+    z = np.maximum(points[..., 2], 1e-4)
+    return np.stack(
+        (
+            intrinsics[0, 0] * points[..., 0] / z + intrinsics[0, 2],
+            intrinsics[1, 1] * points[..., 1] / z + intrinsics[1, 2],
+        ),
+        axis=-1,
+    )
+
+
 def compute_loss(model, batch, args):
     batch = {key: value.to(args.device) for key, value in batch.items()}
     beta = args.smooth_l1_beta_mm / 1000.0
@@ -342,8 +380,8 @@ def compute_loss(model, batch, args):
             args.w_hand * losses["hand"]
             + args.w_relative * losses["relative"]
             + args.w_projection * losses["hand_projection"]
-            + args.w_velocity * losses["hand_velocity"]
-            + args.w_acceleration * losses["hand_acceleration"]
+            + args.w_velocity * losses["velocity"]
+            + args.w_acceleration * losses["acceleration"]
             + args.w_delta_velocity * losses["hand_delta_velocity"]
             + args.w_delta_acceleration * losses["hand_delta_acceleration"]
             + args.w_residual * losses["residual"]
@@ -455,6 +493,8 @@ def main() -> None:
         args.max_target_hand_mm / 1000.0,
         args.max_target_object_mm / 1000.0,
         args.max_target_relative_mm / 1000.0,
+        args.max_object_center_error_mm / 1000.0,
+        args.max_target_projection_shift_px,
     )
     train_data = WindowDataset(
         Path(args.train_windows).expanduser().resolve(), *dataset_args
