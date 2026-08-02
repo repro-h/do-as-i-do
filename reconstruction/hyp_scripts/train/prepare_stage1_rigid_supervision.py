@@ -327,11 +327,15 @@ def main() -> None:
             with np.load(out_path, allow_pickle=False) as raw:
                 hand_valid = np.asarray(raw["hand_supervision_valid"]).astype(bool)
                 object_valid = np.asarray(raw["object_supervision_valid"]).astype(bool)
-            for start in range(
-                0,
-                max(0, metrics["num_frames"] - args.window_size + 1),
-                args.window_stride,
-            ):
+            max_start = metrics["num_frames"] - args.window_size
+            starts = (
+                list(range(0, max_start + 1, args.window_stride))
+                if max_start >= 0
+                else []
+            )
+            if starts and starts[-1] != max_start:
+                starts.append(max_start)
+            for start in starts:
                 end = start + args.window_size
                 if object_valid[start:end].all() and (
                     hand_valid[start:end].sum() >= args.min_valid_hand_frames
