@@ -21,6 +21,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--handflow-root", required=True)
+    parser.add_argument(
+        "--filtered-object-root",
+        help=(
+            "Optional split-specific object filter root. Poses are read from "
+            "<root>/<stream_id>/segmented_ekf_rts/"
+            "foundationpose_segmented_ekf_rts.json."
+        ),
+    )
     parser.add_argument("--dexycb-model-root", required=True)
     parser.add_argument("--mano-data-dir", required=True)
     parser.add_argument("--out-root", required=True)
@@ -175,6 +183,7 @@ def gt_object_centers(
 def prepare_stream(
     record: dict,
     handflow_root: Path,
+    filtered_object_root: Path | None,
     model_root: Path,
     mano_data_dir: Path,
     out_path: Path,
@@ -208,7 +217,17 @@ def prepare_stream(
     sam_centroid = mesh_centroid(
         Path(record["sam3d_glb"]), record["foundationpose_source_mesh_scale"]
     )
-    poses = pose_rows(Path(record["foundationpose_json"]))
+    object_pose_path = Path(record["foundationpose_json"])
+    if filtered_object_root is not None:
+        object_pose_path = (
+            filtered_object_root
+            / stream_id
+            / "segmented_ekf_rts"
+            / "foundationpose_segmented_ekf_rts.json"
+        )
+        if not object_pose_path.is_file():
+            raise FileNotFoundError(object_pose_path)
+    poses = pose_rows(object_pose_path)
     pred_object_center = np.full((count, 3), np.nan, dtype=np.float32)
     pred_object_rot6d = np.full((count, 6), np.nan, dtype=np.float32)
     pred_object_valid = np.zeros(count, dtype=bool)
@@ -249,6 +268,7 @@ def prepare_stream(
         object_name=np.asarray(record["object_name"]),
         stream_id=np.asarray(stream_id),
         intrinsics=intrinsics,
+        object_pose_source=np.asarray(str(object_pose_path.resolve())),
     )
     return {
         "num_frames": count,
@@ -264,6 +284,11 @@ def main() -> None:
         raise ValueError("Invalid shard configuration")
     manifest = Path(args.manifest).expanduser().resolve()
     handflow_root = Path(args.handflow_root).expanduser().resolve()
+    filtered_object_root = (
+        Path(args.filtered_object_root).expanduser().resolve()
+        if args.filtered_object_root
+        else None
+    )
     model_root = Path(args.dexycb_model_root).expanduser().resolve()
     mano_data_dir = Path(args.mano_data_dir).expanduser().resolve()
     out_root = Path(args.out_root).expanduser().resolve()
@@ -286,7 +311,12 @@ def main() -> None:
         try:
             if args.overwrite or not out_path.is_file():
                 metrics = prepare_stream(
-                    record, handflow_root, model_root, mano_data_dir, out_path
+                    record,
+                    handflow_root,
+                    filtered_object_root,
+                    model_root,
+                    mano_data_dir,
+                    out_path,
                 )
             else:
                 with np.load(out_path, allow_pickle=False) as raw:
@@ -328,6 +358,9 @@ def main() -> None:
     summary = {
         "manifest": str(manifest),
         "handflow_root": str(handflow_root),
+        "filtered_object_root": (
+            str(filtered_object_root) if filtered_object_root else None
+        ),
         "out_root": str(out_root),
         "window_jsonl": str(window_path),
         "window_size": args.window_size,
