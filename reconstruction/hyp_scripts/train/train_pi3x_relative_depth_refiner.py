@@ -45,6 +45,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temporal-layers", type=int, default=3)
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--model-variant",
+        choices=("full", "single_depth"),
+        default="full",
+        help=(
+            "full keeps the legacy motion/anomaly/carry branch; "
+            "single_depth predicts directly from the spatial and temporal "
+            "encoders with one depth head."
+        ),
+    )
     parser.add_argument("--max-correction-mm", type=float, default=60.0)
     parser.add_argument("--max-motion-residual-mm", type=float, default=40.0)
     parser.add_argument("--max-target-mm", type=float, default=120.0)
@@ -430,8 +440,10 @@ class Pi3XRelativeDepthRefiner(nn.Module):
         temporal_layers: int,
         heads: int,
         dropout: float,
+        model_variant: str = "full",
     ):
         super().__init__()
+        self.model_variant = model_variant
         self.feature_projection = nn.Sequential(
             nn.LayerNorm(feature_dim),
             nn.Linear(feature_dim, hidden_dim),
@@ -483,42 +495,46 @@ class Pi3XRelativeDepthRefiner(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
-        motion_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=heads,
-            dim_feedforward=hidden_dim * 2,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.motion_projection = nn.Sequential(
-            nn.Linear(motion_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-        )
-        self.motion_encoder = nn.TransformerEncoder(
-            motion_layer, num_layers=2
-        )
-        self.motion_head = nn.Sequential(
-            nn.LayerNorm(hidden_dim * 2),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-        )
-        self.anomaly_head = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-        )
+        if model_variant == "full":
+            motion_layer = nn.TransformerEncoderLayer(
+                d_model=hidden_dim,
+                nhead=heads,
+                dim_feedforward=hidden_dim * 2,
+                dropout=dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.motion_projection = nn.Sequential(
+                nn.Linear(motion_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+            )
+            self.motion_encoder = nn.TransformerEncoder(
+                motion_layer, num_layers=2
+            )
+            self.motion_head = nn.Sequential(
+                nn.LayerNorm(hidden_dim * 2),
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 1),
+            )
+            self.anomaly_head = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 1),
+            )
+        elif model_variant != "single_depth":
+            raise ValueError(f"Unknown model variant: {model_variant}")
         nn.init.trunc_normal_(self.position, std=0.02)
         nn.init.zeros_(self.depth_head[-1].weight)
         nn.init.zeros_(self.depth_head[-1].bias)
-        nn.init.zeros_(self.motion_head[-1].weight)
-        nn.init.zeros_(self.motion_head[-1].bias)
-        nn.init.zeros_(self.anomaly_head[-1].weight)
-        nn.init.constant_(self.anomaly_head[-1].bias, -2.0)
+        if model_variant == "full":
+            nn.init.zeros_(self.motion_head[-1].weight)
+            nn.init.zeros_(self.motion_head[-1].bias)
+            nn.init.zeros_(self.anomaly_head[-1].weight)
+            nn.init.constant_(self.anomaly_head[-1].bias, -2.0)
 
     @staticmethod
     def masked_pool(
@@ -562,6 +578,20 @@ class Pi3XRelativeDepthRefiner(nn.Module):
             torch.tanh(self.depth_head(temporal).squeeze(-1))
             * max_correction
         )
+        if self.model_variant == "single_depth":
+            prediction = geometry_prediction
+            if return_aux:
+                zeros = torch.zeros_like(prediction)
+                return {
+                    "prediction": prediction,
+                    "geometry_prediction": prediction,
+                    "motion_residual": zeros,
+                    "motion_innovation": zeros,
+                    "anomaly_logits": torch.full_like(prediction, -20.0),
+                    "carry_gate": zeros,
+                    "magnitude": torch.abs(prediction),
+                }
+            return prediction
         motion_encoded = self.motion_encoder(
             self.motion_projection(motion) + self.position[:, :frames]
         )
@@ -954,6 +984,10 @@ def run_epoch(model, loader, args, optimizer=None, split="train"):
 
 def main() -> None:
     args = parse_args()
+    if args.model_variant == "single_depth" and args.objective == "full":
+        raise ValueError(
+            "--model-variant single_depth requires a ray-depth objective"
+        )
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -1000,6 +1034,7 @@ def main() -> None:
         args.temporal_layers,
         args.heads,
         args.dropout,
+        args.model_variant,
     ).to(args.device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
@@ -1055,13 +1090,18 @@ def main() -> None:
             "feature_dim": feature_dim,
             "metadata_dim": metadata_dim,
             "motion_dim": motion_dim,
+            "model_variant": args.model_variant,
             "scalar_feature_version": (
-                "v9_ray_depth_guarded"
-                if args.objective == "ray_depth_guarded"
+                "v10_single_depth"
+                if args.model_variant == "single_depth"
                 else (
-                    "v8_ray_depth_only"
-                    if args.objective == "ray_depth_only"
-                    else "v7_thresholded_recurrent_carry"
+                    "v9_ray_depth_guarded"
+                    if args.objective == "ray_depth_guarded"
+                    else (
+                        "v8_ray_depth_only"
+                        if args.objective == "ray_depth_only"
+                        else "v7_thresholded_recurrent_carry"
+                    )
                 )
             ),
             "scalar_feature_scales": {

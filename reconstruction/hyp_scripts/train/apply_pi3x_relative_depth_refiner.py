@@ -68,6 +68,7 @@ def main() -> None:
         int(config["temporal_layers"]),
         int(config["heads"]),
         float(config["dropout"]),
+        str(config.get("model_variant", "full")),
     ).to(args.device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
@@ -247,6 +248,9 @@ def main() -> None:
         output["pi3x_depth_objective"] = np.asarray(
             config.get("objective", "full")
         )
+        output["pi3x_depth_model_variant"] = np.asarray(
+            config.get("model_variant", "full")
+        )
         output["pi3x_depth_source_handflow"] = np.asarray(
             str(handflow_path)
         )
@@ -270,6 +274,7 @@ def main() -> None:
             "scalar_feature_version", "unknown"
         ),
         "objective": config.get("objective", "full"),
+        "model_variant": config.get("model_variant", "full"),
         "windows": str(windows_path),
         "num_windows": len(dataset),
         "num_streams": len(stream_rows),
