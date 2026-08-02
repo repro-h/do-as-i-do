@@ -26,6 +26,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--comparison-object-pose-json",
+        default=None,
+        help=(
+            "Optional second pose JSON rendered with the same SAM3D mesh. "
+            "This replaces the default DexYCB CAD GT object overlay."
+        ),
+    )
+    parser.add_argument(
         "--viewer-python",
         default=os.environ.get(
             "VIS_PYTHON",
@@ -88,6 +96,11 @@ def main() -> None:
         if args.object_pose_json
         else filtered_object
     )
+    comparison_object_pose_json = (
+        Path(args.comparison_object_pose_json).expanduser().resolve()
+        if args.comparison_object_pose_json
+        else None
+    )
     output_root = (
         stage_root / "visualization/pi3x_ray_depth_only_full_v1_val"
     )
@@ -96,7 +109,10 @@ def main() -> None:
         / stream_id
         / "handflow_camera_result_pi3x_depth_refined.npz"
     )
-    for path in (manifest, object_pose_json, prediction):
+    required_paths = [manifest, object_pose_json, prediction]
+    if comparison_object_pose_json is not None:
+        required_paths.append(comparison_object_pose_json)
+    for path in required_paths:
         if not path.is_file():
             raise FileNotFoundError(path)
 
@@ -156,6 +172,45 @@ def main() -> None:
     subprocess.run(prepare_command, check=True)
 
     stream_out = output_root / stream_id
+    comparison_layout = None
+    comparison_scale = None
+    if comparison_object_pose_json is not None:
+        comparison_out = stream_out / "comparison_object"
+        comparison_prepare_script = (
+            repository
+            / "reconstruction/hyp_scripts/"
+            "prepare_foundationpose_handflow_visualization.py"
+        )
+        comparison_command = [
+            sys.executable,
+            "-u",
+            str(comparison_prepare_script),
+            "--foundationpose-json",
+            str(comparison_object_pose_json),
+            "--frame-map-json",
+            str(stream_out / "dexycb_frame_map.json"),
+            "--handflow-npz",
+            str(prediction),
+            "--hand-side",
+            record["hand_side"],
+            "--invalid-hand-mode",
+            "keep",
+            "--out-dir",
+            str(comparison_out),
+        ]
+        subprocess.run(comparison_command, check=True)
+        comparison_layout = (
+            comparison_out / "foundationpose_layout_camera_frame.json"
+        )
+        comparison_payload = json.loads(
+            comparison_object_pose_json.read_text(encoding="utf-8")
+        )
+        comparison_scale = float(
+            comparison_payload.get(
+                "source_mesh_scale",
+                record["foundationpose_source_mesh_scale"],
+            )
+        )
     camera = json.loads(
         (stream_out / "camera.json").read_text(encoding="utf-8")
     )
@@ -177,15 +232,23 @@ def main() -> None:
         "--gt-hand-meshes",
         str(gt_out / "dexycb_gt_hand_meshes.npz"),
         "--gt-object-layout-json",
-        str(gt_out / "dexycb_gt_object_layout_camera_frame.json"),
+        str(
+            comparison_layout
+            if comparison_layout is not None
+            else gt_out / "dexycb_gt_object_layout_camera_frame.json"
+        ),
         "--gt-object-mesh",
         str(
-            Path(args.object_model_root).expanduser().resolve()
-            / record["object_name"]
-            / "textured_simple.obj"
+            Path(record["sam3d_glb"]).expanduser().resolve()
+            if comparison_layout is not None
+            else (
+                Path(args.object_model_root).expanduser().resolve()
+                / record["object_name"]
+                / "textured_simple.obj"
+            )
         ),
         "--gt-object-scale",
-        "1.0",
+        str(comparison_scale if comparison_scale is not None else 1.0),
         "--scale",
         str(record["foundationpose_source_mesh_scale"]),
         "--translation-scale",
@@ -217,6 +280,8 @@ def main() -> None:
     print(f"Objective: {objective}")
     print(f"Checkpoint: {checkpoint}")
     print(f"Object pose: {object_pose_json}")
+    if comparison_object_pose_json is not None:
+        print(f"Comparison object pose: {comparison_object_pose_json}")
     print(f"Viewer: http://localhost:{args.port}")
     print("Press Ctrl+C to stop.", flush=True)
     subprocess.run(viewer_command, check=True)
