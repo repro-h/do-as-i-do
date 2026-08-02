@@ -17,6 +17,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sequence-dir", required=True)
     parser.add_argument(
+        "--prediction-root",
+        help="Override the default v8 prediction root.",
+    )
+    parser.add_argument(
+        "--prediction-filename",
+        default="handflow_camera_result_pi3x_depth_refined.npz",
+    )
+    parser.add_argument(
+        "--output-root",
+        help="Override the prepared visualization output root.",
+    )
+    parser.add_argument(
         "--object-pose-json",
         default=None,
         help=(
@@ -83,7 +95,9 @@ def main() -> None:
     manifest = hybrid_root / "manifests/val.jsonl"
     handflow_root = hybrid_root / "handflow_cache/val_v1/streams"
     prediction_root = (
-        stage_root / "predictions/pi3x_ray_depth_only_full_v1"
+        Path(args.prediction_root).expanduser().resolve()
+        if args.prediction_root
+        else stage_root / "predictions/pi3x_ray_depth_only_full_v1"
     )
     filtered_object = (
         hybrid_root
@@ -102,12 +116,14 @@ def main() -> None:
         else None
     )
     output_root = (
-        stage_root / "visualization/pi3x_ray_depth_only_full_v1_val"
+        Path(args.output_root).expanduser().resolve()
+        if args.output_root
+        else stage_root / "visualization/pi3x_ray_depth_only_full_v1_val"
     )
     prediction = (
         prediction_root
         / stream_id
-        / "handflow_camera_result_pi3x_depth_refined.npz"
+        / args.prediction_filename
     )
     required_paths = [manifest, object_pose_json, prediction]
     if comparison_object_pose_json is not None:
@@ -117,21 +133,20 @@ def main() -> None:
             raise FileNotFoundError(path)
 
     with np.load(prediction, allow_pickle=False) as data:
-        objective = (
-            str(data["pi3x_depth_objective"].item())
-            if "pi3x_depth_objective" in data.files
-            else "not_recorded"
-        )
-        checkpoint = (
-            str(data["pi3x_depth_checkpoint"].item())
-            if "pi3x_depth_checkpoint" in data.files
-            else "not_recorded"
-        )
-    if objective != "ray_depth_only":
-        raise RuntimeError(
-            f"Expected v8 objective=ray_depth_only, got {objective!r} "
-            f"from {prediction}"
-        )
+        if "relative_translation_model_version" in data.files:
+            objective = str(data["relative_translation_model_version"].item())
+            checkpoint = str(data["relative_translation_checkpoint"].item())
+        else:
+            objective = (
+                str(data["pi3x_depth_objective"].item())
+                if "pi3x_depth_objective" in data.files
+                else "not_recorded"
+            )
+            checkpoint = (
+                str(data["pi3x_depth_checkpoint"].item())
+                if "pi3x_depth_checkpoint" in data.files
+                else "not_recorded"
+            )
 
     records = {
         row["stream_id"]: row for row in load_jsonl(manifest)
