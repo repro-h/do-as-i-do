@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pi3x-val-root")
     parser.add_argument("--init-checkpoint")
     parser.add_argument("--freeze-base", action="store_true")
+    parser.add_argument("--pi3x-direct-residual", action="store_true")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -48,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pi3x-gate-full-mm", type=float, default=0.0)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--max-correction-mm", type=float, default=120.0)
+    parser.add_argument("--max-pi3x-residual-mm", type=float, default=60.0)
     parser.add_argument("--max-object-center-error-mm", type=float, default=30.0)
     parser.add_argument("--max-target-projection-shift-px", type=float, default=20.0)
     parser.add_argument("--smooth-l1-beta-mm", type=float, default=5.0)
@@ -58,6 +60,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pi3x-small-anchor-mm", type=float, default=15.0)
     parser.add_argument("--w-pi3x-small-anchor", type=float, default=0.0)
     parser.add_argument("--w-pi3x-degradation-guard", type=float, default=0.0)
+    parser.add_argument("--w-pi3x-residual", type=float, default=0.0)
+    parser.add_argument("--small-noop-mm", type=float, default=15.0)
+    parser.add_argument("--w-small-noop", type=float, default=0.0)
+    parser.add_argument("--w-best-of-degradation-guard", type=float, default=0.0)
     parser.add_argument("--target-weight-lt5", type=float, default=1.0)
     parser.add_argument("--target-weight-5-15", type=float, default=1.0)
     parser.add_argument("--target-weight-15-30", type=float, default=1.0)
@@ -342,9 +348,14 @@ class RelativeTranslationRefiner(nn.Module):
         pi3x_metadata_dim: int = 0,
         spatial_layers: int = 1,
         heads: int = 8,
+        pi3x_direct_residual: bool = False,
     ):
         super().__init__()
         self.pi3x_enabled = pi3x_feature_dim > 0
+        self.pi3x_direct_residual = (
+            self.pi3x_enabled and pi3x_direct_residual
+        )
+        self.base_frozen = False
         self.frame_encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -366,25 +377,63 @@ class RelativeTranslationRefiner(nn.Module):
             self.token_type_embedding = nn.Embedding(
                 len(TOKEN_GROUPS), hidden_dim
             )
-            spatial_layer = nn.TransformerEncoderLayer(
-                d_model=hidden_dim,
-                nhead=heads,
-                dim_feedforward=hidden_dim * 2,
-                dropout=dropout,
-                activation="gelu",
-                batch_first=True,
-                norm_first=True,
-            )
-            self.spatial_encoder = nn.TransformerEncoder(
-                spatial_layer, num_layers=spatial_layers
-            )
-            self.pi3x_fusion = nn.Sequential(
-                nn.Linear(hidden_dim * 3, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, hidden_dim),
-            )
-            nn.init.zeros_(self.pi3x_fusion[-1].weight)
-            nn.init.zeros_(self.pi3x_fusion[-1].bias)
+            if self.pi3x_direct_residual:
+                if hidden_dim % 2:
+                    raise ValueError(
+                        "Pi3X direct residual requires an even hidden dimension"
+                    )
+                self.pi3x_cross_attention = nn.MultiheadAttention(
+                    hidden_dim,
+                    heads,
+                    dropout=dropout,
+                    batch_first=True,
+                )
+                self.pi3x_cross_norm = nn.LayerNorm(hidden_dim)
+                self.pi3x_mask_projection = nn.Sequential(
+                    nn.Linear(10, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, hidden_dim),
+                )
+                self.pi3x_relation_fusion = nn.Sequential(
+                    nn.Linear(hidden_dim * 5, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.GELU(),
+                )
+                self.pi3x_temporal = nn.GRU(
+                    hidden_dim,
+                    hidden_dim // 2,
+                    num_layers=1,
+                    bidirectional=True,
+                    batch_first=True,
+                )
+                self.pi3x_residual_head = nn.Sequential(
+                    nn.LayerNorm(hidden_dim),
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, 3),
+                )
+                nn.init.zeros_(self.pi3x_residual_head[-1].weight)
+                nn.init.zeros_(self.pi3x_residual_head[-1].bias)
+            else:
+                spatial_layer = nn.TransformerEncoderLayer(
+                    d_model=hidden_dim,
+                    nhead=heads,
+                    dim_feedforward=hidden_dim * 2,
+                    dropout=dropout,
+                    activation="gelu",
+                    batch_first=True,
+                    norm_first=True,
+                )
+                self.spatial_encoder = nn.TransformerEncoder(
+                    spatial_layer, num_layers=spatial_layers
+                )
+                self.pi3x_fusion = nn.Sequential(
+                    nn.Linear(hidden_dim * 3, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, hidden_dim),
+                )
+                nn.init.zeros_(self.pi3x_fusion[-1].weight)
+                nn.init.zeros_(self.pi3x_fusion[-1].bias)
         self.temporal = nn.GRU(
             hidden_dim,
             hidden_dim,
@@ -405,6 +454,82 @@ class RelativeTranslationRefiner(nn.Module):
         weight = mask.to(value.dtype).unsqueeze(-1)
         return (value * weight).sum(dim=2) / weight.sum(dim=2).clamp_min(1.0)
 
+    @staticmethod
+    def weighted_pool(
+        value: torch.Tensor, weight: torch.Tensor
+    ) -> torch.Tensor:
+        weight = weight.to(value.dtype).unsqueeze(-1)
+        return (value * weight).sum(dim=2) / weight.sum(dim=2).clamp_min(1e-6)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.base_frozen:
+            self.frame_encoder.eval()
+            self.temporal.eval()
+            self.head.eval()
+        return self
+
+    def normalize_pi3x_metadata(
+        self,
+        metadata: torch.Tensor,
+        valid: torch.Tensor,
+        types: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        metadata = torch.nan_to_num(metadata)
+        points = metadata[..., :3]
+        coverage = metadata[..., 3].clamp(0.0, 1.0)
+        confidence = metadata[..., 4].clamp(0.0, 1.0)
+        indices = metadata[..., 5:7].clamp(0.0, 1.0)
+        hand_mask = valid & (types == 0)
+        object_mask = valid & (types == 1)
+        object_weight = object_mask.to(points.dtype) * (
+            0.1 + 0.9 * coverage
+        ) * (0.25 + 0.75 * confidence)
+        object_center = self.weighted_pool(points, object_weight)
+        centered = points - object_center.unsqueeze(2)
+        object_radius = torch.sqrt(
+            self.weighted_pool(centered.square().sum(-1, keepdim=True), object_weight)
+            .squeeze(-1)
+            .clamp_min(1e-6)
+        )
+        normalized_points = centered / object_radius[:, :, None, None]
+        normalized = torch.cat(
+            [
+                normalized_points.clamp(-8.0, 8.0),
+                coverage[..., None],
+                confidence[..., None],
+                indices,
+            ],
+            dim=-1,
+        )
+
+        hand_weight = hand_mask.to(points.dtype) * (0.1 + 0.9 * coverage)
+        object_mask_weight = object_mask.to(points.dtype) * (
+            0.1 + 0.9 * coverage
+        )
+        hand_center_2d = self.weighted_pool(indices, hand_weight)
+        object_center_2d = self.weighted_pool(indices, object_mask_weight)
+        hand_coverage = self.weighted_pool(
+            coverage[..., None], hand_mask.to(points.dtype)
+        ).squeeze(-1)
+        object_coverage = self.weighted_pool(
+            coverage[..., None], object_mask.to(points.dtype)
+        ).squeeze(-1)
+        token_count = float(valid.shape[-1])
+        mask_summary = torch.cat(
+            [
+                hand_center_2d,
+                object_center_2d,
+                hand_center_2d - object_center_2d,
+                hand_coverage[..., None],
+                object_coverage[..., None],
+                hand_mask.sum(-1, keepdim=True).to(points.dtype) / token_count,
+                object_mask.sum(-1, keepdim=True).to(points.dtype) / token_count,
+            ],
+            dim=-1,
+        )
+        return normalized, mask_summary
+
     def forward(
         self,
         features: torch.Tensor,
@@ -416,6 +541,7 @@ class RelativeTranslationRefiner(nn.Module):
         pi3x_gate_start: float = 0.0,
         pi3x_gate_full: float = 0.0,
         return_aux: bool = False,
+        max_pi3x_residual: Optional[float] = None,
     ):
         encoded = self.frame_encoder(features)
         base_temporal, _ = self.temporal(encoded)
@@ -432,37 +558,101 @@ class RelativeTranslationRefiner(nn.Module):
             ):
                 raise ValueError("Pi3X tokens are required by this checkpoint")
             batch, frames, tokens, _ = token_features.shape
-            token = self.token_feature_projection(token_features)
-            token = token + self.token_metadata_projection(token_metadata)
-            token = token + self.token_type_embedding(token_types)
-            flat = token.reshape(batch * frames, tokens, -1)
-            flat_valid = token_valid.reshape(batch * frames, tokens).clone()
-            missing = ~flat_valid.any(dim=1)
-            flat_valid[missing, 0] = True
-            spatial = self.spatial_encoder(
-                flat, src_key_padding_mask=~flat_valid
-            ).reshape(batch, frames, tokens, -1)
-            pooled = []
-            for type_index in range(len(TOKEN_GROUPS)):
-                mask = token_valid & (token_types == type_index)
-                pooled.append(self.masked_pool(spatial, mask))
-            adapted = encoded + self.pi3x_fusion(torch.cat(pooled, dim=-1))
-            adapted_temporal, _ = self.temporal(adapted)
-            adapted_correction = (
-                torch.tanh(self.head(adapted_temporal)) * max_correction
-            )
-            if pi3x_gate_full > pi3x_gate_start:
-                magnitude = torch.linalg.norm(base_correction, dim=-1)
-                gate = (
-                    (magnitude - pi3x_gate_start)
-                    / (pi3x_gate_full - pi3x_gate_start)
-                ).clamp(0.0, 1.0)
-                gate = gate.square() * (3.0 - 2.0 * gate)
-                correction = base_correction + gate.unsqueeze(-1) * (
-                    adapted_correction - base_correction
+            if self.pi3x_direct_residual:
+                metadata, mask_summary = self.normalize_pi3x_metadata(
+                    token_metadata, token_valid, token_types
                 )
             else:
-                correction = adapted_correction
+                metadata = torch.nan_to_num(token_metadata)
+                mask_summary = None
+            token = self.token_feature_projection(
+                torch.nan_to_num(token_features)
+            )
+            token = token + self.token_metadata_projection(metadata)
+            token = token + self.token_type_embedding(token_types)
+            if self.pi3x_direct_residual:
+                flat = token.reshape(batch * frames, tokens, -1)
+                hand_mask = token_valid & (token_types == 0)
+                key_valid = token_valid & (token_types != 0)
+                flat_key_valid = key_valid.reshape(
+                    batch * frames, tokens
+                ).clone()
+                missing_key = ~flat_key_valid.any(dim=1)
+                flat_key_valid[missing_key, 0] = True
+                attended, _ = self.pi3x_cross_attention(
+                    flat,
+                    flat,
+                    flat,
+                    key_padding_mask=~flat_key_valid,
+                    need_weights=False,
+                )
+                attended = self.pi3x_cross_norm(
+                    flat + attended
+                ).reshape(batch, frames, tokens, -1)
+                hand_relation = self.masked_pool(attended, hand_mask)
+                object_pool = self.masked_pool(
+                    token, token_valid & (token_types == 1)
+                )
+                context_pool = self.masked_pool(
+                    token, token_valid & (token_types == 2)
+                )
+                mask_embedding = self.pi3x_mask_projection(mask_summary)
+                relation = self.pi3x_relation_fusion(
+                    torch.cat(
+                        [
+                            encoded,
+                            hand_relation,
+                            object_pool,
+                            context_pool,
+                            mask_embedding,
+                        ],
+                        dim=-1,
+                    )
+                )
+                temporal_relation, _ = self.pi3x_temporal(relation)
+                residual_limit = (
+                    max_correction
+                    if max_pi3x_residual is None
+                    else max_pi3x_residual
+                )
+                pi3x_residual = (
+                    torch.tanh(self.pi3x_residual_head(temporal_relation))
+                    * residual_limit
+                )
+                correction = base_correction + pi3x_residual
+            else:
+                flat = token.reshape(batch * frames, tokens, -1)
+                flat_valid = token_valid.reshape(
+                    batch * frames, tokens
+                ).clone()
+                missing = ~flat_valid.any(dim=1)
+                flat_valid[missing, 0] = True
+                spatial = self.spatial_encoder(
+                    flat, src_key_padding_mask=~flat_valid
+                ).reshape(batch, frames, tokens, -1)
+                pooled = []
+                for type_index in range(len(TOKEN_GROUPS)):
+                    mask = token_valid & (token_types == type_index)
+                    pooled.append(self.masked_pool(spatial, mask))
+                adapted = encoded + self.pi3x_fusion(
+                    torch.cat(pooled, dim=-1)
+                )
+                adapted_temporal, _ = self.temporal(adapted)
+                adapted_correction = (
+                    torch.tanh(self.head(adapted_temporal)) * max_correction
+                )
+                if pi3x_gate_full > pi3x_gate_start:
+                    magnitude = torch.linalg.norm(base_correction, dim=-1)
+                    gate = (
+                        (magnitude - pi3x_gate_start)
+                        / (pi3x_gate_full - pi3x_gate_start)
+                    ).clamp(0.0, 1.0)
+                    gate = gate.square() * (3.0 - 2.0 * gate)
+                    correction = base_correction + gate.unsqueeze(-1) * (
+                        adapted_correction - base_correction
+                    )
+                else:
+                    correction = adapted_correction
         else:
             correction = base_correction
         if return_aux:
@@ -501,7 +691,8 @@ def compute_loss(model, batch, args):
         batch.get("token_types"),
         args.pi3x_gate_start_mm / 1000.0,
         args.pi3x_gate_full_mm / 1000.0,
-        True,
+        return_aux=True,
+        max_pi3x_residual=args.max_pi3x_residual_mm / 1000.0,
     )
     correction = result["prediction"]
     base_correction = result["base_prediction"]
@@ -559,6 +750,27 @@ def compute_loss(model, batch, args):
     losses["pi3x_degradation_guard"] = (
         F.relu(final_error - base_error) * valid_weight
     ).sum() / valid_weight.sum().clamp_min(1.0)
+    losses["pi3x_residual"] = (
+        pi3x_residual.square().mean(-1) * valid_weight
+    ).sum() / valid_weight.sum().clamp_min(1.0)
+    small_noop_mask = batch["valid"] & (
+        magnitude_mm < args.small_noop_mm
+    )
+    losses["small_noop"] = masked_smooth_l1(
+        correction,
+        torch.zeros_like(correction),
+        small_noop_mask,
+        beta,
+    )
+    initial_error = torch.linalg.norm(
+        batch["relative_initial"] - batch["relative_target"], dim=-1
+    )
+    best_reference_error = torch.minimum(
+        initial_error, base_error.detach()
+    )
+    losses["best_of_degradation_guard"] = (
+        F.relu(final_error - best_reference_error) * valid_weight
+    ).sum() / valid_weight.sum().clamp_min(1.0)
     total = (
         args.w_relative * losses["relative"]
         + args.w_velocity * losses["velocity"]
@@ -566,6 +778,10 @@ def compute_loss(model, batch, args):
         + args.w_residual * losses["residual"]
         + args.w_pi3x_small_anchor * losses["pi3x_small_anchor"]
         + args.w_pi3x_degradation_guard * losses["pi3x_degradation_guard"]
+        + args.w_pi3x_residual * losses["pi3x_residual"]
+        + args.w_small_noop * losses["small_noop"]
+        + args.w_best_of_degradation_guard
+        * losses["best_of_degradation_guard"]
     )
     return total, losses, batch, corrected
 
@@ -658,10 +874,22 @@ def main() -> None:
         args.w_pi3x_small_anchor > 0.0
         or args.w_pi3x_degradation_guard > 0.0
     )
+    direct_guarded_pi3x = (
+        args.w_small_noop > 0.0
+        or args.w_best_of_degradation_guard > 0.0
+    )
     if guarded_pi3x and not args.pi3x_train_root:
         raise ValueError("Pi3X guard losses require Pi3X train/val roots")
     if guarded_pi3x and not args.freeze_base:
         raise ValueError("Pi3X guard losses require --freeze-base")
+    if args.pi3x_direct_residual and not args.pi3x_train_root:
+        raise ValueError("--pi3x-direct-residual requires Pi3X train/val roots")
+    if args.pi3x_direct_residual and not args.freeze_base:
+        raise ValueError("--pi3x-direct-residual requires --freeze-base")
+    if direct_guarded_pi3x and not args.pi3x_direct_residual:
+        raise ValueError(
+            "Direct no-op/guard losses require --pi3x-direct-residual"
+        )
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -732,6 +960,7 @@ def main() -> None:
         pi3x_metadata_dim,
         args.spatial_layers,
         args.heads,
+        args.pi3x_direct_residual,
     ).to(args.device)
     if args.init_checkpoint:
         init_path = Path(args.init_checkpoint).expanduser().resolve()
@@ -761,9 +990,16 @@ def main() -> None:
             "token_type_embedding.",
             "spatial_encoder.",
             "pi3x_fusion.",
+            "pi3x_cross_attention.",
+            "pi3x_cross_norm.",
+            "pi3x_mask_projection.",
+            "pi3x_relation_fusion.",
+            "pi3x_temporal.",
+            "pi3x_residual_head.",
         )
         for name, parameter in model.named_parameters():
             parameter.requires_grad = name.startswith(pi3x_prefixes)
+        model.base_frozen = True
     trainable_parameters = [
         parameter for parameter in model.parameters() if parameter.requires_grad
     ]
@@ -834,12 +1070,17 @@ def main() -> None:
             "val_total": val_metrics["total"],
             "model_version": (
                 (
-                    "relative_translation_pi3x_guarded_residual_v5"
-                    if guarded_pi3x
+                    "relative_translation_pi3x_direct_relation_residual_v6"
+                    if args.pi3x_direct_residual
                     else (
-                        "relative_translation_pi3x_gated_spatial_bigru_v4"
-                        if args.pi3x_gate_full_mm > args.pi3x_gate_start_mm
-                        else "relative_translation_pi3x_spatial_bigru_weighted_v3"
+                        "relative_translation_pi3x_guarded_residual_v5"
+                        if guarded_pi3x
+                        else (
+                            "relative_translation_pi3x_gated_spatial_bigru_v4"
+                            if args.pi3x_gate_full_mm
+                            > args.pi3x_gate_start_mm
+                            else "relative_translation_pi3x_spatial_bigru_weighted_v3"
+                        )
                     )
                 )
                 if pi3x_feature_dim > 0

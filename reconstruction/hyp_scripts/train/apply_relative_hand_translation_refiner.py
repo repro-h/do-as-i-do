@@ -146,6 +146,7 @@ def main() -> None:
         int(checkpoint.get("pi3x_metadata_dim", 0)),
         int(config.get("spatial_layers", 1)),
         int(config.get("heads", 8)),
+        bool(config.get("pi3x_direct_residual", False)),
     )
     model.load_state_dict(checkpoint["model"])
     model.to(args.device).eval()
@@ -203,6 +204,10 @@ def main() -> None:
                 ),
                 float(config.get("pi3x_gate_start_mm", 0.0)) / 1000.0,
                 float(config.get("pi3x_gate_full_mm", 0.0)) / 1000.0,
+                max_pi3x_residual=(
+                    float(config.get("max_pi3x_residual_mm", 60.0))
+                    / 1000.0
+                ),
             ).cpu().numpy()
             for index, stream_id in enumerate(batch["stream_id"]):
                 supervision_path = str(batch["supervision_npz"][index])
