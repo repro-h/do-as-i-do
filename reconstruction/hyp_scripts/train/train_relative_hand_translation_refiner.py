@@ -33,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pi3x-train-root")
     parser.add_argument("--pi3x-val-root")
     parser.add_argument("--init-checkpoint")
+    parser.add_argument("--freeze-base", action="store_true")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -683,8 +684,35 @@ def main() -> None:
             ),
             flush=True,
         )
+    if args.freeze_base:
+        pi3x_prefixes = (
+            "token_feature_projection.",
+            "token_metadata_projection.",
+            "token_type_embedding.",
+            "spatial_encoder.",
+            "pi3x_fusion.",
+        )
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad = name.startswith(pi3x_prefixes)
+    trainable_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    print(
+        json.dumps(
+            {
+                "freeze_base": bool(args.freeze_base),
+                "trainable_parameters": int(
+                    sum(parameter.numel() for parameter in trainable_parameters)
+                ),
+                "total_parameters": int(
+                    sum(parameter.numel() for parameter in model.parameters())
+                ),
+            }
+        ),
+        flush=True,
+    )
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        trainable_parameters, lr=args.lr, weight_decay=args.weight_decay
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs
