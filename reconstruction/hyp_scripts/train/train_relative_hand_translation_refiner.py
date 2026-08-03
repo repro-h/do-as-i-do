@@ -55,6 +55,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-velocity", type=float, default=0.1)
     parser.add_argument("--w-acceleration", type=float, default=0.05)
     parser.add_argument("--w-residual", type=float, default=0.001)
+    parser.add_argument("--pi3x-small-anchor-mm", type=float, default=15.0)
+    parser.add_argument("--w-pi3x-small-anchor", type=float, default=0.0)
+    parser.add_argument("--w-pi3x-degradation-guard", type=float, default=0.0)
     parser.add_argument("--target-weight-lt5", type=float, default=1.0)
     parser.add_argument("--target-weight-5-15", type=float, default=1.0)
     parser.add_argument("--target-weight-15-30", type=float, default=1.0)
@@ -412,7 +415,8 @@ class RelativeTranslationRefiner(nn.Module):
         token_types: Optional[torch.Tensor] = None,
         pi3x_gate_start: float = 0.0,
         pi3x_gate_full: float = 0.0,
-    ) -> torch.Tensor:
+        return_aux: bool = False,
+    ):
         encoded = self.frame_encoder(features)
         base_temporal, _ = self.temporal(encoded)
         base_correction = torch.tanh(self.head(base_temporal)) * max_correction
@@ -454,11 +458,20 @@ class RelativeTranslationRefiner(nn.Module):
                     / (pi3x_gate_full - pi3x_gate_start)
                 ).clamp(0.0, 1.0)
                 gate = gate.square() * (3.0 - 2.0 * gate)
-                return base_correction + gate.unsqueeze(-1) * (
+                correction = base_correction + gate.unsqueeze(-1) * (
                     adapted_correction - base_correction
                 )
-            return adapted_correction
-        return base_correction
+            else:
+                correction = adapted_correction
+        else:
+            correction = base_correction
+        if return_aux:
+            return {
+                "prediction": correction,
+                "base_prediction": base_correction,
+                "pi3x_residual": correction - base_correction,
+            }
+        return correction
 
 
 def masked_smooth_l1(value, target, mask, beta, sample_weight=None):
@@ -479,7 +492,7 @@ def temporal_loss(value, target, mask, order, beta):
 
 def compute_loss(model, batch, args):
     batch = {key: value.to(args.device) for key, value in batch.items()}
-    correction = model(
+    result = model(
         batch["features"],
         args.max_correction_mm / 1000.0,
         batch.get("token_features"),
@@ -488,7 +501,11 @@ def compute_loss(model, batch, args):
         batch.get("token_types"),
         args.pi3x_gate_start_mm / 1000.0,
         args.pi3x_gate_full_mm / 1000.0,
+        True,
     )
+    correction = result["prediction"]
+    base_correction = result["base_prediction"]
+    pi3x_residual = result["pi3x_residual"]
     corrected = batch["relative_initial"] + correction
     beta = args.smooth_l1_beta_mm / 1000.0
     magnitude_mm = batch["target_magnitude"] * 1000.0
@@ -522,11 +539,33 @@ def compute_loss(model, batch, args):
         "residual": (correction.square().mean(-1) * batch["valid"].float()).sum()
         / batch["valid"].float().sum().clamp_min(1.0),
     }
+    small_mask = batch["valid"] & (
+        magnitude_mm < args.pi3x_small_anchor_mm
+    )
+    losses["pi3x_small_anchor"] = masked_smooth_l1(
+        pi3x_residual,
+        torch.zeros_like(pi3x_residual),
+        small_mask,
+        beta,
+    )
+    base_corrected = batch["relative_initial"] + base_correction
+    base_error = torch.linalg.norm(
+        base_corrected - batch["relative_target"], dim=-1
+    )
+    final_error = torch.linalg.norm(
+        corrected - batch["relative_target"], dim=-1
+    )
+    valid_weight = batch["valid"].float()
+    losses["pi3x_degradation_guard"] = (
+        F.relu(final_error - base_error) * valid_weight
+    ).sum() / valid_weight.sum().clamp_min(1.0)
     total = (
         args.w_relative * losses["relative"]
         + args.w_velocity * losses["velocity"]
         + args.w_acceleration * losses["acceleration"]
         + args.w_residual * losses["residual"]
+        + args.w_pi3x_small_anchor * losses["pi3x_small_anchor"]
+        + args.w_pi3x_degradation_guard * losses["pi3x_degradation_guard"]
     )
     return total, losses, batch, corrected
 
@@ -615,6 +654,14 @@ def main() -> None:
         raise ValueError(
             "--pi3x-train-root and --pi3x-val-root must be used together"
         )
+    guarded_pi3x = (
+        args.w_pi3x_small_anchor > 0.0
+        or args.w_pi3x_degradation_guard > 0.0
+    )
+    if guarded_pi3x and not args.pi3x_train_root:
+        raise ValueError("Pi3X guard losses require Pi3X train/val roots")
+    if guarded_pi3x and not args.freeze_base:
+        raise ValueError("Pi3X guard losses require --freeze-base")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -787,9 +834,13 @@ def main() -> None:
             "val_total": val_metrics["total"],
             "model_version": (
                 (
-                    "relative_translation_pi3x_gated_spatial_bigru_v4"
-                    if args.pi3x_gate_full_mm > args.pi3x_gate_start_mm
-                    else "relative_translation_pi3x_spatial_bigru_weighted_v3"
+                    "relative_translation_pi3x_guarded_residual_v5"
+                    if guarded_pi3x
+                    else (
+                        "relative_translation_pi3x_gated_spatial_bigru_v4"
+                        if args.pi3x_gate_full_mm > args.pi3x_gate_start_mm
+                        else "relative_translation_pi3x_spatial_bigru_weighted_v3"
+                    )
                 )
                 if pi3x_feature_dim > 0
                 else "relative_translation_mlp_bigru_weighted_v2"
