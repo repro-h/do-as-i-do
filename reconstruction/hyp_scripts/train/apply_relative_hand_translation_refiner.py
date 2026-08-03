@@ -29,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--windows", required=True)
     parser.add_argument("--global-root", required=True)
     parser.add_argument("--relative-root")
+    parser.add_argument("--pi3x-root")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--handflow-root", required=True)
     parser.add_argument("--out-root", required=True)
@@ -46,6 +47,7 @@ class InferenceDataset(Dataset):
         global_root: Path,
         config: dict,
         relative_root: Optional[Path] = None,
+        pi3x_root: Optional[Path] = None,
     ):
         self.rows = load_jsonl(windows)
         self.relative_root = relative_root
@@ -54,6 +56,7 @@ class InferenceDataset(Dataset):
             global_root,
             SimpleNamespace(**config),
             relative_root,
+            pi3x_root,
         )
 
     def __len__(self) -> int:
@@ -67,13 +70,22 @@ class InferenceDataset(Dataset):
             if self.relative_root is not None
             else Path(row["supervision_npz"])
         ).resolve()
-        return {
+        output = {
             "features": sample["features"],
             "stream_id": row["stream_id"],
             "supervision_npz": str(supervision_path),
             "start": int(row["start"]),
             "end": int(row["end"]),
         }
+        for key in (
+            "token_features",
+            "token_metadata",
+            "token_valid",
+            "token_types",
+        ):
+            if key in sample:
+                output[key] = sample[key]
+        return output
 
 
 def blend_weights(length: int) -> np.ndarray:
@@ -130,6 +142,10 @@ def main() -> None:
         int(config["hidden_dim"]),
         int(config["layers"]),
         float(config["dropout"]),
+        int(checkpoint.get("pi3x_feature_dim", 0)),
+        int(checkpoint.get("pi3x_metadata_dim", 0)),
+        int(config.get("spatial_layers", 1)),
+        int(config.get("heads", 8)),
     )
     model.load_state_dict(checkpoint["model"])
     model.to(args.device).eval()
@@ -142,6 +158,11 @@ def main() -> None:
         (
             Path(args.relative_root).expanduser().resolve()
             if args.relative_root
+            else None
+        ),
+        (
+            Path(args.pi3x_root).expanduser().resolve()
+            if args.pi3x_root
             else None
         ),
     )
@@ -160,6 +181,26 @@ def main() -> None:
             correction = model(
                 batch["features"].to(args.device),
                 float(config["max_correction_mm"]) / 1000.0,
+                (
+                    batch["token_features"].to(args.device)
+                    if "token_features" in batch
+                    else None
+                ),
+                (
+                    batch["token_metadata"].to(args.device)
+                    if "token_metadata" in batch
+                    else None
+                ),
+                (
+                    batch["token_valid"].to(args.device)
+                    if "token_valid" in batch
+                    else None
+                ),
+                (
+                    batch["token_types"].to(args.device)
+                    if "token_types" in batch
+                    else None
+                ),
             ).cpu().numpy()
             for index, stream_id in enumerate(batch["stream_id"]):
                 supervision_path = str(batch["supervision_npz"][index])

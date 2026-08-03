@@ -19,6 +19,7 @@ from tqdm import tqdm
 
 
 PALM = np.asarray([0, 5, 9, 13, 17], dtype=np.int64)
+TOKEN_GROUPS = ("hand", "object", "context")
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,6 +30,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--global-val-root", required=True)
     parser.add_argument("--relative-train-root")
     parser.add_argument("--relative-val-root")
+    parser.add_argument("--pi3x-train-root")
+    parser.add_argument("--pi3x-val-root")
+    parser.add_argument("--init-checkpoint")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -37,6 +41,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--layers", type=int, default=2)
+    parser.add_argument("--spatial-layers", type=int, default=1)
+    parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--max-correction-mm", type=float, default=120.0)
     parser.add_argument("--max-object-center-error-mm", type=float, default=30.0)
@@ -60,7 +66,7 @@ def load_jsonl(path: Path) -> list[dict]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
-@lru_cache(maxsize=256)
+@lru_cache(maxsize=16)
 def load_npz(path_text: str) -> dict[str, np.ndarray]:
     with np.load(path_text, allow_pickle=False) as raw:
         return {key: np.asarray(raw[key]) for key in raw.files}
@@ -100,12 +106,14 @@ class RelativeWindowDataset(Dataset):
         global_root: Path,
         args: argparse.Namespace,
         relative_root: Optional[Path] = None,
+        pi3x_root: Optional[Path] = None,
     ):
         self.rows = load_jsonl(windows)
         if not self.rows:
             raise RuntimeError(f"No windows in {windows}")
         self.global_root = global_root
         self.relative_root = relative_root
+        self.pi3x_root = pi3x_root
         self.max_correction = args.max_correction_mm / 1000.0
         self.max_object_error = args.max_object_center_error_mm / 1000.0
         self.max_projection_shift = args.max_target_projection_shift_px
@@ -226,7 +234,7 @@ class RelativeWindowDataset(Dataset):
             ],
             axis=-1,
         ).astype(np.float32)
-        return {
+        sample = {
             "features": torch.from_numpy(features),
             "relative_initial": torch.from_numpy(relative_initial),
             "relative_target": torch.from_numpy(relative_target),
@@ -235,11 +243,101 @@ class RelativeWindowDataset(Dataset):
                 np.linalg.norm(target_delta, axis=-1).astype(np.float32)
             ),
         }
+        if self.pi3x_root is not None:
+            pi3x_path = (
+                self.pi3x_root
+                / stream_id
+                / "pi3x_geometry_features_compact.npz"
+            ).resolve()
+            if not pi3x_path.is_file():
+                raise FileNotFoundError(pi3x_path)
+            pi3x = load_npz(str(pi3x_path))
+            frame_indices = np.asarray(pi3x["frame_indices"], dtype=np.int64)
+            expected = np.arange(start, end, dtype=np.int64)
+            positions = np.searchsorted(frame_indices, expected)
+            if (
+                np.any(positions >= len(frame_indices))
+                or not np.array_equal(frame_indices[positions], expected)
+            ):
+                raise ValueError(
+                    f"{pi3x_path} does not cover frames [{start}, {end})"
+                )
+            token_features = []
+            token_metadata = []
+            token_valid = []
+            token_types = []
+            grid = np.asarray(
+                pi3x["geometry_feature_grid_hw"], dtype=np.float32
+            )
+            for type_index, prefix in enumerate(TOKEN_GROUPS):
+                group_features = np.asarray(
+                    pi3x[f"{prefix}_features"][positions], dtype=np.float32
+                )
+                points = np.asarray(
+                    pi3x[f"{prefix}_points"][positions], dtype=np.float32
+                )
+                coverage = np.asarray(
+                    pi3x[f"{prefix}_coverage"][positions], dtype=np.float32
+                )
+                confidence = np.asarray(
+                    pi3x[f"{prefix}_confidence"][positions], dtype=np.float32
+                )
+                indices = np.asarray(
+                    pi3x[f"{prefix}_indices"][positions], dtype=np.float32
+                )
+                indices[..., 0] /= max(float(grid[0] - 1), 1.0)
+                indices[..., 1] /= max(float(grid[1] - 1), 1.0)
+                group_metadata = np.concatenate(
+                    [
+                        points,
+                        coverage[..., None],
+                        confidence[..., None],
+                        indices,
+                    ],
+                    axis=-1,
+                )
+                group_valid = np.asarray(
+                    pi3x[f"{prefix}_valid"][positions], dtype=bool
+                )
+                token_features.append(group_features)
+                token_metadata.append(group_metadata)
+                token_valid.append(group_valid)
+                token_types.append(
+                    np.full(group_valid.shape, type_index, dtype=np.int64)
+                )
+            sample.update(
+                {
+                    "token_features": torch.from_numpy(
+                        np.concatenate(token_features, axis=1)
+                    ),
+                    "token_metadata": torch.from_numpy(
+                        np.concatenate(token_metadata, axis=1)
+                    ),
+                    "token_valid": torch.from_numpy(
+                        np.concatenate(token_valid, axis=1)
+                    ),
+                    "token_types": torch.from_numpy(
+                        np.concatenate(token_types, axis=1)
+                    ),
+                }
+            )
+        return sample
 
 
 class RelativeTranslationRefiner(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, layers: int, dropout: float):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        layers: int,
+        dropout: float,
+        pi3x_feature_dim: int = 0,
+        pi3x_metadata_dim: int = 0,
+        spatial_layers: int = 1,
+        heads: int = 8,
+    ):
         super().__init__()
+        self.pi3x_enabled = pi3x_feature_dim > 0
         self.frame_encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -248,6 +346,38 @@ class RelativeTranslationRefiner(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
         )
+        if self.pi3x_enabled:
+            self.token_feature_projection = nn.Sequential(
+                nn.LayerNorm(pi3x_feature_dim),
+                nn.Linear(pi3x_feature_dim, hidden_dim),
+            )
+            self.token_metadata_projection = nn.Sequential(
+                nn.Linear(pi3x_metadata_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            self.token_type_embedding = nn.Embedding(
+                len(TOKEN_GROUPS), hidden_dim
+            )
+            spatial_layer = nn.TransformerEncoderLayer(
+                d_model=hidden_dim,
+                nhead=heads,
+                dim_feedforward=hidden_dim * 2,
+                dropout=dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.spatial_encoder = nn.TransformerEncoder(
+                spatial_layer, num_layers=spatial_layers
+            )
+            self.pi3x_fusion = nn.Sequential(
+                nn.Linear(hidden_dim * 3, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            nn.init.zeros_(self.pi3x_fusion[-1].weight)
+            nn.init.zeros_(self.pi3x_fusion[-1].bias)
         self.temporal = nn.GRU(
             hidden_dim,
             hidden_dim,
@@ -263,8 +393,48 @@ class RelativeTranslationRefiner(nn.Module):
             nn.Linear(hidden_dim, 3),
         )
 
-    def forward(self, features: torch.Tensor, max_correction: float) -> torch.Tensor:
+    @staticmethod
+    def masked_pool(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        weight = mask.to(value.dtype).unsqueeze(-1)
+        return (value * weight).sum(dim=2) / weight.sum(dim=2).clamp_min(1.0)
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        max_correction: float,
+        token_features: Optional[torch.Tensor] = None,
+        token_metadata: Optional[torch.Tensor] = None,
+        token_valid: Optional[torch.Tensor] = None,
+        token_types: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         encoded = self.frame_encoder(features)
+        if self.pi3x_enabled:
+            if any(
+                value is None
+                for value in (
+                    token_features,
+                    token_metadata,
+                    token_valid,
+                    token_types,
+                )
+            ):
+                raise ValueError("Pi3X tokens are required by this checkpoint")
+            batch, frames, tokens, _ = token_features.shape
+            token = self.token_feature_projection(token_features)
+            token = token + self.token_metadata_projection(token_metadata)
+            token = token + self.token_type_embedding(token_types)
+            flat = token.reshape(batch * frames, tokens, -1)
+            flat_valid = token_valid.reshape(batch * frames, tokens).clone()
+            missing = ~flat_valid.any(dim=1)
+            flat_valid[missing, 0] = True
+            spatial = self.spatial_encoder(
+                flat, src_key_padding_mask=~flat_valid
+            ).reshape(batch, frames, tokens, -1)
+            pooled = []
+            for type_index in range(len(TOKEN_GROUPS)):
+                mask = token_valid & (token_types == type_index)
+                pooled.append(self.masked_pool(spatial, mask))
+            encoded = encoded + self.pi3x_fusion(torch.cat(pooled, dim=-1))
         temporal, _ = self.temporal(encoded)
         return torch.tanh(self.head(temporal)) * max_correction
 
@@ -287,7 +457,14 @@ def temporal_loss(value, target, mask, order, beta):
 
 def compute_loss(model, batch, args):
     batch = {key: value.to(args.device) for key, value in batch.items()}
-    correction = model(batch["features"], args.max_correction_mm / 1000.0)
+    correction = model(
+        batch["features"],
+        args.max_correction_mm / 1000.0,
+        batch.get("token_features"),
+        batch.get("token_metadata"),
+        batch.get("token_valid"),
+        batch.get("token_types"),
+    )
     corrected = batch["relative_initial"] + correction
     beta = args.smooth_l1_beta_mm / 1000.0
     magnitude_mm = batch["target_magnitude"] * 1000.0
@@ -410,6 +587,10 @@ def run_epoch(model, loader, args, optimizer=None, split="train"):
 
 def main() -> None:
     args = parse_args()
+    if bool(args.pi3x_train_root) != bool(args.pi3x_val_root):
+        raise ValueError(
+            "--pi3x-train-root and --pi3x-val-root must be used together"
+        )
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -422,6 +603,11 @@ def main() -> None:
             if args.relative_train_root
             else None
         ),
+        (
+            Path(args.pi3x_train_root).expanduser().resolve()
+            if args.pi3x_train_root
+            else None
+        ),
     )
     val_data = RelativeWindowDataset(
         Path(args.val_windows).expanduser().resolve(),
@@ -430,6 +616,11 @@ def main() -> None:
         (
             Path(args.relative_val_root).expanduser().resolve()
             if args.relative_val_root
+            else None
+        ),
+        (
+            Path(args.pi3x_val_root).expanduser().resolve()
+            if args.pi3x_val_root
             else None
         ),
     )
@@ -450,9 +641,48 @@ def main() -> None:
         persistent_workers=args.num_workers > 0,
     )
     input_dim = int(train_data[0]["features"].shape[-1])
+    sample = train_data[0]
+    pi3x_feature_dim = (
+        int(sample["token_features"].shape[-1])
+        if "token_features" in sample
+        else 0
+    )
+    pi3x_metadata_dim = (
+        int(sample["token_metadata"].shape[-1])
+        if "token_metadata" in sample
+        else 0
+    )
     model = RelativeTranslationRefiner(
-        input_dim, args.hidden_dim, args.layers, args.dropout
+        input_dim,
+        args.hidden_dim,
+        args.layers,
+        args.dropout,
+        pi3x_feature_dim,
+        pi3x_metadata_dim,
+        args.spatial_layers,
+        args.heads,
     ).to(args.device)
+    if args.init_checkpoint:
+        init_path = Path(args.init_checkpoint).expanduser().resolve()
+        init_checkpoint = torch.load(init_path, map_location="cpu")
+        current = model.state_dict()
+        compatible = {
+            key: value
+            for key, value in init_checkpoint["model"].items()
+            if key in current and current[key].shape == value.shape
+        }
+        missing, unexpected = model.load_state_dict(compatible, strict=False)
+        print(
+            json.dumps(
+                {
+                    "init_checkpoint": str(init_path),
+                    "loaded_tensors": len(compatible),
+                    "new_tensors": len(missing),
+                    "unexpected_tensors": len(unexpected),
+                }
+            ),
+            flush=True,
+        )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
@@ -479,9 +709,15 @@ def main() -> None:
             "model": model.state_dict(),
             "args": vars(args),
             "input_dim": input_dim,
+            "pi3x_feature_dim": pi3x_feature_dim,
+            "pi3x_metadata_dim": pi3x_metadata_dim,
             "epoch": epoch,
             "val_total": val_metrics["total"],
-            "model_version": "relative_translation_mlp_bigru_weighted_v2",
+            "model_version": (
+                "relative_translation_pi3x_spatial_bigru_weighted_v3"
+                if pi3x_feature_dim > 0
+                else "relative_translation_mlp_bigru_weighted_v2"
+            ),
         }
         torch.save(checkpoint, out_dir / "last.pt")
         if val_metrics["total"] < best:
