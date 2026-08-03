@@ -61,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-weight-ge30", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--data-parallel", action="store_true")
     return parser.parse_args()
 
 
@@ -733,6 +734,23 @@ def main() -> None:
         ),
         flush=True,
     )
+    if args.data_parallel:
+        if not str(args.device).startswith("cuda"):
+            raise ValueError("--data-parallel requires --device cuda")
+        if torch.cuda.device_count() < 2:
+            raise RuntimeError(
+                "--data-parallel requires at least two visible CUDA devices"
+            )
+        model = nn.DataParallel(model)
+        print(
+            json.dumps(
+                {
+                    "data_parallel": True,
+                    "visible_cuda_devices": torch.cuda.device_count(),
+                }
+            ),
+            flush=True,
+        )
     optimizer = torch.optim.AdamW(
         trainable_parameters, lr=args.lr, weight_decay=args.weight_decay
     )
@@ -756,7 +774,11 @@ def main() -> None:
         history.append(row)
         print(json.dumps(row), flush=True)
         checkpoint = {
-            "model": model.state_dict(),
+            "model": (
+                model.module.state_dict()
+                if isinstance(model, nn.DataParallel)
+                else model.state_dict()
+            ),
             "args": vars(args),
             "input_dim": input_dim,
             "pi3x_feature_dim": pi3x_feature_dim,
