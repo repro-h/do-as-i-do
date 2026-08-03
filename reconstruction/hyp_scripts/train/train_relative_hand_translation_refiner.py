@@ -44,6 +44,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--spatial-layers", type=int, default=1)
     parser.add_argument("--heads", type=int, default=8)
+    parser.add_argument("--pi3x-gate-start-mm", type=float, default=0.0)
+    parser.add_argument("--pi3x-gate-full-mm", type=float, default=0.0)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--max-correction-mm", type=float, default=120.0)
     parser.add_argument("--max-object-center-error-mm", type=float, default=30.0)
@@ -407,8 +409,12 @@ class RelativeTranslationRefiner(nn.Module):
         token_metadata: Optional[torch.Tensor] = None,
         token_valid: Optional[torch.Tensor] = None,
         token_types: Optional[torch.Tensor] = None,
+        pi3x_gate_start: float = 0.0,
+        pi3x_gate_full: float = 0.0,
     ) -> torch.Tensor:
         encoded = self.frame_encoder(features)
+        base_temporal, _ = self.temporal(encoded)
+        base_correction = torch.tanh(self.head(base_temporal)) * max_correction
         if self.pi3x_enabled:
             if any(
                 value is None
@@ -435,9 +441,23 @@ class RelativeTranslationRefiner(nn.Module):
             for type_index in range(len(TOKEN_GROUPS)):
                 mask = token_valid & (token_types == type_index)
                 pooled.append(self.masked_pool(spatial, mask))
-            encoded = encoded + self.pi3x_fusion(torch.cat(pooled, dim=-1))
-        temporal, _ = self.temporal(encoded)
-        return torch.tanh(self.head(temporal)) * max_correction
+            adapted = encoded + self.pi3x_fusion(torch.cat(pooled, dim=-1))
+            adapted_temporal, _ = self.temporal(adapted)
+            adapted_correction = (
+                torch.tanh(self.head(adapted_temporal)) * max_correction
+            )
+            if pi3x_gate_full > pi3x_gate_start:
+                magnitude = torch.linalg.norm(base_correction, dim=-1)
+                gate = (
+                    (magnitude - pi3x_gate_start)
+                    / (pi3x_gate_full - pi3x_gate_start)
+                ).clamp(0.0, 1.0)
+                gate = gate.square() * (3.0 - 2.0 * gate)
+                return base_correction + gate.unsqueeze(-1) * (
+                    adapted_correction - base_correction
+                )
+            return adapted_correction
+        return base_correction
 
 
 def masked_smooth_l1(value, target, mask, beta, sample_weight=None):
@@ -465,6 +485,8 @@ def compute_loss(model, batch, args):
         batch.get("token_metadata"),
         batch.get("token_valid"),
         batch.get("token_types"),
+        args.pi3x_gate_start_mm / 1000.0,
+        args.pi3x_gate_full_mm / 1000.0,
     )
     corrected = batch["relative_initial"] + correction
     beta = args.smooth_l1_beta_mm / 1000.0
@@ -742,7 +764,11 @@ def main() -> None:
             "epoch": epoch,
             "val_total": val_metrics["total"],
             "model_version": (
-                "relative_translation_pi3x_spatial_bigru_weighted_v3"
+                (
+                    "relative_translation_pi3x_gated_spatial_bigru_v4"
+                    if args.pi3x_gate_full_mm > args.pi3x_gate_start_mm
+                    else "relative_translation_pi3x_spatial_bigru_weighted_v3"
+                )
                 if pi3x_feature_dim > 0
                 else "relative_translation_mlp_bigru_weighted_v2"
             ),

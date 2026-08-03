@@ -201,6 +201,8 @@ def main() -> None:
                     if "token_types" in batch
                     else None
                 ),
+                float(config.get("pi3x_gate_start_mm", 0.0)) / 1000.0,
+                float(config.get("pi3x_gate_full_mm", 0.0)) / 1000.0,
             ).cpu().numpy()
             for index, stream_id in enumerate(batch["stream_id"]):
                 supervision_path = str(batch["supervision_npz"][index])
