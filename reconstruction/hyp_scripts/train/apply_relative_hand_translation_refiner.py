@@ -8,6 +8,7 @@ import json
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 
 import numpy as np
 import torch
@@ -27,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--windows", required=True)
     parser.add_argument("--global-root", required=True)
+    parser.add_argument("--relative-root")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--handflow-root", required=True)
     parser.add_argument("--out-root", required=True)
@@ -38,10 +40,20 @@ def parse_args() -> argparse.Namespace:
 
 
 class InferenceDataset(Dataset):
-    def __init__(self, windows: Path, global_root: Path, config: dict):
+    def __init__(
+        self,
+        windows: Path,
+        global_root: Path,
+        config: dict,
+        relative_root: Optional[Path] = None,
+    ):
         self.rows = load_jsonl(windows)
+        self.relative_root = relative_root
         self.base = RelativeWindowDataset(
-            windows, global_root, SimpleNamespace(**config)
+            windows,
+            global_root,
+            SimpleNamespace(**config),
+            relative_root,
         )
 
     def __len__(self) -> int:
@@ -50,10 +62,15 @@ class InferenceDataset(Dataset):
     def __getitem__(self, index: int) -> dict:
         row = self.rows[index]
         sample = self.base[index]
+        supervision_path = (
+            self.relative_root / f"{row['stream_id']}.npz"
+            if self.relative_root is not None
+            else Path(row["supervision_npz"])
+        ).resolve()
         return {
             "features": sample["features"],
             "stream_id": row["stream_id"],
-            "supervision_npz": row["supervision_npz"],
+            "supervision_npz": str(supervision_path),
             "start": int(row["start"]),
             "end": int(row["end"]),
         }
@@ -119,7 +136,14 @@ def main() -> None:
 
     windows = Path(args.windows).expanduser().resolve()
     dataset = InferenceDataset(
-        windows, Path(args.global_root).expanduser().resolve(), config
+        windows,
+        Path(args.global_root).expanduser().resolve(),
+        config,
+        (
+            Path(args.relative_root).expanduser().resolve()
+            if args.relative_root
+            else None
+        ),
     )
     loader = DataLoader(
         dataset,
