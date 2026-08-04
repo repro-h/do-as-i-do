@@ -52,6 +52,16 @@ def parse_args() -> argparse.Namespace:
         default=15.0,
     )
     parser.add_argument("--symmetry-axis-flip", action="store_true")
+    parser.add_argument(
+        "--symmetry-selection-mode",
+        choices=("sequence", "temporal"),
+        default="sequence",
+    )
+    parser.add_argument(
+        "--symmetry-yaw-transition-mm-per-deg",
+        type=float,
+        default=0.2,
+    )
     parser.add_argument("--out-dir", required=True)
     return parser.parse_args()
 
@@ -217,7 +227,7 @@ def transform_between_poses(
     return transform[:3, :3], transform[:3, 3]
 
 
-def select_sequence_symmetry(
+def symmetry_data_costs(
     candidates: list[dict],
     frame_ids: np.ndarray,
     gt_rows: dict[str, np.ndarray],
@@ -225,14 +235,15 @@ def select_sequence_symmetry(
     gt_joints: np.ndarray,
     supervision_valid: np.ndarray,
     normalized_left: bool,
-) -> tuple[dict, list[dict]]:
-    scored = []
-    for candidate in candidates:
+) -> tuple[np.ndarray, np.ndarray]:
+    count = min(len(frame_ids), len(filtered_pose))
+    costs = np.full((count, len(candidates)), np.inf, dtype=np.float64)
+    counts = np.zeros((count, len(candidates)), dtype=np.int32)
+    for candidate_index, candidate in enumerate(candidates):
         symmetry = np.asarray(candidate["matrix"], dtype=np.float64)
         if normalized_left:
             symmetry = mirror_pose(symmetry)
-        errors = []
-        for index in range(min(len(frame_ids), len(filtered_pose))):
+        for index in range(count):
             if not supervision_valid[index]:
                 continue
             frame = frame_string(frame_ids[index], index)
@@ -247,24 +258,149 @@ def select_sequence_symmetry(
             target = apply_transform(
                 gt_joints[index, PALM], rotation, translation
             )
-            errors.extend(
-                np.linalg.norm(target - gt_joints[index, PALM], axis=-1)
-                .tolist()
+            errors = np.linalg.norm(
+                target - gt_joints[index, PALM], axis=-1
             )
-        score = float(np.median(errors) * 1000.0) if errors else np.inf
+            errors = errors[np.isfinite(errors)]
+            if len(errors):
+                costs[index, candidate_index] = float(
+                    np.median(errors) * 1000.0
+                )
+                counts[index, candidate_index] = len(errors)
+    return costs, counts
+
+
+def select_sequence_symmetry(
+    candidates: list[dict], costs: np.ndarray
+) -> tuple[np.ndarray, dict, list[dict]]:
+    scored = []
+    for candidate_index, candidate in enumerate(candidates):
+        values = costs[:, candidate_index]
+        values = values[np.isfinite(values)]
+        score = float(np.median(values)) if len(values) else np.inf
         scored.append(
             {
+                "candidate_index": candidate_index,
                 "angle_deg": candidate["angle_deg"],
                 "flipped": candidate["flipped"],
                 "palm_3d_median_mm": score,
-                "num_values": len(errors),
+                "num_values": int(len(values)),
                 "matrix": candidate["matrix"],
             }
         )
     scored.sort(key=lambda row: row["palm_3d_median_mm"])
     if not scored or not np.isfinite(scored[0]["palm_3d_median_mm"]):
         raise RuntimeError("No valid sequence symmetry candidate")
-    return scored[0], scored
+    selected = np.full(
+        len(costs), scored[0]["candidate_index"], dtype=np.int64
+    )
+    audit = {
+        "mode": "sequence",
+        "selected_angle_deg": scored[0]["angle_deg"],
+        "selected_flipped": scored[0]["flipped"],
+        "selected_palm_3d_median_mm": scored[0]["palm_3d_median_mm"],
+    }
+    return selected, audit, scored
+
+
+def circular_angle_difference(first: np.ndarray, second: np.ndarray) -> np.ndarray:
+    difference = np.abs(first[:, None] - second[None, :])
+    return np.minimum(difference, 360.0 - difference)
+
+
+def select_temporal_symmetry(
+    candidates: list[dict],
+    costs: np.ndarray,
+    transition_mm_per_deg: float,
+) -> tuple[np.ndarray, dict, list[dict]]:
+    valid_frames = np.flatnonzero(np.isfinite(costs).any(axis=1))
+    if not len(valid_frames):
+        raise RuntimeError("No valid temporal symmetry frames")
+    solutions = []
+    for flipped in sorted({bool(row["flipped"]) for row in candidates}):
+        states = np.asarray(
+            [
+                index for index, row in enumerate(candidates)
+                if bool(row["flipped"]) == flipped
+            ],
+            dtype=np.int64,
+        )
+        angles = np.asarray(
+            [candidates[index]["angle_deg"] for index in states],
+            dtype=np.float64,
+        )
+        transition = (
+            circular_angle_difference(angles, angles)
+            * transition_mm_per_deg
+        )
+        back = np.full((len(valid_frames), len(states)), -1, dtype=np.int64)
+        previous = costs[valid_frames[0], states].copy()
+        for step, frame in enumerate(valid_frames[1:], start=1):
+            total = previous[:, None] + transition
+            back[step] = np.argmin(total, axis=0)
+            previous = costs[frame, states] + np.min(total, axis=0)
+        state = int(np.argmin(previous))
+        selected_states = np.full(len(valid_frames), state, dtype=np.int64)
+        for step in range(len(valid_frames) - 1, 0, -1):
+            selected_states[step - 1] = back[step, selected_states[step]]
+        selected_candidates = states[selected_states]
+        solutions.append(
+            {
+                "flipped": flipped,
+                "total_cost": float(previous[state]),
+                "selected": selected_candidates,
+            }
+        )
+    solution = min(solutions, key=lambda row: row["total_cost"])
+    selected = np.full(len(costs), int(solution["selected"][0]), dtype=np.int64)
+    selected[valid_frames] = solution["selected"]
+    for frame in range(valid_frames[0] - 1, -1, -1):
+        selected[frame] = selected[frame + 1]
+    for frame in range(valid_frames[0] + 1, len(selected)):
+        if frame not in set(valid_frames.tolist()):
+            selected[frame] = selected[frame - 1]
+
+    selected_costs = costs[valid_frames, selected[valid_frames]]
+    selected_angles = np.asarray(
+        [candidates[index]["angle_deg"] for index in selected],
+        dtype=np.float64,
+    )
+    steps = np.minimum(
+        np.abs(np.diff(selected_angles)),
+        360.0 - np.abs(np.diff(selected_angles)),
+    )
+    candidate_scores = []
+    for index, candidate in enumerate(candidates):
+        values = costs[:, index]
+        values = values[np.isfinite(values)]
+        candidate_scores.append(
+            {
+                "candidate_index": index,
+                "angle_deg": candidate["angle_deg"],
+                "flipped": candidate["flipped"],
+                "palm_3d_median_mm": (
+                    float(np.median(values)) if len(values) else np.inf
+                ),
+                "num_values": int(len(values)),
+                "matrix": candidate["matrix"],
+            }
+        )
+    candidate_scores.sort(key=lambda row: row["palm_3d_median_mm"])
+    audit = {
+        "mode": "temporal",
+        "selected_flipped": bool(solution["flipped"]),
+        "selected_palm_3d_median_mm": float(np.median(selected_costs)),
+        "selected_angle_min_deg": float(np.min(selected_angles)),
+        "selected_angle_max_deg": float(np.max(selected_angles)),
+        "selected_angle_step_median_deg": (
+            float(np.median(steps)) if len(steps) else 0.0
+        ),
+        "selected_angle_step_max_deg": (
+            float(np.max(steps)) if len(steps) else 0.0
+        ),
+        "total_cost": solution["total_cost"],
+    }
+    return selected, audit, candidate_scores
 
 
 def distribution(values: np.ndarray, unit: str = "mm") -> dict:
@@ -352,7 +488,7 @@ def main() -> None:
         args.symmetry_step_deg,
         args.symmetry_axis_flip,
     )
-    selected_symmetry, symmetry_scores = select_sequence_symmetry(
+    symmetry_costs, _ = symmetry_data_costs(
         candidates,
         frame_ids[:count],
         gt_rows,
@@ -361,13 +497,31 @@ def main() -> None:
         supervision_valid[:count],
         normalized_left,
     )
-    symmetry_original = np.asarray(
-        selected_symmetry["matrix"], dtype=np.float64
+    if args.symmetry_selection_mode == "temporal":
+        selected_symmetry_indices, symmetry_selection, symmetry_scores = (
+            select_temporal_symmetry(
+                candidates,
+                symmetry_costs,
+                args.symmetry_yaw_transition_mm_per_deg,
+            )
+        )
+    else:
+        selected_symmetry_indices, symmetry_selection, symmetry_scores = (
+            select_sequence_symmetry(candidates, symmetry_costs)
+        )
+    selected_symmetry_angles = np.asarray(
+        [
+            candidates[index]["angle_deg"]
+            for index in selected_symmetry_indices
+        ],
+        dtype=np.float32,
     )
-    symmetry_normalized = (
-        mirror_pose(symmetry_original)
-        if normalized_left
-        else symmetry_original
+    selected_symmetry_flipped = np.asarray(
+        [
+            candidates[index]["flipped"]
+            for index in selected_symmetry_indices
+        ],
+        dtype=bool,
     )
     target_vertices = np.full_like(gt_vertices[:count], np.nan)
     target_joints = np.full_like(gt_joints[:count], np.nan)
@@ -380,6 +534,15 @@ def main() -> None:
     frame_rows = []
 
     for index in range(count):
+        symmetry_original = np.asarray(
+            candidates[selected_symmetry_indices[index]]["matrix"],
+            dtype=np.float64,
+        )
+        symmetry_normalized = (
+            mirror_pose(symmetry_original)
+            if normalized_left
+            else symmetry_original
+        )
         frame = frame_string(frame_ids[index], index)
         filtered_pose = filtered_rows.get(frame)
         gt_pose_original = gt_rows.get(frame)
@@ -495,6 +658,9 @@ def main() -> None:
         v8_target_translation_camera=v8_delta_camera.astype(np.float32),
         v8_target_translation_object=v8_delta_object.astype(np.float32),
         target_2d_palm_error_px=target_2d_error.astype(np.float32),
+        selected_symmetry_angle_deg=selected_symmetry_angles,
+        selected_symmetry_flipped=selected_symmetry_flipped,
+        selected_symmetry_candidate_index=selected_symmetry_indices,
         transform_mode=np.asarray(args.transform_mode),
         normalized_left=np.asarray(normalized_left),
     )
@@ -539,12 +705,17 @@ def main() -> None:
             "axis": args.symmetry_axis,
             "step_deg": args.symmetry_step_deg,
             "allow_axis_flip": args.symmetry_axis_flip,
-            "selected_angle_deg": selected_symmetry["angle_deg"],
-            "selected_flipped": selected_symmetry["flipped"],
-            "selected_palm_3d_median_mm": selected_symmetry[
-                "palm_3d_median_mm"
-            ],
-            "selected_matrix": symmetry_original.tolist(),
+            "selection_mode": args.symmetry_selection_mode,
+            "yaw_transition_mm_per_deg": (
+                args.symmetry_yaw_transition_mm_per_deg
+            ),
+            **symmetry_selection,
+            "selected_angle_deg_by_frame": (
+                selected_symmetry_angles.astype(float).tolist()
+            ),
+            "selected_flipped_by_frame": (
+                selected_symmetry_flipped.tolist()
+            ),
             "top_candidates": [
                 {
                     key: value

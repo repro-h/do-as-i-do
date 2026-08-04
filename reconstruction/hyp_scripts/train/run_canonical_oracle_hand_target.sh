@@ -9,6 +9,8 @@ PORT=${PORT:-8098}
 SYMMETRY_AXIS=${SYMMETRY_AXIS:-none}
 SYMMETRY_STEP_DEG=${SYMMETRY_STEP_DEG:-15}
 SYMMETRY_AXIS_FLIP=${SYMMETRY_AXIS_FLIP:-0}
+SYMMETRY_SELECTION_MODE=${SYMMETRY_SELECTION_MODE:-sequence}
+SYMMETRY_YAW_TRANSITION=${SYMMETRY_YAW_TRANSITION:-0.2}
 
 subject=$(basename "$(dirname "$(dirname "$SEQ_DIR")")")
 sequence=$(basename "$(dirname "$SEQ_DIR")")
@@ -113,6 +115,8 @@ done
 symmetry_args=(
   --symmetry-axis "$SYMMETRY_AXIS"
   --symmetry-step-deg "$SYMMETRY_STEP_DEG"
+  --symmetry-selection-mode "$SYMMETRY_SELECTION_MODE"
+  --symmetry-yaw-transition-mm-per-deg "$SYMMETRY_YAW_TRANSITION"
 )
 if [[ "$SYMMETRY_AXIS_FLIP" == "1" ]]; then
   symmetry_args+=(--symmetry-axis-flip)
