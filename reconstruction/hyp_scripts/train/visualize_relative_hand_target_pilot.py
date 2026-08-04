@@ -163,7 +163,7 @@ def main() -> None:
     )
     controls = {
         "raw": server.gui.add_checkbox("Raw HandFlow", initial_value=False),
-        "v8": server.gui.add_checkbox("V8 hand", initial_value=True),
+        "v8": server.gui.add_checkbox("V8 hand", initial_value=False),
         "gt": server.gui.add_checkbox("GT hand", initial_value=False),
         "target": server.gui.add_checkbox(
             "Relative target", initial_value=True
@@ -237,14 +237,14 @@ def main() -> None:
         raw_mm = float(np.linalg.norm(
             target_data["raw_target_translation_camera"][frame]
         ) * 1000.0)
-        v8_mm = float(np.linalg.norm(
-            target_data["v8_target_translation_camera"][frame]
-        ) * 1000.0)
+        v8_delta = target_data["v8_target_translation_camera"][frame]
+        v8_mm = float(np.linalg.norm(v8_delta) * 1000.0)
+        v8_text = f"{v8_mm:.2f}mm" if np.isfinite(v8_mm) else "n/a"
         reprojection = float(target_data["target_2d_palm_error_px"][frame])
         print(
             f"frame={frame_id} valid={target_valid} "
             f"raw_to_target={raw_mm:.2f}mm "
-            f"v8_to_target={v8_mm:.2f}mm "
+            f"v8_to_target={v8_text} "
             f"target_2d={reprojection:.2f}px",
             flush=True,
         )

@@ -531,6 +531,7 @@ def main() -> None:
     v8_delta_object = np.full((count, 3), np.nan, dtype=np.float64)
     target_2d_error = np.full(count, np.nan, dtype=np.float64)
     valid = np.zeros(count, dtype=bool)
+    v8_valid = np.zeros(count, dtype=bool)
     frame_rows = []
 
     for index in range(count):
@@ -546,13 +547,22 @@ def main() -> None:
         frame = frame_string(frame_ids[index], index)
         filtered_pose = filtered_rows.get(frame)
         gt_pose_original = gt_rows.get(frame)
-        if (
-            filtered_pose is None
-            or gt_pose_original is None
-            or not gt_mesh_valid[index]
-            or not supervision_valid[index]
-            or not v8_predicted[index]
-        ):
+        invalid_reasons = []
+        if filtered_pose is None:
+            invalid_reasons.append("missing_filtered_object_pose")
+        if gt_pose_original is None:
+            invalid_reasons.append("missing_gt_object_pose")
+        if not gt_mesh_valid[index]:
+            invalid_reasons.append("invalid_gt_hand_mesh")
+        if not supervision_valid[index]:
+            invalid_reasons.append("invalid_global_supervision")
+        if invalid_reasons:
+            frame_rows.append({
+                "frame": frame,
+                "valid": False,
+                "invalid_reasons": invalid_reasons,
+                "v8_predicted": bool(v8_predicted[index]),
+            })
             continue
 
         if args.transform_mode == "full_se3":
@@ -591,12 +601,14 @@ def main() -> None:
         raw_delta_camera[index] = np.median(
             target_joints[index, PALM] - handflow_joints[index, PALM], axis=0
         )
-        v8_delta_camera[index] = np.median(
-            target_joints[index, PALM] - v8_joints[PALM], axis=0
-        )
         rotation_fp = fp_pose_normalized[index, :3, :3]
         raw_delta_object[index] = rotation_fp.T @ raw_delta_camera[index]
-        v8_delta_object[index] = rotation_fp.T @ v8_delta_camera[index]
+        if v8_predicted[index]:
+            v8_delta_camera[index] = np.median(
+                target_joints[index, PALM] - v8_joints[PALM], axis=0
+            )
+            v8_delta_object[index] = rotation_fp.T @ v8_delta_camera[index]
+            v8_valid[index] = True
 
         projected = target_joints[index, PALM].copy()
         z = np.maximum(projected[:, 2], 1e-6)
@@ -613,11 +625,16 @@ def main() -> None:
         valid[index] = True
         frame_rows.append({
             "frame": frame,
+            "valid": True,
+            "invalid_reasons": [],
+            "v8_predicted": bool(v8_predicted[index]),
             "raw_target_translation_mm": (
                 np.linalg.norm(raw_delta_camera[index]) * 1000.0
             ),
             "v8_target_translation_mm": (
                 np.linalg.norm(v8_delta_camera[index]) * 1000.0
+                if v8_valid[index]
+                else None
             ),
             "target_2d_palm_error_px": target_2d_error[index],
         })
@@ -652,6 +669,7 @@ def main() -> None:
         supervision_out,
         frame_ids=frame_ids[:count],
         valid=valid,
+        v8_valid=v8_valid,
         target_joints_3d=target_joints.astype(np.float32),
         raw_target_translation_camera=raw_delta_camera.astype(np.float32),
         raw_target_translation_object=raw_delta_object.astype(np.float32),
@@ -666,7 +684,9 @@ def main() -> None:
     )
 
     raw_magnitude = np.linalg.norm(raw_delta_camera[valid], axis=-1) * 1000.0
-    v8_magnitude = np.linalg.norm(v8_delta_camera[valid], axis=-1) * 1000.0
+    v8_magnitude = (
+        np.linalg.norm(v8_delta_camera[v8_valid], axis=-1) * 1000.0
+    )
     audit = {
         "supervision": str(paths["supervision"]),
         "prediction": str(paths["prediction"]),
@@ -727,6 +747,7 @@ def main() -> None:
         },
         "num_frames": count,
         "num_valid": int(valid.sum()),
+        "num_v8_valid": int(v8_valid.sum()),
         "raw_target_translation": distribution(raw_magnitude),
         "v8_target_translation": distribution(v8_magnitude),
         "target_2d_palm_error_px": distribution(
