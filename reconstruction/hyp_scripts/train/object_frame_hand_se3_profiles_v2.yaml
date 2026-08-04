@@ -42,8 +42,11 @@ objects:
   024_bowl:
     symmetry: {axis: y, step_deg: 15.0, allow_axis_flip: false, selection_mode: temporal}
     pose_gate: {enabled: false}
+  036_wood_block:
+    symmetry: {axis: y, step_deg: 180.0, allow_axis_flip: true, selection_mode: sequence}
+    pose_gate: {enabled: false}
   040_large_marker:
-    symmetry: {axis: y, step_deg: 15.0, allow_axis_flip: false, selection_mode: temporal}
+    symmetry: {axis: y, step_deg: 5.0, allow_axis_flip: false, selection_mode: temporal}
     pose_gate: {enabled: false}
   052_extra_large_clamp:
     pose_gate: {enabled: true, max_rotation_error_deg: 45.0, max_translation_error_mm: 40.0}
