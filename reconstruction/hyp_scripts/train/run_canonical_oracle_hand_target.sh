@@ -6,6 +6,9 @@ PI3_PYTHON=${PI3_PYTHON:-/home/mengxiangting/nas/mengxt/anaconda3/envs/pi3/bin/p
 VIS_PYTHON=${VIS_PYTHON:-/home/mengxiangting/nas/mengxt/anaconda3/envs/sam3d-objects/bin/python}
 SEQ_DIR=${SEQ_DIR:-$DO_AS_I_DO/reconstruction/data/dexycb/foundationpose_quality_filter_v2/val/passed/20200709-subject-01/20200709_143531/836212060125}
 PORT=${PORT:-8098}
+SYMMETRY_AXIS=${SYMMETRY_AXIS:-none}
+SYMMETRY_STEP_DEG=${SYMMETRY_STEP_DEG:-15}
+SYMMETRY_AXIS_FLIP=${SYMMETRY_AXIS_FLIP:-0}
 
 subject=$(basename "$(dirname "$(dirname "$SEQ_DIR")")")
 sequence=$(basename "$(dirname "$SEQ_DIR")")
@@ -107,6 +110,14 @@ do
   fi
 done
 
+symmetry_args=(
+  --symmetry-axis "$SYMMETRY_AXIS"
+  --symmetry-step-deg "$SYMMETRY_STEP_DEG"
+)
+if [[ "$SYMMETRY_AXIS_FLIP" == "1" ]]; then
+  symmetry_args+=(--symmetry-axis-flip)
+fi
+
 "$PI3_PYTHON" -u "$PREPARE_TARGET" \
   --supervision-npz "$SUPERVISION" \
   --v8-prediction-npz "$V8_PREDICTION" \
@@ -121,6 +132,7 @@ done
   --object-mesh-scale "$OBJECT_SCALE" \
   --hand-side "$HAND_SIDE" \
   --transform-mode full_se3 \
+  "${symmetry_args[@]}" \
   --out-dir "$OUT_DIR"
 
 echo "Stream: $STREAM_ID"

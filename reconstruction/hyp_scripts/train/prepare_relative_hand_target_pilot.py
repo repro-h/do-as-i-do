@@ -41,6 +41,17 @@ def parse_args() -> argparse.Namespace:
         choices=("translation_only", "full_se3"),
         default="translation_only",
     )
+    parser.add_argument(
+        "--symmetry-axis",
+        choices=("none", "x", "y", "z"),
+        default="none",
+    )
+    parser.add_argument(
+        "--symmetry-step-deg",
+        type=float,
+        default=15.0,
+    )
+    parser.add_argument("--symmetry-axis-flip", action="store_true")
     parser.add_argument("--out-dir", required=True)
     return parser.parse_args()
 
@@ -152,6 +163,110 @@ def apply_transform(
     return points @ rotation.T + translation
 
 
+def axis_rotation(axis: str, angle_rad: float) -> np.ndarray:
+    index = {"x": 0, "y": 1, "z": 2}[axis]
+    first = (index + 1) % 3
+    second = (index + 2) % 3
+    cosine = np.cos(angle_rad)
+    sine = np.sin(angle_rad)
+    matrix = np.eye(3, dtype=np.float64)
+    matrix[first, first] = cosine
+    matrix[second, second] = cosine
+    matrix[first, second] = -sine
+    matrix[second, first] = sine
+    return matrix
+
+
+def symmetry_candidates(
+    axis: str, step_deg: float, allow_flip: bool
+) -> list[dict]:
+    if axis == "none":
+        return [{"angle_deg": 0.0, "flipped": False, "matrix": np.eye(4)}]
+    if not 0.0 < step_deg <= 360.0:
+        raise ValueError("symmetry-step-deg must be in (0, 360]")
+    count = max(1, int(round(360.0 / step_deg)))
+    angles = np.linspace(0.0, 360.0, count, endpoint=False)
+    flip = np.eye(3, dtype=np.float64)
+    if allow_flip:
+        perpendicular = "xyz"[("xyz".index(axis) + 1) % 3]
+        flip = axis_rotation(perpendicular, np.pi)
+    candidates = []
+    for flipped in ([False, True] if allow_flip else [False]):
+        for angle in angles:
+            rotation = axis_rotation(axis, np.radians(angle))
+            if flipped:
+                rotation = rotation @ flip
+            matrix = np.eye(4, dtype=np.float64)
+            matrix[:3, :3] = rotation
+            candidates.append(
+                {
+                    "angle_deg": float(angle),
+                    "flipped": bool(flipped),
+                    "matrix": matrix,
+                }
+            )
+    return candidates
+
+
+def transform_between_poses(
+    source_pose: np.ndarray,
+    target_pose: np.ndarray,
+    symmetry: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    transform = target_pose @ symmetry @ np.linalg.inv(source_pose)
+    return transform[:3, :3], transform[:3, 3]
+
+
+def select_sequence_symmetry(
+    candidates: list[dict],
+    frame_ids: np.ndarray,
+    gt_rows: dict[str, np.ndarray],
+    filtered_pose: np.ndarray,
+    gt_joints: np.ndarray,
+    supervision_valid: np.ndarray,
+    normalized_left: bool,
+) -> tuple[dict, list[dict]]:
+    scored = []
+    for candidate in candidates:
+        symmetry = np.asarray(candidate["matrix"], dtype=np.float64)
+        if normalized_left:
+            symmetry = mirror_pose(symmetry)
+        errors = []
+        for index in range(min(len(frame_ids), len(filtered_pose))):
+            if not supervision_valid[index]:
+                continue
+            frame = frame_string(frame_ids[index], index)
+            gt_pose = gt_rows.get(frame)
+            if gt_pose is None:
+                continue
+            if normalized_left:
+                gt_pose = mirror_pose(gt_pose)
+            rotation, translation = transform_between_poses(
+                gt_pose, filtered_pose[index], symmetry
+            )
+            target = apply_transform(
+                gt_joints[index, PALM], rotation, translation
+            )
+            errors.extend(
+                np.linalg.norm(target - gt_joints[index, PALM], axis=-1)
+                .tolist()
+            )
+        score = float(np.median(errors) * 1000.0) if errors else np.inf
+        scored.append(
+            {
+                "angle_deg": candidate["angle_deg"],
+                "flipped": candidate["flipped"],
+                "palm_3d_median_mm": score,
+                "num_values": len(errors),
+                "matrix": candidate["matrix"],
+            }
+        )
+    scored.sort(key=lambda row: row["palm_3d_median_mm"])
+    if not scored or not np.isfinite(scored[0]["palm_3d_median_mm"]):
+        raise RuntimeError("No valid sequence symmetry candidate")
+    return scored[0], scored
+
+
 def distribution(values: np.ndarray, unit: str = "mm") -> dict:
     values = np.asarray(values, dtype=np.float64)
     values = values[np.isfinite(values)]
@@ -232,6 +347,28 @@ def main() -> None:
         len(fp_pose_normalized), len(v8_correction), len(gt_vertices),
         len(raw_vertices), len(v8_vertices), len(gt_mesh_valid),
     )
+    candidates = symmetry_candidates(
+        args.symmetry_axis,
+        args.symmetry_step_deg,
+        args.symmetry_axis_flip,
+    )
+    selected_symmetry, symmetry_scores = select_sequence_symmetry(
+        candidates,
+        frame_ids[:count],
+        gt_rows,
+        fp_pose_normalized[:count],
+        gt_joints[:count],
+        supervision_valid[:count],
+        normalized_left,
+    )
+    symmetry_original = np.asarray(
+        selected_symmetry["matrix"], dtype=np.float64
+    )
+    symmetry_normalized = (
+        mirror_pose(symmetry_original)
+        if normalized_left
+        else symmetry_original
+    )
     target_vertices = np.full_like(gt_vertices[:count], np.nan)
     target_joints = np.full_like(gt_joints[:count], np.nan)
     raw_delta_camera = np.full((count, 3), np.nan, dtype=np.float64)
@@ -255,9 +392,14 @@ def main() -> None:
         ):
             continue
 
-        mesh_rotation, mesh_translation = relative_transform(
-            gt_pose_original, filtered_pose, args.transform_mode
-        )
+        if args.transform_mode == "full_se3":
+            mesh_rotation, mesh_translation = transform_between_poses(
+                gt_pose_original, filtered_pose, symmetry_original
+            )
+        else:
+            mesh_rotation, mesh_translation = relative_transform(
+                gt_pose_original, filtered_pose, args.transform_mode
+            )
         target_vertices[index] = apply_transform(
             gt_vertices[index], mesh_rotation, mesh_translation
         )
@@ -267,11 +409,18 @@ def main() -> None:
             if normalized_left
             else gt_pose_original
         )
-        joint_rotation, joint_translation = relative_transform(
-            gt_pose_normalized,
-            fp_pose_normalized[index],
-            args.transform_mode,
-        )
+        if args.transform_mode == "full_se3":
+            joint_rotation, joint_translation = transform_between_poses(
+                gt_pose_normalized,
+                fp_pose_normalized[index],
+                symmetry_normalized,
+            )
+        else:
+            joint_rotation, joint_translation = relative_transform(
+                gt_pose_normalized,
+                fp_pose_normalized[index],
+                args.transform_mode,
+            )
         target_joints[index] = apply_transform(
             gt_joints[index], joint_rotation, joint_translation
         )
@@ -386,6 +535,25 @@ def main() -> None:
         "object_mesh_scale": args.object_mesh_scale,
         "hand_side": side,
         "transform_mode": args.transform_mode,
+        "symmetry": {
+            "axis": args.symmetry_axis,
+            "step_deg": args.symmetry_step_deg,
+            "allow_axis_flip": args.symmetry_axis_flip,
+            "selected_angle_deg": selected_symmetry["angle_deg"],
+            "selected_flipped": selected_symmetry["flipped"],
+            "selected_palm_3d_median_mm": selected_symmetry[
+                "palm_3d_median_mm"
+            ],
+            "selected_matrix": symmetry_original.tolist(),
+            "top_candidates": [
+                {
+                    key: value
+                    for key, value in row.items()
+                    if key != "matrix"
+                }
+                for row in symmetry_scores[:10]
+            ],
+        },
         "num_frames": count,
         "num_valid": int(valid.sum()),
         "raw_target_translation": distribution(raw_magnitude),
@@ -402,6 +570,7 @@ def main() -> None:
     print("raw target translation:", audit["raw_target_translation"])
     print("v8 target translation:", audit["v8_target_translation"])
     print("target 2D palm error:", audit["target_2d_palm_error_px"])
+    print("selected symmetry:", audit["symmetry"])
 
 
 if __name__ == "__main__":
