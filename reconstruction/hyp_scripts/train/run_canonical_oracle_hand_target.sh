@@ -67,7 +67,7 @@ print(
 ' "$VAL_MANIFEST" "$STREAM_ID"
 )
 
-CANONICAL_ALIGNMENT=$CANONICAL_ROOT/$OBJECT_NAME/canonical_alignment.json
+CANONICAL_ALIGNMENT=${CANONICAL_ALIGNMENT:-$CANONICAL_ROOT/$OBJECT_NAME/canonical_alignment.json}
 GT_YCB_OBJECT_MESH=$DEXYCB_MODELS/$OBJECT_NAME/textured_simple.obj
 if [[ ! -f "$CANONICAL_ALIGNMENT" ]]; then
   echo "Missing canonical alignment: $CANONICAL_ALIGNMENT" >&2

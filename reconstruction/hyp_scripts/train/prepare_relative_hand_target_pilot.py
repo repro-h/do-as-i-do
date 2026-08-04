@@ -127,7 +127,14 @@ def sam_to_ycb_rigid(path: Path) -> tuple[np.ndarray, float | None]:
     payload = load_json(path)
     similarity = payload.get("raw_sam_to_ycb_similarity")
     if not isinstance(similarity, dict):
-        raise KeyError("raw_sam_to_ycb_similarity")
+        rigid = payload.get("sam_to_ycb_rigid")
+        if rigid is None:
+            raise KeyError("raw_sam_to_ycb_similarity or sam_to_ycb_rigid")
+        matrix = np.asarray(rigid, dtype=np.float64).reshape(4, 4)
+        residual_scale = payload.get("scale_ratio_to_foundationpose")
+        return matrix, (
+            float(residual_scale) if residual_scale is not None else None
+        )
     matrix = np.eye(4, dtype=np.float64)
     matrix[:3, :3] = np.asarray(
         similarity["rotation"], dtype=np.float64
