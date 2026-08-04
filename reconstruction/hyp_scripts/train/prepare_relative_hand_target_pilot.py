@@ -471,6 +471,12 @@ def main() -> None:
     fp_pose_normalized = np.asarray(supervision["object_pose"], dtype=np.float64)
     intrinsics = np.asarray(supervision["intrinsics"], dtype=np.float64)
     supervision_valid = np.asarray(supervision["supervision_valid"], dtype=bool)
+    gt_joint_valid = np.asarray(
+        supervision.get("gt_valid", supervision_valid), dtype=bool
+    )
+    handflow_valid = np.asarray(
+        supervision.get("hand_valid", supervision_valid), dtype=bool
+    )
     normalized_left = bool(np.asarray(supervision["normalized_left"]).item())
     frame_ids = np.asarray(supervision["frame_ids"])
     v8_correction = np.asarray(
@@ -482,6 +488,7 @@ def main() -> None:
         len(frame_ids), len(handflow_joints), len(gt_joints),
         len(fp_pose_normalized), len(v8_correction), len(gt_vertices),
         len(raw_vertices), len(v8_vertices), len(gt_mesh_valid),
+        len(gt_joint_valid), len(handflow_valid),
     )
     candidates = symmetry_candidates(
         args.symmetry_axis,
@@ -494,7 +501,7 @@ def main() -> None:
         gt_rows,
         fp_pose_normalized[:count],
         gt_joints[:count],
-        supervision_valid[:count],
+        gt_joint_valid[:count],
         normalized_left,
     )
     if args.symmetry_selection_mode == "temporal":
@@ -531,6 +538,8 @@ def main() -> None:
     v8_delta_object = np.full((count, 3), np.nan, dtype=np.float64)
     target_2d_error = np.full(count, np.nan, dtype=np.float64)
     valid = np.zeros(count, dtype=bool)
+    joint_metric_valid = np.zeros(count, dtype=bool)
+    raw_valid = np.zeros(count, dtype=bool)
     v8_valid = np.zeros(count, dtype=bool)
     frame_rows = []
 
@@ -554,8 +563,15 @@ def main() -> None:
             invalid_reasons.append("missing_gt_object_pose")
         if not gt_mesh_valid[index]:
             invalid_reasons.append("invalid_gt_hand_mesh")
-        if not supervision_valid[index]:
-            invalid_reasons.append("invalid_global_supervision")
+        has_joint_supervision = bool(
+            gt_joint_valid[index]
+            and np.isfinite(gt_joints[index]).all()
+            and np.isfinite(gt_joints_2d[index]).all()
+        )
+        if not has_joint_supervision:
+            metric_unavailable_reasons = ["invalid_gt_joint_supervision"]
+        else:
+            metric_unavailable_reasons = []
         if invalid_reasons:
             frame_rows.append({
                 "frame": frame,
@@ -576,60 +592,70 @@ def main() -> None:
         target_vertices[index] = apply_transform(
             gt_vertices[index], mesh_rotation, mesh_translation
         )
-
-        gt_pose_normalized = (
-            mirror_pose(gt_pose_original)
-            if normalized_left
-            else gt_pose_original
-        )
-        if args.transform_mode == "full_se3":
-            joint_rotation, joint_translation = transform_between_poses(
-                gt_pose_normalized,
-                fp_pose_normalized[index],
-                symmetry_normalized,
-            )
-        else:
-            joint_rotation, joint_translation = relative_transform(
-                gt_pose_normalized,
-                fp_pose_normalized[index],
-                args.transform_mode,
-            )
-        target_joints[index] = apply_transform(
-            gt_joints[index], joint_rotation, joint_translation
-        )
-        v8_joints = handflow_joints[index] + v8_correction[index, None]
-        raw_delta_camera[index] = np.median(
-            target_joints[index, PALM] - handflow_joints[index, PALM], axis=0
-        )
-        rotation_fp = fp_pose_normalized[index, :3, :3]
-        raw_delta_object[index] = rotation_fp.T @ raw_delta_camera[index]
-        if v8_predicted[index]:
-            v8_delta_camera[index] = np.median(
-                target_joints[index, PALM] - v8_joints[PALM], axis=0
-            )
-            v8_delta_object[index] = rotation_fp.T @ v8_delta_camera[index]
-            v8_valid[index] = True
-
-        projected = target_joints[index, PALM].copy()
-        z = np.maximum(projected[:, 2], 1e-6)
-        uv = np.stack(
-            [
-                intrinsics[0, 0] * projected[:, 0] / z + intrinsics[0, 2],
-                intrinsics[1, 1] * projected[:, 1] / z + intrinsics[1, 2],
-            ],
-            axis=-1,
-        )
-        target_2d_error[index] = np.median(
-            np.linalg.norm(uv - gt_joints_2d[index, PALM], axis=-1)
-        )
         valid[index] = True
+
+        if has_joint_supervision:
+            gt_pose_normalized = (
+                mirror_pose(gt_pose_original)
+                if normalized_left
+                else gt_pose_original
+            )
+            if args.transform_mode == "full_se3":
+                joint_rotation, joint_translation = transform_between_poses(
+                    gt_pose_normalized,
+                    fp_pose_normalized[index],
+                    symmetry_normalized,
+                )
+            else:
+                joint_rotation, joint_translation = relative_transform(
+                    gt_pose_normalized,
+                    fp_pose_normalized[index],
+                    args.transform_mode,
+                )
+            target_joints[index] = apply_transform(
+                gt_joints[index], joint_rotation, joint_translation
+            )
+            joint_metric_valid[index] = True
+            rotation_fp = fp_pose_normalized[index, :3, :3]
+            if handflow_valid[index] and np.isfinite(handflow_joints[index]).all():
+                raw_delta_camera[index] = np.median(
+                    target_joints[index, PALM] - handflow_joints[index, PALM],
+                    axis=0,
+                )
+                raw_delta_object[index] = rotation_fp.T @ raw_delta_camera[index]
+                raw_valid[index] = True
+            if raw_valid[index] and v8_predicted[index]:
+                v8_joints = handflow_joints[index] + v8_correction[index, None]
+                v8_delta_camera[index] = np.median(
+                    target_joints[index, PALM] - v8_joints[PALM], axis=0
+                )
+                v8_delta_object[index] = rotation_fp.T @ v8_delta_camera[index]
+                v8_valid[index] = True
+
+            projected = target_joints[index, PALM].copy()
+            z = np.maximum(projected[:, 2], 1e-6)
+            uv = np.stack(
+                [
+                    intrinsics[0, 0] * projected[:, 0] / z + intrinsics[0, 2],
+                    intrinsics[1, 1] * projected[:, 1] / z + intrinsics[1, 2],
+                ],
+                axis=-1,
+            )
+            target_2d_error[index] = np.median(
+                np.linalg.norm(uv - gt_joints_2d[index, PALM], axis=-1)
+            )
         frame_rows.append({
             "frame": frame,
             "valid": True,
             "invalid_reasons": [],
+            "joint_metrics_available": bool(joint_metric_valid[index]),
+            "metric_unavailable_reasons": metric_unavailable_reasons,
+            "raw_available": bool(raw_valid[index]),
             "v8_predicted": bool(v8_predicted[index]),
             "raw_target_translation_mm": (
                 np.linalg.norm(raw_delta_camera[index]) * 1000.0
+                if raw_valid[index]
+                else None
             ),
             "v8_target_translation_mm": (
                 np.linalg.norm(v8_delta_camera[index]) * 1000.0
@@ -669,6 +695,8 @@ def main() -> None:
         supervision_out,
         frame_ids=frame_ids[:count],
         valid=valid,
+        joint_metric_valid=joint_metric_valid,
+        raw_valid=raw_valid,
         v8_valid=v8_valid,
         target_joints_3d=target_joints.astype(np.float32),
         raw_target_translation_camera=raw_delta_camera.astype(np.float32),
@@ -683,7 +711,9 @@ def main() -> None:
         normalized_left=np.asarray(normalized_left),
     )
 
-    raw_magnitude = np.linalg.norm(raw_delta_camera[valid], axis=-1) * 1000.0
+    raw_magnitude = (
+        np.linalg.norm(raw_delta_camera[raw_valid], axis=-1) * 1000.0
+    )
     v8_magnitude = (
         np.linalg.norm(v8_delta_camera[v8_valid], axis=-1) * 1000.0
     )
@@ -747,6 +777,8 @@ def main() -> None:
         },
         "num_frames": count,
         "num_valid": int(valid.sum()),
+        "num_joint_metric_valid": int(joint_metric_valid.sum()),
+        "num_raw_valid": int(raw_valid.sum()),
         "num_v8_valid": int(v8_valid.sum()),
         "raw_target_translation": distribution(raw_magnitude),
         "v8_target_translation": distribution(v8_magnitude),

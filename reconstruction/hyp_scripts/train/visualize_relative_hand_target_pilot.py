@@ -234,16 +234,16 @@ def main() -> None:
                 )
             )
         target_valid = bool(target_data["valid"][frame])
-        raw_mm = float(np.linalg.norm(
-            target_data["raw_target_translation_camera"][frame]
-        ) * 1000.0)
+        raw_delta = target_data["raw_target_translation_camera"][frame]
+        raw_mm = float(np.linalg.norm(raw_delta) * 1000.0)
+        raw_text = f"{raw_mm:.2f}mm" if np.isfinite(raw_mm) else "n/a"
         v8_delta = target_data["v8_target_translation_camera"][frame]
         v8_mm = float(np.linalg.norm(v8_delta) * 1000.0)
         v8_text = f"{v8_mm:.2f}mm" if np.isfinite(v8_mm) else "n/a"
         reprojection = float(target_data["target_2d_palm_error_px"][frame])
         print(
             f"frame={frame_id} valid={target_valid} "
-            f"raw_to_target={raw_mm:.2f}mm "
+            f"raw_to_target={raw_text} "
             f"v8_to_target={v8_text} "
             f"target_2d={reprojection:.2f}px",
             flush=True,
