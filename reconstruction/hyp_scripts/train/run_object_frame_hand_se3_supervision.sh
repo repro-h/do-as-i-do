@@ -17,14 +17,15 @@ HYBRID_ROOT=${HYBRID_ROOT:-$DO_AS_I_DO/reconstruction/data/dexycb/hybrid_trainin
 GLOBAL_V2_ROOT=${GLOBAL_V2_ROOT:-$HYBRID_ROOT/stage1_global_hand_v2}
 MANIFEST=${MANIFEST:-$HYBRID_ROOT/manifests/$SPLIT.jsonl}
 GLOBAL_SUPERVISION_ROOT=${GLOBAL_SUPERVISION_ROOT:-$GLOBAL_V2_ROOT/supervision/$SPLIT}
-CANONICAL_ROOT=${CANONICAL_ROOT:-$GLOBAL_V2_ROOT/canonical_alignment/sam_ycb_bank_v1}
-SE3_ROOT=${SE3_ROOT:-$GLOBAL_V2_ROOT/object_frame_hand_se3_supervision_v1}
+CANONICAL_ROOT=${CANONICAL_ROOT:-$GLOBAL_V2_ROOT/canonical_alignment/sam_ycb_bank_v2}
+OBJECT_PROFILE_JSON=${OBJECT_PROFILE_JSON:-$DO_AS_I_DO/reconstruction/hyp_scripts/train/object_frame_hand_se3_profiles_v2.yaml}
+SE3_ROOT=${SE3_ROOT:-$GLOBAL_V2_ROOT/object_frame_hand_se3_supervision_v2}
 OUT_ROOT=${OUT_ROOT:-$SE3_ROOT/$SPLIT}
 RUN_ROOT=${RUN_ROOT:-$SE3_ROOT/_runs/$SPLIT}
 WINDOW_JSONL=${WINDOW_JSONL:-$RUN_ROOT/shard_${SHARD_INDEX}.jsonl}
 EXPORT_SCRIPT=$DO_AS_I_DO/reconstruction/hyp_scripts/train/prepare_object_frame_hand_se3_supervision.py
 
-for path in "$PI3_PYTHON" "$MANIFEST" "$EXPORT_SCRIPT"; do
+for path in "$PI3_PYTHON" "$MANIFEST" "$EXPORT_SCRIPT" "$OBJECT_PROFILE_JSON"; do
   if [[ ! -f "$path" ]]; then
     echo "Missing file: $path" >&2
     exit 1
@@ -46,6 +47,7 @@ command=(
   --split "$SPLIT"
   --global-supervision-root "$GLOBAL_SUPERVISION_ROOT"
   --canonical-root "$CANONICAL_ROOT"
+  --object-profile-json "$OBJECT_PROFILE_JSON"
   --out-root "$OUT_ROOT"
   --window-jsonl "$WINDOW_JSONL"
   --window-size 16

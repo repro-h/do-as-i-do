@@ -11,6 +11,12 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 import yaml
 
+from prepare_relative_hand_target_pilot import (
+    select_sequence_symmetry,
+    select_temporal_symmetry,
+    symmetry_candidates,
+)
+
 
 MIRROR_X = np.diag([-1.0, 1.0, 1.0]).astype(np.float64)
 
@@ -21,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", required=True)
     parser.add_argument("--global-supervision-root", required=True)
     parser.add_argument("--canonical-root", required=True)
+    parser.add_argument("--object-profile-json", required=True)
     parser.add_argument("--out-root", required=True)
     parser.add_argument("--window-jsonl", required=True)
     parser.add_argument("--window-size", type=int, default=16)
@@ -159,6 +166,17 @@ def distribution(values: np.ndarray, scale: float = 1.0) -> dict:
     }
 
 
+def merged_profile(payload: dict, object_name: str) -> dict:
+    output = json.loads(json.dumps(payload.get("default", {})))
+    override = payload.get("objects", {}).get(object_name, {})
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(output.get(key), dict):
+            output[key].update(value)
+        else:
+            output[key] = value
+    return output
+
+
 def load_metadata(stream_dir: Path) -> dict:
     path = stream_dir.parent / "meta.yml"
     if not path.is_file():
@@ -174,6 +192,7 @@ def prepare_stream(
     scale_warning_threshold: float,
     min_visible_hand_pixels: int,
     hand_presence_mode: str,
+    object_profile: dict,
 ) -> dict:
     stream_id = str(record["stream_id"])
     object_name = str(record["object_name"])
@@ -278,14 +297,127 @@ def prepare_stream(
         gt_sam_pose = gt_ycb_pose @ sam_to_ycb
         gt_sam_object_pose[index] = gt_sam_pose
         gt_object_valid[index] = True
-        if gt_valid[index]:
-            target_translation_object[index] = camera_point_to_object(
-                gt_joints[index, 0], gt_sam_pose
+
+    symmetry_profile = object_profile.get("symmetry", {})
+    symmetry_axis = str(symmetry_profile.get("axis", "none"))
+    candidates = symmetry_candidates(
+        symmetry_axis,
+        float(symmetry_profile.get("step_deg", 15.0)),
+        bool(symmetry_profile.get("allow_axis_flip", False)),
+    )
+    symmetry_costs = np.full(
+        (count, len(candidates)), np.inf, dtype=np.float64
+    )
+    for candidate_index, candidate in enumerate(candidates):
+        symmetry = np.asarray(candidate["matrix"], dtype=np.float64)
+        if normalized_left:
+            symmetry = mirror_pose(symmetry)
+        for index in range(count):
+            if (
+                not gt_valid[index]
+                or not gt_object_valid[index]
+                or not object_valid[index]
+            ):
+                continue
+            local_palm = camera_points_to_object(
+                gt_joints[index, [0, 5, 9, 13, 17]],
+                gt_sam_object_pose[index],
             )
-            if gt_root_valid[index]:
-                target_rotation_object[index] = (
-                    gt_sam_pose[:3, :3].T @ target_root_rotation[index]
+            candidate_palm = local_palm @ symmetry[:3, :3].T
+            target_palm = (
+                candidate_palm @ filtered_pose[index, :3, :3].T
+                + filtered_pose[index, :3, 3]
+            )
+            symmetry_costs[index, candidate_index] = float(
+                np.median(
+                    np.linalg.norm(
+                        target_palm - gt_joints[index, [0, 5, 9, 13, 17]],
+                        axis=-1,
+                    )
                 )
+            )
+
+    selection_mode = str(
+        symmetry_profile.get("selection_mode", "sequence")
+    )
+    if not np.isfinite(symmetry_costs).any():
+        selected_symmetry = np.zeros(count, dtype=np.int64)
+        symmetry_selection = {
+            "mode": selection_mode,
+            "selected_angle_deg": 0.0,
+            "selected_flipped": False,
+            "num_valid_costs": 0,
+        }
+    elif selection_mode == "temporal":
+        selected_symmetry, symmetry_selection, _ = select_temporal_symmetry(
+            candidates,
+            symmetry_costs,
+            float(symmetry_profile.get("yaw_transition_mm_per_deg", 0.2)),
+        )
+    else:
+        selected_symmetry, symmetry_selection, _ = select_sequence_symmetry(
+            candidates, symmetry_costs
+        )
+    selected_symmetry_angle = np.asarray(
+        [candidates[value]["angle_deg"] for value in selected_symmetry],
+        dtype=np.float32,
+    )
+    selected_symmetry_flipped = np.asarray(
+        [candidates[value]["flipped"] for value in selected_symmetry],
+        dtype=bool,
+    )
+
+    for index in range(count):
+        if not gt_object_valid[index] or not gt_valid[index]:
+            continue
+        symmetry = np.asarray(
+            candidates[selected_symmetry[index]]["matrix"], dtype=np.float64
+        )
+        if normalized_left:
+            symmetry = mirror_pose(symmetry)
+        raw_translation = camera_point_to_object(
+            gt_joints[index, 0], gt_sam_object_pose[index]
+        )
+        target_translation_object[index] = (
+            symmetry[:3, :3] @ raw_translation
+        )
+        if gt_root_valid[index]:
+            raw_rotation = (
+                gt_sam_object_pose[index, :3, :3].T
+                @ target_root_rotation[index]
+            )
+            target_rotation_object[index] = symmetry[:3, :3] @ raw_rotation
+
+    pose_rotation_error_deg = np.full(count, np.nan, dtype=np.float64)
+    pose_translation_error_mm = np.full(count, np.nan, dtype=np.float64)
+    pose_quality_valid = np.ones(count, dtype=bool)
+    gate_profile = object_profile.get("pose_gate", {})
+    gate_enabled = bool(gate_profile.get("enabled", True))
+    for index in range(count):
+        if not gt_object_valid[index] or not object_valid[index]:
+            pose_quality_valid[index] = False
+            continue
+        relative_rotation = (
+            gt_sam_object_pose[index, :3, :3].T
+            @ filtered_pose[index, :3, :3]
+        )
+        pose_rotation_error_deg[index] = np.degrees(
+            np.linalg.norm(Rotation.from_matrix(relative_rotation).as_rotvec())
+        )
+        pose_translation_error_mm[index] = (
+            np.linalg.norm(
+                filtered_pose[index, :3, 3]
+                - gt_sam_object_pose[index, :3, 3]
+            )
+            * 1000.0
+        )
+        if gate_enabled:
+            pose_quality_valid[index] = bool(
+                pose_rotation_error_deg[index]
+                <= float(gate_profile.get("max_rotation_error_deg", 20.0))
+                and pose_translation_error_mm[index]
+                <= float(gate_profile.get("max_translation_error_mm", 30.0))
+            )
 
     hand_observed = visible_hand_pixels >= min_visible_hand_pixels
     hand_presence = presence_from_observations(
@@ -297,6 +429,7 @@ def prepare_stream(
         & object_valid
         & gt_object_valid
         & hand_presence
+        & pose_quality_valid
         & np.isfinite(initial_translation_object).all(axis=1)
         & np.isfinite(target_translation_object).all(axis=1)
     )
@@ -381,11 +514,25 @@ def prepare_stream(
         gt_valid=gt_valid,
         filtered_object_valid=object_valid,
         gt_object_valid=gt_object_valid,
+        pose_quality_valid=pose_quality_valid,
+        pose_rotation_error_deg=pose_rotation_error_deg.astype(np.float32),
+        pose_translation_error_mm=pose_translation_error_mm.astype(np.float32),
         visible_hand_pixels=visible_hand_pixels,
         hand_observed=hand_observed,
         hand_presence=hand_presence,
         valid_translation=valid_translation,
         valid_rotation=valid_rotation,
+        selected_symmetry_candidate_index=selected_symmetry.astype(np.int32),
+        selected_symmetry_angle_deg=selected_symmetry_angle,
+        selected_symmetry_flipped=selected_symmetry_flipped,
+        symmetry_axis=np.asarray(symmetry_axis),
+        symmetry_selection_mode=np.asarray(selection_mode),
+        symmetry_selection_json=np.asarray(json.dumps(symmetry_selection)),
+        object_profile_json=np.asarray(json.dumps(object_profile)),
+        rotation_supervision_weight=np.asarray(
+            float(object_profile.get("rotation_supervision_weight", 1.0)),
+            dtype=np.float32,
+        ),
         normalized_left=np.asarray(normalized_left),
         hand_side=np.asarray(hand_side),
         object_name=np.asarray(object_name),
@@ -423,6 +570,16 @@ def prepare_stream(
             else None
         ),
         "scale_warning": scale_warning,
+        "pose_gate_enabled": gate_enabled,
+        "pose_gate_valid_frames": int(pose_quality_valid.sum()),
+        "pose_rotation_error_deg": distribution(pose_rotation_error_deg),
+        "pose_translation_error_mm": distribution(pose_translation_error_mm),
+        "symmetry_axis": symmetry_axis,
+        "symmetry_selection_mode": selection_mode,
+        "symmetry_selection": symmetry_selection,
+        "rotation_supervision_weight": float(
+            object_profile.get("rotation_supervision_weight", 1.0)
+        ),
         "canonical_residual_scale": residual_scale,
         "initial_to_target_translation_mm": distribution(
             translation_error, scale=1000.0
@@ -451,12 +608,22 @@ def main() -> None:
     manifest = Path(args.manifest).expanduser().resolve()
     global_root = Path(args.global_supervision_root).expanduser().resolve()
     canonical_root = Path(args.canonical_root).expanduser().resolve()
+    profile_path = Path(args.object_profile_json).expanduser().resolve()
+    profile_payload = yaml.safe_load(
+        profile_path.read_text(encoding="utf-8")
+    ) or {}
+    excluded_objects = set(profile_payload.get("excluded_objects", []))
     out_root = Path(args.out_root).expanduser().resolve()
     window_path = Path(args.window_jsonl).expanduser().resolve()
     out_root.mkdir(parents=True, exist_ok=True)
     window_path.parent.mkdir(parents=True, exist_ok=True)
 
     records = load_jsonl(manifest)
+    num_manifest_records = len(records)
+    records = [
+        row for row in records
+        if str(row.get("object_name")) not in excluded_objects
+    ]
     requested_streams = set(args.stream_id)
     if requested_streams:
         records = [
@@ -491,6 +658,9 @@ def main() -> None:
                     args.scale_warning_threshold,
                     args.min_visible_hand_pixels,
                     args.hand_presence_mode,
+                    merged_profile(
+                        profile_payload, str(record["object_name"])
+                    ),
                 )
             else:
                 with np.load(out_path, allow_pickle=False) as archive:
@@ -547,6 +717,11 @@ def main() -> None:
         "split": args.split,
         "global_supervision_root": str(global_root),
         "canonical_root": str(canonical_root),
+        "object_profile_json": str(profile_path),
+        "object_profile_version": profile_payload.get("version"),
+        "excluded_objects": sorted(excluded_objects),
+        "num_manifest_records": num_manifest_records,
+        "num_records_after_exclusion": len(records),
         "out_root": str(out_root),
         "window_jsonl": str(window_path),
         "window_size": args.window_size,

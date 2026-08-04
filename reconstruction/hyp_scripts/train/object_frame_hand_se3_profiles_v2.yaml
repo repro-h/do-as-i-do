@@ -1,0 +1,54 @@
+version: object_frame_hand_se3_profiles_v2
+
+excluded_objects:
+  - 010_potted_meat_can
+  - 011_banana
+
+default:
+  symmetry:
+    axis: none
+    step_deg: 15.0
+    allow_axis_flip: false
+    selection_mode: sequence
+    yaw_transition_mm_per_deg: 0.2
+  pose_gate:
+    enabled: true
+    max_rotation_error_deg: 20.0
+    max_translation_error_mm: 30.0
+  rotation_supervision_weight: 1.0
+
+objects:
+  002_master_chef_can:
+    symmetry: {axis: y, step_deg: 15.0, allow_axis_flip: true, selection_mode: temporal}
+    pose_gate: {enabled: false}
+  003_cracker_box:
+    symmetry: {axis: y, step_deg: 180.0, allow_axis_flip: true, selection_mode: sequence}
+    pose_gate: {enabled: false}
+  004_sugar_box:
+    symmetry: {axis: y, step_deg: 180.0, allow_axis_flip: true, selection_mode: sequence}
+    pose_gate: {enabled: false}
+  005_tomato_soup_can:
+    symmetry: {axis: y, step_deg: 15.0, allow_axis_flip: true, selection_mode: temporal}
+    pose_gate: {enabled: false}
+  008_pudding_box:
+    symmetry: {axis: y, step_deg: 180.0, allow_axis_flip: true, selection_mode: sequence}
+    pose_gate: {enabled: false}
+  009_gelatin_box:
+    symmetry: {axis: y, step_deg: 180.0, allow_axis_flip: true, selection_mode: sequence}
+    pose_gate: {enabled: false}
+  019_pitcher_base:
+    pose_gate: {enabled: true, max_rotation_error_deg: 30.0, max_translation_error_mm: 30.0}
+    rotation_supervision_weight: 0.5
+  024_bowl:
+    symmetry: {axis: y, step_deg: 15.0, allow_axis_flip: false, selection_mode: temporal}
+    pose_gate: {enabled: false}
+  040_large_marker:
+    symmetry: {axis: y, step_deg: 15.0, allow_axis_flip: false, selection_mode: temporal}
+    pose_gate: {enabled: false}
+  052_extra_large_clamp:
+    pose_gate: {enabled: true, max_rotation_error_deg: 45.0, max_translation_error_mm: 40.0}
+    rotation_supervision_weight: 0.25
+  061_foam_brick:
+    symmetry: {axis: y, step_deg: 180.0, allow_axis_flip: true, selection_mode: sequence}
+    pose_gate: {enabled: false}
+    rotation_supervision_weight: 0.5
