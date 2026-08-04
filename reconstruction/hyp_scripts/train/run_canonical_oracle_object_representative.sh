@@ -13,30 +13,40 @@ OBJECT_INDEX=${OBJECT_INDEX:-0}
 LIST_ONLY=${LIST_ONLY:-0}
 PORT=${PORT:-8098}
 RUN_ORACLE=$DO_AS_I_DO/reconstruction/hyp_scripts/train/run_canonical_oracle_hand_target.sh
+SYMMETRY_PROFILE=${SYMMETRY_PROFILE:-auto}
 
-# Supply object-aware defaults while still allowing explicit environment
-# overrides for audit experiments.
-if [[ -z "${SYMMETRY_AXIS:-}" ]]; then
+# In auto mode, reset every value so settings from the previous object cannot
+# leak into the next audit. Set SYMMETRY_PROFILE=manual to override them.
+if [[ "$SYMMETRY_PROFILE" == "auto" ]]; then
   case "$OBJECT_NAME" in
-    002_master_chef_can)
+    002_master_chef_can|005_tomato_soup_can|040_large_marker)
       SYMMETRY_AXIS=y
-      SYMMETRY_STEP_DEG=${SYMMETRY_STEP_DEG:-15}
-      SYMMETRY_AXIS_FLIP=${SYMMETRY_AXIS_FLIP:-1}
-      SYMMETRY_SELECTION_MODE=${SYMMETRY_SELECTION_MODE:-temporal}
+      SYMMETRY_STEP_DEG=15
+      SYMMETRY_AXIS_FLIP=1
+      SYMMETRY_SELECTION_MODE=temporal
       ;;
-    003_cracker_box)
+    003_cracker_box|004_sugar_box|008_pudding_box|009_gelatin_box|010_potted_meat_can|036_wood_block|061_foam_brick)
       SYMMETRY_AXIS=y
-      SYMMETRY_STEP_DEG=${SYMMETRY_STEP_DEG:-180}
-      SYMMETRY_AXIS_FLIP=${SYMMETRY_AXIS_FLIP:-1}
-      SYMMETRY_SELECTION_MODE=${SYMMETRY_SELECTION_MODE:-sequence}
+      SYMMETRY_STEP_DEG=180
+      SYMMETRY_AXIS_FLIP=1
+      SYMMETRY_SELECTION_MODE=sequence
+      ;;
+    024_bowl)
+      SYMMETRY_AXIS=y
+      SYMMETRY_STEP_DEG=15
+      SYMMETRY_AXIS_FLIP=0
+      SYMMETRY_SELECTION_MODE=temporal
       ;;
     *)
       SYMMETRY_AXIS=none
-      SYMMETRY_STEP_DEG=${SYMMETRY_STEP_DEG:-15}
-      SYMMETRY_AXIS_FLIP=${SYMMETRY_AXIS_FLIP:-0}
-      SYMMETRY_SELECTION_MODE=${SYMMETRY_SELECTION_MODE:-sequence}
+      SYMMETRY_STEP_DEG=15
+      SYMMETRY_AXIS_FLIP=0
+      SYMMETRY_SELECTION_MODE=sequence
       ;;
   esac
+elif [[ "$SYMMETRY_PROFILE" != "manual" ]]; then
+  echo "SYMMETRY_PROFILE must be auto or manual" >&2
+  exit 1
 fi
 SYMMETRY_YAW_TRANSITION=${SYMMETRY_YAW_TRANSITION:-0.2}
 export SYMMETRY_AXIS SYMMETRY_STEP_DEG SYMMETRY_AXIS_FLIP
@@ -146,6 +156,7 @@ echo "hand_side=$HAND_SIDE"
 echo "stream_id=$STREAM_ID"
 echo "sequence_dir=$SEQ_DIR"
 echo "port=$PORT"
+echo "symmetry_profile=$SYMMETRY_PROFILE"
 echo "symmetry_axis=$SYMMETRY_AXIS"
 echo "symmetry_step_deg=$SYMMETRY_STEP_DEG"
 echo "symmetry_axis_flip=$SYMMETRY_AXIS_FLIP"
