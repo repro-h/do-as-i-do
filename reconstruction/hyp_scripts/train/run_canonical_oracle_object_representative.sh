@@ -14,6 +14,34 @@ LIST_ONLY=${LIST_ONLY:-0}
 PORT=${PORT:-8098}
 RUN_ORACLE=$DO_AS_I_DO/reconstruction/hyp_scripts/train/run_canonical_oracle_hand_target.sh
 
+# Supply object-aware defaults while still allowing explicit environment
+# overrides for audit experiments.
+if [[ -z "${SYMMETRY_AXIS:-}" ]]; then
+  case "$OBJECT_NAME" in
+    002_master_chef_can)
+      SYMMETRY_AXIS=y
+      SYMMETRY_STEP_DEG=${SYMMETRY_STEP_DEG:-15}
+      SYMMETRY_AXIS_FLIP=${SYMMETRY_AXIS_FLIP:-1}
+      SYMMETRY_SELECTION_MODE=${SYMMETRY_SELECTION_MODE:-temporal}
+      ;;
+    003_cracker_box)
+      SYMMETRY_AXIS=y
+      SYMMETRY_STEP_DEG=${SYMMETRY_STEP_DEG:-180}
+      SYMMETRY_AXIS_FLIP=${SYMMETRY_AXIS_FLIP:-1}
+      SYMMETRY_SELECTION_MODE=${SYMMETRY_SELECTION_MODE:-sequence}
+      ;;
+    *)
+      SYMMETRY_AXIS=none
+      SYMMETRY_STEP_DEG=${SYMMETRY_STEP_DEG:-15}
+      SYMMETRY_AXIS_FLIP=${SYMMETRY_AXIS_FLIP:-0}
+      SYMMETRY_SELECTION_MODE=${SYMMETRY_SELECTION_MODE:-sequence}
+      ;;
+  esac
+fi
+SYMMETRY_YAW_TRANSITION=${SYMMETRY_YAW_TRANSITION:-0.2}
+export SYMMETRY_AXIS SYMMETRY_STEP_DEG SYMMETRY_AXIS_FLIP
+export SYMMETRY_SELECTION_MODE SYMMETRY_YAW_TRANSITION
+
 for path in "$PI3_PYTHON" "$MANIFEST" "$RUN_ORACLE"; do
   if [[ ! -f "$path" ]]; then
     echo "Missing file: $path" >&2
@@ -118,6 +146,10 @@ echo "hand_side=$HAND_SIDE"
 echo "stream_id=$STREAM_ID"
 echo "sequence_dir=$SEQ_DIR"
 echo "port=$PORT"
+echo "symmetry_axis=$SYMMETRY_AXIS"
+echo "symmetry_step_deg=$SYMMETRY_STEP_DEG"
+echo "symmetry_axis_flip=$SYMMETRY_AXIS_FLIP"
+echo "symmetry_selection_mode=$SYMMETRY_SELECTION_MODE"
 
 cd "$DO_AS_I_DO"
 exec /bin/bash "$RUN_ORACLE"
