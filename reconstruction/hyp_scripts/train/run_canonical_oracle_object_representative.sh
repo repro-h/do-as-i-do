@@ -10,6 +10,7 @@ HYBRID_ROOT=${HYBRID_ROOT:-$DO_AS_I_DO/reconstruction/data/dexycb/hybrid_trainin
 MANIFEST=${MANIFEST:-$HYBRID_ROOT/manifests/val.jsonl}
 OBJECT_NAME=${OBJECT_NAME:-}
 OBJECT_INDEX=${OBJECT_INDEX:-0}
+LIST_ONLY=${LIST_ONLY:-0}
 PORT=${PORT:-8098}
 RUN_ORACLE=$DO_AS_I_DO/reconstruction/hyp_scripts/train/run_canonical_oracle_hand_target.sh
 
@@ -50,6 +51,38 @@ for name in sorted(by_object):
 if [[ "$OBJECT_NAME" == "--list" || -z "$OBJECT_NAME" ]]; then
   echo -e "object\thand_side\tstream_id\tsequence_dir"
   list_representatives
+  exit 0
+fi
+
+if [[ "$LIST_ONLY" == "1" ]]; then
+  "$PI3_PYTHON" -c '
+import json, sys
+
+manifest, object_name = sys.argv[1:]
+rows = sorted(
+    [
+        json.loads(line)
+        for line in open(manifest)
+        if line.strip()
+        and str(json.loads(line)["object_name"]) == object_name
+    ],
+    key=lambda row: (
+        str(row.get("hand_side", "")),
+        str(row["stream_id"]),
+    ),
+)
+if not rows:
+    raise SystemExit(f"Object not found in manifest: {object_name}")
+print("index\thand_side\tstream_id\tsequence_dir")
+for index, row in enumerate(rows):
+    print(
+        index,
+        row.get("hand_side", "unknown"),
+        row["stream_id"],
+        row["stream_dir"],
+        sep="\t",
+    )
+' "$MANIFEST" "$OBJECT_NAME"
   exit 0
 fi
 
