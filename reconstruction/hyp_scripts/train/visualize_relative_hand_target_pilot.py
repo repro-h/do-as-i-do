@@ -199,8 +199,8 @@ def main() -> None:
                     "/object",
                     vertices=object_vertices,
                     faces=object_faces,
-                    color=(185, 185, 185),
-                    opacity=0.32,
+                    color=(245, 165, 45),
+                    opacity=0.46,
                 )
             )
         gt_pose = gt_ycb_pose.get(frame_id)
@@ -279,7 +279,7 @@ def main() -> None:
     show_frame(0)
     print(f"Viewer: http://localhost:{args.port}")
     print(
-        "SAM object=gray, GT YCB object=cyan, Raw=orange, "
+        "SAM object=amber, GT YCB object=cyan, Raw=orange, "
         "V8=blue, GT hand=green, relative target=magenta"
     )
     print("Press Ctrl+C to stop")
