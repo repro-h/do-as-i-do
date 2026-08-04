@@ -51,6 +51,8 @@ command=(
   --window-size 16
   --window-stride 4
   --min-valid-frames 8
+  --min-visible-hand-pixels 64
+  --hand-presence-mode span
   --scale-warning-threshold 0.1
   --num-shards "$NUM_SHARDS"
   --shard-index "$SHARD_INDEX"

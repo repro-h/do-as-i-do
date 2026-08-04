@@ -26,6 +26,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-size", type=int, default=16)
     parser.add_argument("--window-stride", type=int, default=4)
     parser.add_argument("--min-valid-frames", type=int, default=8)
+    parser.add_argument("--min-visible-hand-pixels", type=int, default=64)
+    parser.add_argument(
+        "--hand-presence-mode",
+        choices=("observed", "span"),
+        default="span",
+    )
     parser.add_argument("--scale-warning-threshold", type=float, default=0.1)
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
@@ -94,23 +100,42 @@ def canonical_alignment(path: Path) -> tuple[np.ndarray, float | None]:
     return matrix, residual_scale
 
 
-def load_gt_object_pose(path: Path, grasp_index: int) -> np.ndarray | None:
+def load_gt_frame(
+    path: Path, grasp_index: int
+) -> tuple[np.ndarray | None, int]:
     if not path.is_file():
-        return None
+        return None, 0
     with np.load(path, allow_pickle=False) as payload:
         if "pose_y" not in payload.files:
-            return None
+            return None, 0
         poses = np.asarray(payload["pose_y"], dtype=np.float64)
+        hand_pixels = 0
+        if "seg" in payload.files:
+            segmentation = np.asarray(payload["seg"])
+            hand_pixels = int(np.count_nonzero(segmentation == 255))
     if poses.ndim == 2:
         poses = poses[None]
     if poses.ndim != 3 or grasp_index >= len(poses):
-        return None
+        return None, hand_pixels
     value = poses[grasp_index]
     if value.shape[0] < 3 or value.shape[1] < 4:
-        return None
+        return None, hand_pixels
     matrix = np.eye(4, dtype=np.float64)
     matrix[:3, :4] = value[:3, :4]
-    return matrix if np.isfinite(matrix).all() else None
+    return (
+        matrix if np.isfinite(matrix).all() else None,
+        hand_pixels,
+    )
+
+
+def presence_from_observations(observed: np.ndarray, mode: str) -> np.ndarray:
+    observed = np.asarray(observed, dtype=bool)
+    if mode == "observed" or not observed.any():
+        return observed.copy()
+    indices = np.flatnonzero(observed)
+    presence = np.zeros_like(observed)
+    presence[indices[0] : indices[-1] + 1] = True
+    return presence
 
 
 def camera_point_to_object(point: np.ndarray, pose: np.ndarray) -> np.ndarray:
@@ -147,6 +172,8 @@ def prepare_stream(
     canonical_root: Path,
     out_path: Path,
     scale_warning_threshold: float,
+    min_visible_hand_pixels: int,
+    hand_presence_mode: str,
 ) -> dict:
     stream_id = str(record["stream_id"])
     object_name = str(record["object_name"])
@@ -225,6 +252,7 @@ def prepare_stream(
     gt_object_pose = np.full((count, 4, 4), np.nan, dtype=np.float64)
     gt_sam_object_pose = np.full((count, 4, 4), np.nan, dtype=np.float64)
     gt_object_valid = np.zeros(count, dtype=bool)
+    visible_hand_pixels = np.zeros(count, dtype=np.int32)
 
     for index in range(count):
         frame = frame_string(frame_ids[index], index)
@@ -239,7 +267,7 @@ def prepare_stream(
                     @ initial_root_rotation[index]
                 )
 
-        gt_ycb_pose = load_gt_object_pose(
+        gt_ycb_pose, visible_hand_pixels[index] = load_gt_frame(
             stream_dir / f"labels_{frame}.npz", grasp_index
         )
         if gt_ycb_pose is None:
@@ -259,11 +287,16 @@ def prepare_stream(
                     gt_sam_pose[:3, :3].T @ target_root_rotation[index]
                 )
 
+    hand_observed = visible_hand_pixels >= min_visible_hand_pixels
+    hand_presence = presence_from_observations(
+        hand_observed, hand_presence_mode
+    )
     valid_translation = (
         hand_valid
         & gt_valid
         & object_valid
         & gt_object_valid
+        & hand_presence
         & np.isfinite(initial_translation_object).all(axis=1)
         & np.isfinite(target_translation_object).all(axis=1)
     )
@@ -348,6 +381,9 @@ def prepare_stream(
         gt_valid=gt_valid,
         filtered_object_valid=object_valid,
         gt_object_valid=gt_object_valid,
+        visible_hand_pixels=visible_hand_pixels,
+        hand_observed=hand_observed,
+        hand_presence=hand_presence,
         valid_translation=valid_translation,
         valid_rotation=valid_rotation,
         normalized_left=np.asarray(normalized_left),
@@ -374,6 +410,18 @@ def prepare_stream(
         "valid_translation": int(valid_translation.sum()),
         "valid_rotation": int(valid_rotation.sum()),
         "missing_fraction": float(1.0 - valid_translation.mean()),
+        "observed_hand_frames": int(hand_observed.sum()),
+        "presence_frames": int(hand_presence.sum()),
+        "first_presence_frame": (
+            int(np.flatnonzero(hand_presence)[0])
+            if hand_presence.any()
+            else None
+        ),
+        "last_presence_frame": (
+            int(np.flatnonzero(hand_presence)[-1])
+            if hand_presence.any()
+            else None
+        ),
         "scale_warning": scale_warning,
         "canonical_residual_scale": residual_scale,
         "initial_to_target_translation_mm": distribution(
@@ -441,6 +489,8 @@ def main() -> None:
                     canonical_root,
                     out_path,
                     args.scale_warning_threshold,
+                    args.min_visible_hand_pixels,
+                    args.hand_presence_mode,
                 )
             else:
                 with np.load(out_path, allow_pickle=False) as archive:
@@ -501,6 +551,8 @@ def main() -> None:
         "window_jsonl": str(window_path),
         "window_size": args.window_size,
         "window_stride": args.window_stride,
+        "min_visible_hand_pixels": args.min_visible_hand_pixels,
+        "hand_presence_mode": args.hand_presence_mode,
         "num_shards": args.num_shards,
         "shard_index": args.shard_index,
         "num_requested": len(selected),
