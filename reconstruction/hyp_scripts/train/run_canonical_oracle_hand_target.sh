@@ -63,8 +63,13 @@ print(
 )
 
 CANONICAL_ALIGNMENT=$CANONICAL_ROOT/$OBJECT_NAME/canonical_alignment.json
+GT_YCB_OBJECT_MESH=$DEXYCB_MODELS/$OBJECT_NAME/textured_simple.obj
 if [[ ! -f "$CANONICAL_ALIGNMENT" ]]; then
   echo "Missing canonical alignment: $CANONICAL_ALIGNMENT" >&2
+  exit 1
+fi
+if [[ ! -f "$GT_YCB_OBJECT_MESH" ]]; then
+  echo "Missing GT YCB object mesh: $GT_YCB_OBJECT_MESH" >&2
   exit 1
 fi
 
@@ -110,6 +115,7 @@ done
   --gt-hand-meshes "$GT_HAND_MESHES" \
   --filtered-object-json "$FILTERED_OBJECT_JSON" \
   --gt-object-json "$GT_OBJECT_LAYOUT" \
+  --gt-ycb-object-mesh "$GT_YCB_OBJECT_MESH" \
   --canonical-alignment-json "$CANONICAL_ALIGNMENT" \
   --object-mesh "$OBJECT_MESH" \
   --object-mesh-scale "$OBJECT_SCALE" \

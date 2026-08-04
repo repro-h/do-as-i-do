@@ -38,6 +38,22 @@ def load_npz(path: Path) -> dict[str, np.ndarray]:
 
 def pose_rows(path: Path) -> dict[str, np.ndarray]:
     payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("objects") is not None:
+        output = {}
+        for index, row in enumerate(payload["objects"]):
+            local = row.get("local_to_scene") or {}
+            quaternion = local.get("quat_wxyz_camera_frame")
+            translation = local.get("translation_camera_frame")
+            if quaternion is None or translation is None:
+                continue
+            frame = str(
+                row.get("frame_idx", row.get("frame_index", index))
+            ).zfill(6)
+            matrix = np.eye(4, dtype=np.float32)
+            matrix[:3, :3] = quaternion_wxyz_to_matrix(quaternion)
+            matrix[:3, 3] = np.asarray(translation, dtype=np.float32)
+            output[frame] = matrix
+        return output
     rows = payload.get("by_frame") or payload.get("frames") or {}
     iterator = rows.items() if isinstance(rows, dict) else enumerate(rows)
     output = {}
@@ -49,6 +65,22 @@ def pose_rows(path: Path) -> dict[str, np.ndarray]:
             row["object_in_camera"], dtype=np.float32
         ).reshape(4, 4)
     return output
+
+
+def quaternion_wxyz_to_matrix(value) -> np.ndarray:
+    w, x, y, z = np.asarray(value, dtype=np.float64).reshape(4)
+    norm = np.sqrt(w * w + x * x + y * y + z * z)
+    if norm <= 1e-12:
+        raise ValueError("Zero-length quaternion")
+    w, x, y, z = np.asarray([w, x, y, z]) / norm
+    return np.asarray(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float32,
+    )
 
 
 def frame_string(value, fallback: int) -> str:
@@ -103,11 +135,19 @@ def main() -> None:
         for index, value in enumerate(target_data["frame_ids"])
     ]
     filtered_pose = pose_rows(Path(audit["filtered_object_json"]))
+    gt_ycb_pose = pose_rows(Path(audit["gt_object_json"]))
     object_local, object_faces = load_object(
         Path(audit["object_mesh"]),
         float(audit["object_mesh_scale"]),
         args.max_object_faces,
     )
+    gt_ycb_mesh = audit.get("gt_ycb_object_mesh")
+    if gt_ycb_mesh:
+        gt_ycb_local, gt_ycb_faces = load_object(
+            Path(gt_ycb_mesh), 1.0, args.max_object_faces
+        )
+    else:
+        gt_ycb_local, gt_ycb_faces = None, None
     count = min(
         len(frame_ids), *(len(value) for value in vertices.values())
     )
@@ -129,6 +169,14 @@ def main() -> None:
             "Relative target", initial_value=True
         ),
     }
+    object_controls = {
+        "sam": server.gui.add_checkbox(
+            "Filtered SAM object", initial_value=True
+        ),
+        "ycb": server.gui.add_checkbox(
+            "GT YCB object", initial_value=gt_ycb_local is not None
+        ),
+    }
     handles = []
     playing = {"value": False}
     suppress = {"value": False}
@@ -142,7 +190,7 @@ def main() -> None:
         clear()
         frame_id = frame_ids[frame]
         pose = filtered_pose.get(frame_id)
-        if pose is not None:
+        if pose is not None and object_controls["sam"].value:
             object_vertices = (
                 object_local @ pose[:3, :3].T + pose[:3, 3]
             )
@@ -153,6 +201,24 @@ def main() -> None:
                     faces=object_faces,
                     color=(185, 185, 185),
                     opacity=0.32,
+                )
+            )
+        gt_pose = gt_ycb_pose.get(frame_id)
+        if (
+            gt_pose is not None
+            and gt_ycb_local is not None
+            and object_controls["ycb"].value
+        ):
+            gt_object_vertices = (
+                gt_ycb_local @ gt_pose[:3, :3].T + gt_pose[:3, 3]
+            )
+            handles.append(
+                server.scene.add_mesh_simple(
+                    "/gt_ycb_object",
+                    vertices=gt_object_vertices,
+                    faces=gt_ycb_faces,
+                    color=(30, 215, 225),
+                    opacity=0.28,
                 )
             )
         for name in ("raw", "v8", "gt", "target"):
@@ -194,6 +260,8 @@ def main() -> None:
 
     for control in controls.values():
         control.on_update(lambda _: show_frame(frame_slider.value))
+    for control in object_controls.values():
+        control.on_update(lambda _: show_frame(frame_slider.value))
 
     def playback() -> None:
         while True:
@@ -210,7 +278,10 @@ def main() -> None:
     threading.Thread(target=playback, daemon=True).start()
     show_frame(0)
     print(f"Viewer: http://localhost:{args.port}")
-    print("Raw=orange, V8=blue, GT=green, relative target=magenta")
+    print(
+        "SAM object=gray, GT YCB object=cyan, Raw=orange, "
+        "V8=blue, GT hand=green, relative target=magenta"
+    )
     print("Press Ctrl+C to stop")
     while True:
         time.sleep(1.0)

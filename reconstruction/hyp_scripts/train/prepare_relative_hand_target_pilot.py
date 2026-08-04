@@ -23,6 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gt-hand-meshes", required=True)
     parser.add_argument("--filtered-object-json", required=True)
     parser.add_argument("--gt-object-json", required=True)
+    parser.add_argument("--gt-ycb-object-mesh", default=None)
     parser.add_argument(
         "--canonical-alignment-json",
         default=None,
@@ -176,6 +177,7 @@ def main() -> None:
             "gt_hand_meshes": args.gt_hand_meshes,
             "filtered_object_json": args.filtered_object_json,
             "gt_object_json": args.gt_object_json,
+            "gt_ycb_object_mesh": args.gt_ycb_object_mesh,
             "canonical_alignment_json": args.canonical_alignment_json,
             "object_mesh": args.object_mesh,
         }.items()
@@ -360,6 +362,11 @@ def main() -> None:
         "target_supervision": str(supervision_out),
         "filtered_object_json": str(paths["filtered_object_json"]),
         "gt_object_json": str(paths["gt_object_json"]),
+        "gt_ycb_object_mesh": (
+            str(paths["gt_ycb_object_mesh"])
+            if "gt_ycb_object_mesh" in paths
+            else None
+        ),
         "canonical_alignment_json": (
             str(paths["canonical_alignment_json"])
             if "canonical_alignment_json" in paths
