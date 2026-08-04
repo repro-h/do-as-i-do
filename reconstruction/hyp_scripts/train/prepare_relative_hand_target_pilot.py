@@ -23,6 +23,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gt-hand-meshes", required=True)
     parser.add_argument("--filtered-object-json", required=True)
     parser.add_argument("--gt-object-json", required=True)
+    parser.add_argument(
+        "--canonical-alignment-json",
+        default=None,
+        help=(
+            "Optional SAM-to-YCB canonical alignment. When provided, "
+            "--gt-object-json is interpreted as a DexYCB YCB layout and "
+            "converted into the SAM canonical frame before hand transfer."
+        ),
+    )
     parser.add_argument("--object-mesh", required=True)
     parser.add_argument("--object-mesh-scale", type=float, required=True)
     parser.add_argument("--hand-side", choices=("left", "right"), required=True)
@@ -46,6 +55,23 @@ def load_json(path: Path) -> dict:
 
 def pose_rows(path: Path) -> dict[str, np.ndarray]:
     payload = load_json(path)
+    if payload.get("objects") is not None:
+        output = {}
+        for index, row in enumerate(payload["objects"]):
+            local = row.get("local_to_scene") or {}
+            quaternion = local.get("quat_wxyz_camera_frame")
+            translation = local.get("translation_camera_frame")
+            if quaternion is None or translation is None:
+                continue
+            frame = str(
+                row.get("frame_idx", row.get("frame_index", index))
+            ).zfill(6)
+            matrix = np.eye(4, dtype=np.float64)
+            matrix[:3, :3] = quaternion_wxyz_to_matrix(quaternion)
+            matrix[:3, 3] = np.asarray(translation, dtype=np.float64)
+            if np.isfinite(matrix).all():
+                output[frame] = matrix
+        return output
     rows = payload.get("by_frame") or payload.get("frames") or {}
     iterator = rows.items() if isinstance(rows, dict) else enumerate(rows)
     output = {}
@@ -57,6 +83,41 @@ def pose_rows(path: Path) -> dict[str, np.ndarray]:
         if np.isfinite(matrix).all():
             output[frame] = matrix
     return output
+
+
+def quaternion_wxyz_to_matrix(value) -> np.ndarray:
+    w, x, y, z = np.asarray(value, dtype=np.float64).reshape(4)
+    norm = np.sqrt(w * w + x * x + y * y + z * z)
+    if norm <= 1e-12:
+        raise ValueError("Zero-length quaternion")
+    w, x, y, z = np.asarray([w, x, y, z]) / norm
+    return np.asarray(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def sam_to_ycb_rigid(path: Path) -> tuple[np.ndarray, float | None]:
+    payload = load_json(path)
+    similarity = payload.get("raw_sam_to_ycb_similarity")
+    if not isinstance(similarity, dict):
+        raise KeyError("raw_sam_to_ycb_similarity")
+    matrix = np.eye(4, dtype=np.float64)
+    matrix[:3, :3] = np.asarray(
+        similarity["rotation"], dtype=np.float64
+    ).reshape(3, 3)
+    matrix[:3, 3] = np.asarray(
+        similarity["translation_m"], dtype=np.float64
+    ).reshape(3)
+    production = payload.get("production_sam_to_ycb_similarity") or {}
+    residual_scale = production.get("residual_scale")
+    return matrix, (
+        float(residual_scale) if residual_scale is not None else None
+    )
 
 
 def frame_string(value, fallback: int) -> str:
@@ -115,8 +176,10 @@ def main() -> None:
             "gt_hand_meshes": args.gt_hand_meshes,
             "filtered_object_json": args.filtered_object_json,
             "gt_object_json": args.gt_object_json,
+            "canonical_alignment_json": args.canonical_alignment_json,
             "object_mesh": args.object_mesh,
         }.items()
+        if value is not None
     }
     for path in paths.values():
         if not path.is_file():
@@ -131,6 +194,16 @@ def main() -> None:
     gt_meshes = load_npz(paths["gt_hand_meshes"])
     filtered_rows = pose_rows(paths["filtered_object_json"])
     gt_rows = pose_rows(paths["gt_object_json"])
+    canonical_transform = None
+    canonical_residual_scale = None
+    if "canonical_alignment_json" in paths:
+        canonical_transform, canonical_residual_scale = sam_to_ycb_rigid(
+            paths["canonical_alignment_json"]
+        )
+        gt_rows = {
+            frame: pose @ canonical_transform
+            for frame, pose in gt_rows.items()
+        }
 
     side = args.hand_side
     gt_vertices = np.asarray(gt_meshes[f"{side}_vertices"], dtype=np.float64)
@@ -287,6 +360,21 @@ def main() -> None:
         "target_supervision": str(supervision_out),
         "filtered_object_json": str(paths["filtered_object_json"]),
         "gt_object_json": str(paths["gt_object_json"]),
+        "canonical_alignment_json": (
+            str(paths["canonical_alignment_json"])
+            if "canonical_alignment_json" in paths
+            else None
+        ),
+        "sam_to_ycb_rigid": (
+            canonical_transform.tolist()
+            if canonical_transform is not None
+            else None
+        ),
+        "canonical_residual_scale": canonical_residual_scale,
+        "canonical_scale_warning": bool(
+            canonical_residual_scale is not None
+            and abs(canonical_residual_scale - 1.0) > 0.1
+        ),
         "object_mesh": str(paths["object_mesh"]),
         "object_mesh_scale": args.object_mesh_scale,
         "hand_side": side,
