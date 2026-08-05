@@ -45,6 +45,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-velocity", type=float, default=0.05)
     parser.add_argument("--w-acceleration", type=float, default=0.02)
     parser.add_argument("--w-degradation-guard", type=float, default=0.25)
+    parser.add_argument(
+        "--w-rotation-degradation-guard", type=float, default=0.25
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--data-parallel", action="store_true")
@@ -365,6 +368,9 @@ def run_epoch(
                 translation_frame, batch["valid_translation"]
             )
             angle = rotation_angle(predicted_r, batch["target_rotation"])
+            initial_angle = rotation_angle(
+                batch["initial_rotation"], batch["target_rotation"]
+            )
             rotation_mask = batch["valid_rotation"].to(angle.dtype)
             rotation_mask = rotation_mask * batch["rotation_weight"]
             rotation = (
@@ -391,12 +397,18 @@ def run_epoch(
                 F.relu(predicted_error - initial_error) / 0.02,
                 batch["valid_translation"],
             )
+            rotation_degradation_guard = (
+                (F.relu(angle - initial_angle) * rotation_mask).sum()
+                / rotation_mask.sum().clamp_min(1.0)
+            )
             total = (
                 args.w_translation * translation
                 + args.w_rotation * rotation
                 + args.w_velocity * velocity
                 + args.w_acceleration * acceleration
                 + args.w_degradation_guard * degradation_guard
+                + args.w_rotation_degradation_guard
+                * rotation_degradation_guard
             )
             if training:
                 optimizer.zero_grad(set_to_none=True)
@@ -411,6 +423,7 @@ def run_epoch(
             "velocity": velocity,
             "acceleration": acceleration,
             "degradation_guard": degradation_guard,
+            "rotation_degradation_guard": rotation_degradation_guard,
         }
         for key, value in values.items():
             totals[key] += float(value.detach())
@@ -421,9 +434,7 @@ def run_epoch(
         valid_r = batch["valid_rotation"].detach().cpu().numpy().astype(bool)
         initial_t_error = initial_error.detach().cpu().numpy()
         predicted_t_error = predicted_error.detach().cpu().numpy()
-        initial_r_error = rotation_angle(
-            batch["initial_rotation"], batch["target_rotation"]
-        ).detach().cpu().numpy()
+        initial_r_error = initial_angle.detach().cpu().numpy()
         predicted_r_error = angle.detach().cpu().numpy()
         initial_translation_errors.append(initial_t_error[valid_t])
         predicted_translation_errors.append(predicted_t_error[valid_t])
@@ -456,6 +467,7 @@ def defaultdict_float() -> dict[str, float]:
         "velocity": 0.0,
         "acceleration": 0.0,
         "degradation_guard": 0.0,
+        "rotation_degradation_guard": 0.0,
     }
 
 
@@ -500,7 +512,7 @@ def main() -> None:
         "generator": generator,
     }
     train_loader = DataLoader(
-        train_data, shuffle=True, drop_last=True, **loader_kwargs
+        train_data, shuffle=True, drop_last=False, **loader_kwargs
     )
     val_loader = DataLoader(val_data, shuffle=False, **loader_kwargs)
     optimizer = torch.optim.AdamW(
