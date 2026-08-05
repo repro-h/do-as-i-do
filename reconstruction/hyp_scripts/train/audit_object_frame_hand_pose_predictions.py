@@ -18,6 +18,7 @@ from train_object_frame_hand_pose_baseline import (
     AbsoluteObjectFramePoseModel,
     ObjectFrameWindowDataset,
 )
+from train_object_frame_hand_pose_selector import PoseCandidateSelector
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--windows", required=True)
     parser.add_argument("--pi3x-root", required=True)
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--selector-checkpoint")
     parser.add_argument("--out-json", required=True)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -65,6 +67,7 @@ def summarize(entries: list[dict]) -> dict:
     initial_t, predicted_t = [], []
     initial_r, predicted_r = [], []
     oracle_t, oracle_r = [], []
+    selected_t, selected_r = [], []
     translation_improved = rotation_improved = rotation_count = 0
     for entry in entries:
         if entry["valid_translation"]:
@@ -73,6 +76,11 @@ def summarize(entries: list[dict]) -> dict:
             initial_t.append(old * 1000.0)
             predicted_t.append(new * 1000.0)
             oracle_t.append(min(old, new) * 1000.0)
+            if "selected_t" in entry:
+                selected = float(
+                    np.linalg.norm(entry["selected_t"] - entry["target_t"])
+                )
+                selected_t.append(selected * 1000.0)
             translation_improved += int(new < old)
         if entry["valid_rotation"]:
             old = rotation_error_deg(entry["initial_r"], entry["target_r"])
@@ -80,9 +88,13 @@ def summarize(entries: list[dict]) -> dict:
             initial_r.append(old)
             predicted_r.append(new)
             oracle_r.append(min(old, new))
+            if "selected_r" in entry:
+                selected_r.append(
+                    rotation_error_deg(entry["selected_r"], entry["target_r"])
+                )
             rotation_improved += int(new < old)
             rotation_count += 1
-    return {
+    output = {
         "frames": len(entries),
         "initial_translation_mm": distribution(initial_t),
         "predicted_translation_mm": distribution(predicted_t),
@@ -97,6 +109,11 @@ def summarize(entries: list[dict]) -> dict:
             rotation_improved / rotation_count if rotation_count else None
         ),
     }
+    if selected_t:
+        output["selected_translation_mm"] = distribution(selected_t)
+    if selected_r:
+        output["selected_rotation_deg"] = distribution(selected_r)
+    return output
 
 
 def main() -> None:
@@ -142,13 +159,33 @@ def main() -> None:
     model.load_state_dict(checkpoint["model_state"])
     device = torch.device(args.device)
     model.to(device).eval()
+    selector = None
+    selector_checkpoint_path = None
+    if args.selector_checkpoint:
+        selector_checkpoint_path = (
+            Path(args.selector_checkpoint).expanduser().resolve()
+        )
+        selector_checkpoint = torch.load(
+            selector_checkpoint_path, map_location="cpu"
+        )
+        selector_config = Namespace(**selector_checkpoint["args"])
+        selector = PoseCandidateSelector(
+            config.hidden_dim,
+            selector_config.hidden_dim,
+            len(object_names),
+            selector_config.object_embedding_dim,
+            selector_config.side_embedding_dim,
+            selector_config.dropout,
+        )
+        selector.load_state_dict(selector_checkpoint["selector_state"])
+        selector.to(device).eval()
 
     accumulated: dict[tuple[str, int], dict] = {}
     with torch.no_grad():
         for batch in tqdm(loader, desc="audit"):
             indices = batch["dataset_index"].numpy()
             device_batch = {key: value.to(device) for key, value in batch.items()}
-            predicted_t, predicted_r = model(
+            model_output = model(
                 device_batch["features"],
                 device_batch["object_index"],
                 device_batch.get("hand_token_features"),
@@ -158,11 +195,43 @@ def main() -> None:
                 device_batch.get("key_token_metadata"),
                 device_batch.get("key_token_valid"),
                 device_batch.get("key_token_types"),
+                return_context=selector is not None,
             )
+            if selector is None:
+                predicted_t, predicted_r = model_output
+                selected_t = selected_r = None
+            else:
+                predicted_t, predicted_r, context = model_output
+                translation_logits, rotation_logits = selector(
+                    context,
+                    device_batch["initial_translation"],
+                    predicted_t,
+                    device_batch["initial_rotation"],
+                    predicted_r,
+                    device_batch["object_index"],
+                    device_batch["hand_side_index"],
+                )
+                translation_choose = translation_logits >= 0
+                rotation_choose = rotation_logits >= 0
+                selected_t = torch.where(
+                    translation_choose[..., None],
+                    predicted_t,
+                    device_batch["initial_translation"],
+                )
+                selected_r = torch.where(
+                    rotation_choose[..., None, None],
+                    predicted_r,
+                    device_batch["initial_rotation"],
+                )
             predicted_t = (
                 predicted_t * device_batch["object_scale"][..., None]
             ).cpu().numpy()
             predicted_r = predicted_r.cpu().numpy()
+            if selected_t is not None:
+                selected_t = (
+                    selected_t * device_batch["object_scale"][..., None]
+                ).cpu().numpy()
+                selected_r = selected_r.cpu().numpy()
             initial_t = (
                 device_batch["initial_translation"]
                 * device_batch["object_scale"][..., None]
@@ -189,6 +258,8 @@ def main() -> None:
                             "hand_side": str(row["hand_side"]),
                             "predicted_t_values": [],
                             "predicted_r_values": [],
+                            "selected_t_values": [],
+                            "selected_r_values": [],
                             "initial_t": initial_t[batch_index, offset],
                             "target_t": target_t[batch_index, offset],
                             "initial_r": initial_r[batch_index, offset],
@@ -203,6 +274,13 @@ def main() -> None:
                     entry["predicted_r_values"].append(
                         predicted_r[batch_index, offset]
                     )
+                    if selected_t is not None:
+                        entry["selected_t_values"].append(
+                            selected_t[batch_index, offset]
+                        )
+                        entry["selected_r_values"].append(
+                            selected_r[batch_index, offset]
+                        )
 
     entries = []
     for entry in accumulated.values():
@@ -212,6 +290,13 @@ def main() -> None:
         entry["predicted_r"] = rotation_average(
             entry.pop("predicted_r_values")
         )
+        selected_t_values = entry.pop("selected_t_values")
+        selected_r_values = entry.pop("selected_r_values")
+        if selected_t_values:
+            entry["selected_t"] = np.mean(
+                np.stack(selected_t_values), axis=0
+            )
+            entry["selected_r"] = rotation_average(selected_r_values)
         entries.append(entry)
 
     groups: dict[str, list[dict]] = defaultdict(list)
@@ -222,6 +307,11 @@ def main() -> None:
     report = {
         "checkpoint": str(checkpoint_path),
         "checkpoint_epoch": int(checkpoint["epoch"]),
+        "selector_checkpoint": (
+            str(selector_checkpoint_path)
+            if selector_checkpoint_path is not None
+            else None
+        ),
         "windows": str(windows),
         "num_unique_frames": len(entries),
         "groups": {
