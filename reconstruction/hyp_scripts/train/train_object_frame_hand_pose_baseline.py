@@ -153,6 +153,7 @@ class ObjectFrameWindowDataset(Dataset):
         )
         object_name = scalar_text(data["object_name"])
         normalized_left = bool(np.asarray(data["normalized_left"]).item())
+        hand_side = scalar_text(data["hand_side"])
         if object_name not in self.object_to_index:
             raise KeyError(f"Unknown object {object_name} in {path}")
 
@@ -245,6 +246,9 @@ class ObjectFrameWindowDataset(Dataset):
             ),
             "object_index": torch.tensor(
                 self.object_to_index[object_name], dtype=torch.long
+            ),
+            "hand_side_index": torch.tensor(
+                0 if hand_side == "left" else 1, dtype=torch.long
             ),
         }
         if self.pi3x_root is not None:
@@ -576,7 +580,8 @@ class AbsoluteObjectFramePoseModel(nn.Module):
         key_token_metadata: torch.Tensor | None = None,
         key_token_valid: torch.Tensor | None = None,
         key_token_types: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_context: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
         if self.object_embedding is not None:
             object_feature = self.object_embedding(object_index)
             object_feature = object_feature[:, None].expand(
@@ -604,6 +609,8 @@ class AbsoluteObjectFramePoseModel(nn.Module):
             * self.max_normalized_translation
         )
         rotation = rotation_6d_to_matrix(self.rotation_head(temporal))
+        if return_context:
+            return translation, rotation, temporal
         return translation, rotation
 
 
