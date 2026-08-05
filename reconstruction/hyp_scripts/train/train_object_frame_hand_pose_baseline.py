@@ -20,6 +20,9 @@ from tqdm import tqdm
 
 KEY_JOINTS = np.asarray([4, 5, 8, 9, 12, 13, 16, 17, 20], dtype=np.int64)
 MODEL_VERSION = "object_frame_absolute_pose_mlp_bigru_v1"
+OBJECT_CONDITIONED_MODEL_VERSION = (
+    "object_frame_absolute_pose_object_embedding_mlp_bigru_v2"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--object-embedding-dim", type=int, default=0)
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--max-normalized-translation", type=float, default=3.0)
@@ -88,7 +92,13 @@ def axis_angle_matrix(rotvec: np.ndarray) -> np.ndarray:
 
 
 class ObjectFrameWindowDataset(Dataset):
-    def __init__(self, windows: Path, args: argparse.Namespace, augment: bool):
+    def __init__(
+        self,
+        windows: Path,
+        args: argparse.Namespace,
+        augment: bool,
+        object_to_index: dict[str, int],
+    ):
         self.rows = load_jsonl(windows)
         if not self.rows:
             raise RuntimeError(f"No windows in {windows}")
@@ -96,6 +106,7 @@ class ObjectFrameWindowDataset(Dataset):
         self.translation_noise = args.translation_noise_mm / 1000.0
         self.rotation_noise = math.radians(args.rotation_noise_deg)
         self.initial_pose_dropout = args.initial_pose_dropout
+        self.object_to_index = object_to_index
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -127,6 +138,9 @@ class ObjectFrameWindowDataset(Dataset):
         rotation_weight = float(
             np.asarray(data["rotation_supervision_weight"]).item()
         )
+        object_name = scalar_text(data["object_name"])
+        if object_name not in self.object_to_index:
+            raise KeyError(f"Unknown object {object_name} in {path}")
 
         length = end - start
         arrays = [joints, initial_t, target_t, initial_r, target_r]
@@ -207,6 +221,9 @@ class ObjectFrameWindowDataset(Dataset):
             "rotation_weight": torch.full(
                 (length,), rotation_weight, dtype=torch.float32
             ),
+            "object_index": torch.tensor(
+                self.object_to_index[object_name], dtype=torch.long
+            ),
         }
 
 
@@ -227,11 +244,19 @@ class AbsoluteObjectFramePoseModel(nn.Module):
         layers: int,
         dropout: float,
         max_normalized_translation: float,
+        num_objects: int,
+        object_embedding_dim: int,
     ):
         super().__init__()
         self.max_normalized_translation = max_normalized_translation
+        self.object_embedding = (
+            nn.Embedding(num_objects, object_embedding_dim)
+            if object_embedding_dim > 0
+            else None
+        )
+        encoder_input_dim = input_dim + object_embedding_dim
         self.frame_encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(encoder_input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -263,7 +288,15 @@ class AbsoluteObjectFramePoseModel(nn.Module):
             torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
         )
 
-    def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, features: torch.Tensor, object_index: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.object_embedding is not None:
+            object_feature = self.object_embedding(object_index)
+            object_feature = object_feature[:, None].expand(
+                -1, features.shape[1], -1
+            )
+            features = torch.cat((features, object_feature), dim=-1)
         encoded = self.frame_encoder(features)
         temporal, _ = self.temporal(encoded)
         translation = (
@@ -350,7 +383,9 @@ def run_epoch(
     for batch in iterator:
         batch = {key: value.to(device) for key, value in batch.items()}
         with torch.set_grad_enabled(training):
-            predicted_t_normalized, predicted_r = model(batch["features"])
+            predicted_t_normalized, predicted_r = model(
+                batch["features"], batch["object_index"]
+            )
             scale = batch["object_scale"][..., None]
             predicted_t = predicted_t_normalized * scale
             target_t = batch["target_translation"] * scale
@@ -489,8 +524,23 @@ def main() -> None:
     val_windows = Path(args.val_windows).expanduser().resolve()
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    train_data = ObjectFrameWindowDataset(train_windows, args, augment=True)
-    val_data = ObjectFrameWindowDataset(val_windows, args, augment=False)
+    train_rows = load_jsonl(train_windows)
+    object_names = sorted({str(row["object_name"]) for row in train_rows})
+    val_object_names = {
+        str(row["object_name"]) for row in load_jsonl(val_windows)
+    }
+    unknown_objects = sorted(val_object_names - set(object_names))
+    if unknown_objects:
+        raise KeyError(f"Validation contains unknown objects: {unknown_objects}")
+    object_to_index = {
+        name: index for index, name in enumerate(object_names)
+    }
+    train_data = ObjectFrameWindowDataset(
+        train_windows, args, augment=True, object_to_index=object_to_index
+    )
+    val_data = ObjectFrameWindowDataset(
+        val_windows, args, augment=False, object_to_index=object_to_index
+    )
     input_dim = int(train_data[0]["features"].shape[-1])
     device = torch.device(args.device)
     model = AbsoluteObjectFramePoseModel(
@@ -499,6 +549,8 @@ def main() -> None:
         args.layers,
         args.dropout,
         args.max_normalized_translation,
+        len(object_names),
+        args.object_embedding_dim,
     ).to(device)
     if args.data_parallel:
         model = nn.DataParallel(model)
@@ -541,7 +593,11 @@ def main() -> None:
         print(json.dumps(row), flush=True)
         checkpoint = {
             "epoch": epoch,
-            "model_version": MODEL_VERSION,
+            "model_version": (
+                OBJECT_CONDITIONED_MODEL_VERSION
+                if args.object_embedding_dim > 0
+                else MODEL_VERSION
+            ),
             "model_state": (
                 model.module.state_dict()
                 if isinstance(model, nn.DataParallel)
@@ -550,6 +606,8 @@ def main() -> None:
             "optimizer_state": optimizer.state_dict(),
             "args": vars(args),
             "input_dim": input_dim,
+            "object_embedding_dim": args.object_embedding_dim,
+            "object_names": object_names,
             "val_total": val_metrics["total"],
         }
         torch.save(checkpoint, out_dir / "last.pt")
