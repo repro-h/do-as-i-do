@@ -23,12 +23,17 @@ MODEL_VERSION = "object_frame_absolute_pose_mlp_bigru_v1"
 OBJECT_CONDITIONED_MODEL_VERSION = (
     "object_frame_absolute_pose_object_embedding_mlp_bigru_v2"
 )
+PI3X_RELATION_MODEL_VERSION = (
+    "object_frame_absolute_pose_pi3x_relative_cross_attention_v3"
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-windows", required=True)
     parser.add_argument("--val-windows", required=True)
+    parser.add_argument("--pi3x-train-root")
+    parser.add_argument("--pi3x-val-root")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -37,6 +42,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--object-embedding-dim", type=int, default=0)
+    parser.add_argument("--pi3x-relation-dim", type=int, default=128)
+    parser.add_argument("--pi3x-heads", type=int, default=8)
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--max-normalized-translation", type=float, default=3.0)
@@ -98,6 +105,7 @@ class ObjectFrameWindowDataset(Dataset):
         args: argparse.Namespace,
         augment: bool,
         object_to_index: dict[str, int],
+        pi3x_root: Path | None,
     ):
         self.rows = load_jsonl(windows)
         if not self.rows:
@@ -107,12 +115,14 @@ class ObjectFrameWindowDataset(Dataset):
         self.rotation_noise = math.radians(args.rotation_noise_deg)
         self.initial_pose_dropout = args.initial_pose_dropout
         self.object_to_index = object_to_index
+        self.pi3x_root = pi3x_root
 
     def __len__(self) -> int:
         return len(self.rows)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         row = self.rows[index]
+        stream_id = str(row["stream_id"])
         start, end = int(row["start"]), int(row["end"])
         path = Path(row["supervision_npz"]).expanduser().resolve()
         data = load_npz(str(path))
@@ -130,6 +140,9 @@ class ObjectFrameWindowDataset(Dataset):
         target_r = np.asarray(
             data["target_rotation_object"], dtype=np.float32
         )[start:end]
+        filtered_pose = np.asarray(
+            data["filtered_object_pose"], dtype=np.float32
+        )[start:end]
         valid_t = np.asarray(data["valid_translation"], dtype=bool)[start:end]
         valid_r = np.asarray(data["valid_rotation"], dtype=bool)[start:end]
         observed = np.asarray(data["hand_observed"], dtype=bool)[start:end]
@@ -139,11 +152,19 @@ class ObjectFrameWindowDataset(Dataset):
             np.asarray(data["rotation_supervision_weight"]).item()
         )
         object_name = scalar_text(data["object_name"])
+        normalized_left = bool(np.asarray(data["normalized_left"]).item())
         if object_name not in self.object_to_index:
             raise KeyError(f"Unknown object {object_name} in {path}")
 
         length = end - start
-        arrays = [joints, initial_t, target_t, initial_r, target_r]
+        arrays = [
+            joints,
+            initial_t,
+            target_t,
+            initial_r,
+            target_r,
+            filtered_pose,
+        ]
         if any(len(value) != length for value in arrays):
             raise ValueError(f"Window exceeds supervision for {path}")
         finite_t = (
@@ -205,7 +226,7 @@ class ObjectFrameWindowDataset(Dataset):
             axis=-1,
         ).astype(np.float32)
 
-        return {
+        sample = {
             "features": torch.from_numpy(features),
             "initial_translation": torch.from_numpy(
                 clean_initial_t_normalized.astype(np.float32)
@@ -225,6 +246,137 @@ class ObjectFrameWindowDataset(Dataset):
                 self.object_to_index[object_name], dtype=torch.long
             ),
         }
+        if self.pi3x_root is not None:
+            pi3x_path = (
+                self.pi3x_root
+                / stream_id
+                / "pi3x_geometry_features_compact.npz"
+            ).resolve()
+            if not pi3x_path.is_file():
+                raise FileNotFoundError(pi3x_path)
+            pi3x = load_npz(str(pi3x_path))
+            frame_indices = np.asarray(pi3x["frame_indices"], dtype=np.int64)
+            expected = np.arange(start, end, dtype=np.int64)
+            positions = np.searchsorted(frame_indices, expected)
+            if (
+                np.any(positions >= len(frame_indices))
+                or not np.array_equal(frame_indices[positions], expected)
+            ):
+                raise ValueError(
+                    f"{pi3x_path} does not cover frames [{start}, {end})"
+                )
+
+            grid = np.asarray(
+                pi3x["geometry_feature_grid_hw"], dtype=np.float32
+            )
+
+            def token_group(prefix: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+                token_features = np.asarray(
+                    pi3x[f"{prefix}_features"][positions], dtype=np.float32
+                )
+                points = np.asarray(
+                    pi3x[f"{prefix}_points"][positions], dtype=np.float32
+                )
+                coverage = np.asarray(
+                    pi3x[f"{prefix}_coverage"][positions], dtype=np.float32
+                )
+                confidence = np.asarray(
+                    pi3x[f"{prefix}_confidence"][positions], dtype=np.float32
+                )
+                indices = np.asarray(
+                    pi3x[f"{prefix}_indices"][positions], dtype=np.float32
+                )
+                if normalized_left:
+                    points = points.copy()
+                    points[..., 0] *= -1.0
+                    indices = indices.copy()
+                    indices[..., 1] = (float(grid[1]) - 1.0) - indices[..., 1]
+                indices[..., 0] /= max(float(grid[0] - 1), 1.0)
+                indices[..., 1] /= max(float(grid[1] - 1), 1.0)
+                valid = np.asarray(
+                    pi3x[f"{prefix}_valid"][positions], dtype=bool
+                )
+                metadata = np.concatenate(
+                    (
+                        points,
+                        indices,
+                        coverage[..., None],
+                        confidence[..., None],
+                    ),
+                    axis=-1,
+                )
+                return token_features, metadata, valid
+
+            hand_features, hand_metadata, hand_token_valid = token_group("hand")
+            object_features, object_metadata, object_token_valid = token_group(
+                "object"
+            )
+            context_features, context_metadata, context_token_valid = token_group(
+                "context"
+            )
+
+            object_points = object_metadata[..., :3]
+            object_center = np.zeros((length, 3), dtype=np.float32)
+            object_point_scale = np.ones(length, dtype=np.float32)
+            for frame in range(length):
+                valid_points = object_points[frame, object_token_valid[frame]]
+                valid_points = valid_points[np.isfinite(valid_points).all(axis=-1)]
+                if len(valid_points):
+                    center = np.median(valid_points, axis=0)
+                    distances = np.linalg.norm(valid_points - center, axis=-1)
+                    point_scale = max(
+                        float(np.sqrt(np.mean(distances ** 2))), 1e-4
+                    )
+                    object_center[frame] = center
+                    object_point_scale[frame] = point_scale
+            for metadata in (hand_metadata, object_metadata, context_metadata):
+                centered_points = (
+                    metadata[..., :3] - object_center[:, None]
+                )
+                object_frame_points = np.einsum(
+                    "tni,tij->tnj",
+                    centered_points,
+                    filtered_pose[:, :3, :3],
+                )
+                metadata[..., :3] = (
+                    object_frame_points / object_point_scale[:, None, None]
+                )
+                metadata[:] = np.nan_to_num(metadata)
+
+            key_features = np.concatenate(
+                (object_features, context_features), axis=1
+            )
+            key_metadata = np.concatenate(
+                (object_metadata, context_metadata), axis=1
+            )
+            key_valid = np.concatenate(
+                (object_token_valid, context_token_valid), axis=1
+            )
+            pose_frame_valid = np.isfinite(
+                filtered_pose[:, :3, :3]
+            ).all(axis=(1, 2))
+            relation_frame_valid = (
+                pose_frame_valid & object_token_valid.any(axis=1)
+            )
+            hand_token_valid &= relation_frame_valid[:, None]
+            key_valid &= relation_frame_valid[:, None]
+            key_types = np.concatenate(
+                (
+                    np.zeros_like(object_token_valid, dtype=np.int64),
+                    np.ones_like(context_token_valid, dtype=np.int64),
+                ),
+                axis=1,
+            )
+            sample.update(
+                hand_token_features=torch.from_numpy(hand_features),
+                hand_token_metadata=torch.from_numpy(hand_metadata),
+                hand_token_valid=torch.from_numpy(hand_token_valid),
+                key_token_features=torch.from_numpy(key_features),
+                key_token_metadata=torch.from_numpy(key_metadata),
+                key_token_valid=torch.from_numpy(key_valid),
+                key_token_types=torch.from_numpy(key_types),
+            )
+        return sample
 
 
 def rotation_6d_to_matrix(value: torch.Tensor) -> torch.Tensor:
@@ -234,6 +386,113 @@ def rotation_6d_to_matrix(value: torch.Tensor) -> torch.Tensor:
     second = F.normalize(second, dim=-1, eps=1e-6)
     third = torch.cross(first, second, dim=-1)
     return torch.stack((first, second, third), dim=-1)
+
+
+class RelativeCrossAttention(nn.Module):
+    def __init__(
+        self,
+        feature_dim: int,
+        metadata_dim: int,
+        relation_dim: int,
+        heads: int,
+        dropout: float,
+    ):
+        super().__init__()
+        if relation_dim % heads:
+            raise ValueError("pi3x-relation-dim must be divisible by pi3x-heads")
+        self.heads = heads
+        self.head_dim = relation_dim // heads
+        self.scale = self.head_dim ** -0.5
+        self.hand_feature_projection = nn.Sequential(
+            nn.LayerNorm(feature_dim), nn.Linear(feature_dim, relation_dim)
+        )
+        self.key_feature_projection = nn.Sequential(
+            nn.LayerNorm(feature_dim), nn.Linear(feature_dim, relation_dim)
+        )
+        self.hand_metadata_projection = nn.Sequential(
+            nn.Linear(metadata_dim, relation_dim),
+            nn.GELU(),
+            nn.Linear(relation_dim, relation_dim),
+        )
+        self.key_metadata_projection = nn.Sequential(
+            nn.Linear(metadata_dim, relation_dim),
+            nn.GELU(),
+            nn.Linear(relation_dim, relation_dim),
+        )
+        self.key_type_embedding = nn.Embedding(2, relation_dim)
+        self.query = nn.Linear(relation_dim, relation_dim)
+        self.key = nn.Linear(relation_dim, relation_dim)
+        self.value = nn.Linear(relation_dim, relation_dim)
+        self.relative_bias = nn.Sequential(
+            nn.Linear(6, 32), nn.GELU(), nn.Linear(32, heads)
+        )
+        self.output = nn.Linear(relation_dim, relation_dim)
+        self.norm = nn.LayerNorm(relation_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        hand_features: torch.Tensor,
+        hand_metadata: torch.Tensor,
+        hand_valid: torch.Tensor,
+        key_features: torch.Tensor,
+        key_metadata: torch.Tensor,
+        key_valid: torch.Tensor,
+        key_types: torch.Tensor,
+    ) -> torch.Tensor:
+        hand = self.hand_feature_projection(hand_features)
+        hand = hand + self.hand_metadata_projection(hand_metadata)
+        key_token = self.key_feature_projection(key_features)
+        key_token = key_token + self.key_metadata_projection(key_metadata)
+        key_token = key_token + self.key_type_embedding(key_types)
+
+        batch, frames, hand_count, _ = hand.shape
+        key_count = key_token.shape[2]
+        query = self.query(hand).reshape(
+            batch, frames, hand_count, self.heads, self.head_dim
+        ).permute(0, 1, 3, 2, 4)
+        key = self.key(key_token).reshape(
+            batch, frames, key_count, self.heads, self.head_dim
+        ).permute(0, 1, 3, 2, 4)
+        value = self.value(key_token).reshape(
+            batch, frames, key_count, self.heads, self.head_dim
+        ).permute(0, 1, 3, 2, 4)
+
+        delta_xyz = (
+            hand_metadata[:, :, :, None, :3]
+            - key_metadata[:, :, None, :, :3]
+        )
+        distance = torch.linalg.norm(delta_xyz, dim=-1, keepdim=True)
+        delta_uv = (
+            hand_metadata[:, :, :, None, 3:5]
+            - key_metadata[:, :, None, :, 3:5]
+        )
+        relative = torch.cat((delta_xyz, distance, delta_uv), dim=-1)
+        bias = self.relative_bias(relative).permute(0, 1, 4, 2, 3)
+        logits = torch.einsum("bthid,bthjd->bthij", query, key)
+        logits = logits * self.scale + bias
+        logits = logits.masked_fill(
+            ~key_valid[:, :, None, None, :], -1e4
+        )
+        attention = torch.softmax(logits, dim=-1)
+        attention = self.dropout(attention)
+        attended = torch.einsum("bthij,bthjd->bthid", attention, value)
+        attended = attended.permute(0, 1, 3, 2, 4).reshape(
+            batch, frames, hand_count, -1
+        )
+        has_key = key_valid.any(dim=-1)[..., None, None]
+        attended = attended * has_key.to(attended.dtype)
+        updated = self.norm(hand + self.output(attended))
+
+        confidence = hand_metadata[..., 6].clamp(0.0, 1.0)
+        pool_weight = confidence * hand_valid.to(confidence.dtype)
+        fallback = hand_valid.to(confidence.dtype)
+        use_fallback = pool_weight.sum(-1, keepdim=True) <= 1e-6
+        pool_weight = torch.where(use_fallback, fallback, pool_weight)
+        pooled = (
+            updated * pool_weight[..., None]
+        ).sum(dim=2) / pool_weight.sum(dim=2, keepdim=True).clamp_min(1.0)
+        return pooled
 
 
 class AbsoluteObjectFramePoseModel(nn.Module):
@@ -246,6 +505,10 @@ class AbsoluteObjectFramePoseModel(nn.Module):
         max_normalized_translation: float,
         num_objects: int,
         object_embedding_dim: int,
+        pi3x_feature_dim: int = 0,
+        pi3x_metadata_dim: int = 0,
+        pi3x_relation_dim: int = 128,
+        pi3x_heads: int = 8,
     ):
         super().__init__()
         self.max_normalized_translation = max_normalized_translation
@@ -254,7 +517,20 @@ class AbsoluteObjectFramePoseModel(nn.Module):
             if object_embedding_dim > 0
             else None
         )
+        self.pi3x_relation = (
+            RelativeCrossAttention(
+                pi3x_feature_dim,
+                pi3x_metadata_dim,
+                pi3x_relation_dim,
+                pi3x_heads,
+                dropout,
+            )
+            if pi3x_feature_dim > 0
+            else None
+        )
         encoder_input_dim = input_dim + object_embedding_dim
+        if self.pi3x_relation is not None:
+            encoder_input_dim += pi3x_relation_dim
         self.frame_encoder = nn.Sequential(
             nn.Linear(encoder_input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -289,7 +565,16 @@ class AbsoluteObjectFramePoseModel(nn.Module):
         )
 
     def forward(
-        self, features: torch.Tensor, object_index: torch.Tensor
+        self,
+        features: torch.Tensor,
+        object_index: torch.Tensor,
+        hand_token_features: torch.Tensor | None = None,
+        hand_token_metadata: torch.Tensor | None = None,
+        hand_token_valid: torch.Tensor | None = None,
+        key_token_features: torch.Tensor | None = None,
+        key_token_metadata: torch.Tensor | None = None,
+        key_token_valid: torch.Tensor | None = None,
+        key_token_types: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.object_embedding is not None:
             object_feature = self.object_embedding(object_index)
@@ -297,6 +582,20 @@ class AbsoluteObjectFramePoseModel(nn.Module):
                 -1, features.shape[1], -1
             )
             features = torch.cat((features, object_feature), dim=-1)
+        if self.pi3x_relation is not None:
+            token_values = (
+                hand_token_features,
+                hand_token_metadata,
+                hand_token_valid,
+                key_token_features,
+                key_token_metadata,
+                key_token_valid,
+                key_token_types,
+            )
+            if any(value is None for value in token_values):
+                raise ValueError("Pi3X relation tokens are required")
+            relation = self.pi3x_relation(*token_values)
+            features = torch.cat((features, relation), dim=-1)
         encoded = self.frame_encoder(features)
         temporal, _ = self.temporal(encoded)
         translation = (
@@ -384,7 +683,15 @@ def run_epoch(
         batch = {key: value.to(device) for key, value in batch.items()}
         with torch.set_grad_enabled(training):
             predicted_t_normalized, predicted_r = model(
-                batch["features"], batch["object_index"]
+                batch["features"],
+                batch["object_index"],
+                batch.get("hand_token_features"),
+                batch.get("hand_token_metadata"),
+                batch.get("hand_token_valid"),
+                batch.get("key_token_features"),
+                batch.get("key_token_metadata"),
+                batch.get("key_token_valid"),
+                batch.get("key_token_types"),
             )
             scale = batch["object_scale"][..., None]
             predicted_t = predicted_t_normalized * scale
@@ -514,6 +821,10 @@ def seed_worker(worker_id: int) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.object_embedding_dim < 0:
+        raise ValueError("object-embedding-dim must be non-negative")
+    if args.pi3x_relation_dim <= 0 or args.pi3x_heads <= 0:
+        raise ValueError("Pi3X relation dimensions must be positive")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -522,6 +833,26 @@ def main() -> None:
 
     train_windows = Path(args.train_windows).expanduser().resolve()
     val_windows = Path(args.val_windows).expanduser().resolve()
+    if bool(args.pi3x_train_root) != bool(args.pi3x_val_root):
+        raise ValueError(
+            "pi3x-train-root and pi3x-val-root must be provided together"
+        )
+    pi3x_train_root = (
+        Path(args.pi3x_train_root).expanduser().resolve()
+        if args.pi3x_train_root
+        else None
+    )
+    pi3x_val_root = (
+        Path(args.pi3x_val_root).expanduser().resolve()
+        if args.pi3x_val_root
+        else None
+    )
+    for path in (train_windows, val_windows):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    for path in (pi3x_train_root, pi3x_val_root):
+        if path is not None and not path.is_dir():
+            raise NotADirectoryError(path)
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     train_rows = load_jsonl(train_windows)
@@ -536,12 +867,31 @@ def main() -> None:
         name: index for index, name in enumerate(object_names)
     }
     train_data = ObjectFrameWindowDataset(
-        train_windows, args, augment=True, object_to_index=object_to_index
+        train_windows,
+        args,
+        augment=True,
+        object_to_index=object_to_index,
+        pi3x_root=pi3x_train_root,
     )
     val_data = ObjectFrameWindowDataset(
-        val_windows, args, augment=False, object_to_index=object_to_index
+        val_windows,
+        args,
+        augment=False,
+        object_to_index=object_to_index,
+        pi3x_root=pi3x_val_root,
     )
-    input_dim = int(train_data[0]["features"].shape[-1])
+    sample = train_data[0]
+    input_dim = int(sample["features"].shape[-1])
+    pi3x_feature_dim = (
+        int(sample["hand_token_features"].shape[-1])
+        if "hand_token_features" in sample
+        else 0
+    )
+    pi3x_metadata_dim = (
+        int(sample["hand_token_metadata"].shape[-1])
+        if "hand_token_metadata" in sample
+        else 0
+    )
     device = torch.device(args.device)
     model = AbsoluteObjectFramePoseModel(
         input_dim,
@@ -551,7 +901,38 @@ def main() -> None:
         args.max_normalized_translation,
         len(object_names),
         args.object_embedding_dim,
+        pi3x_feature_dim,
+        pi3x_metadata_dim,
+        args.pi3x_relation_dim,
+        args.pi3x_heads,
     ).to(device)
+    print(
+        json.dumps(
+            {
+                "model_version": (
+                    PI3X_RELATION_MODEL_VERSION
+                    if pi3x_feature_dim > 0
+                    else (
+                        OBJECT_CONDITIONED_MODEL_VERSION
+                        if args.object_embedding_dim > 0
+                        else MODEL_VERSION
+                    )
+                ),
+                "windows": {
+                    "train": len(train_data),
+                    "val": len(val_data),
+                },
+                "input_dim": input_dim,
+                "pi3x_feature_dim": pi3x_feature_dim,
+                "pi3x_metadata_dim": pi3x_metadata_dim,
+                "pi3x_relation_dim": (
+                    args.pi3x_relation_dim if pi3x_feature_dim > 0 else 0
+                ),
+                "objects": len(object_names),
+            }
+        ),
+        flush=True,
+    )
     if args.data_parallel:
         model = nn.DataParallel(model)
 
@@ -594,9 +975,13 @@ def main() -> None:
         checkpoint = {
             "epoch": epoch,
             "model_version": (
-                OBJECT_CONDITIONED_MODEL_VERSION
-                if args.object_embedding_dim > 0
-                else MODEL_VERSION
+                PI3X_RELATION_MODEL_VERSION
+                if pi3x_feature_dim > 0
+                else (
+                    OBJECT_CONDITIONED_MODEL_VERSION
+                    if args.object_embedding_dim > 0
+                    else MODEL_VERSION
+                )
             ),
             "model_state": (
                 model.module.state_dict()
@@ -608,6 +993,12 @@ def main() -> None:
             "input_dim": input_dim,
             "object_embedding_dim": args.object_embedding_dim,
             "object_names": object_names,
+            "pi3x_feature_dim": pi3x_feature_dim,
+            "pi3x_metadata_dim": pi3x_metadata_dim,
+            "pi3x_relation_dim": (
+                args.pi3x_relation_dim if pi3x_feature_dim > 0 else 0
+            ),
+            "pi3x_heads": args.pi3x_heads if pi3x_feature_dim > 0 else 0,
             "val_total": val_metrics["total"],
         }
         torch.save(checkpoint, out_dir / "last.pt")
