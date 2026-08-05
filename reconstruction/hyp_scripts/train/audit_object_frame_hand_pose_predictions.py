@@ -64,6 +64,7 @@ def rotation_error_deg(prediction: np.ndarray, target: np.ndarray) -> float:
 def summarize(entries: list[dict]) -> dict:
     initial_t, predicted_t = [], []
     initial_r, predicted_r = [], []
+    oracle_t, oracle_r = [], []
     translation_improved = rotation_improved = rotation_count = 0
     for entry in entries:
         if entry["valid_translation"]:
@@ -71,23 +72,27 @@ def summarize(entries: list[dict]) -> dict:
             new = float(np.linalg.norm(entry["predicted_t"] - entry["target_t"]))
             initial_t.append(old * 1000.0)
             predicted_t.append(new * 1000.0)
+            oracle_t.append(min(old, new) * 1000.0)
             translation_improved += int(new < old)
         if entry["valid_rotation"]:
             old = rotation_error_deg(entry["initial_r"], entry["target_r"])
             new = rotation_error_deg(entry["predicted_r"], entry["target_r"])
             initial_r.append(old)
             predicted_r.append(new)
+            oracle_r.append(min(old, new))
             rotation_improved += int(new < old)
             rotation_count += 1
     return {
         "frames": len(entries),
         "initial_translation_mm": distribution(initial_t),
         "predicted_translation_mm": distribution(predicted_t),
+        "oracle_translation_mm": distribution(oracle_t),
         "translation_improved_fraction": (
             translation_improved / len(initial_t) if initial_t else None
         ),
         "initial_rotation_deg": distribution(initial_r),
         "predicted_rotation_deg": distribution(predicted_r),
+        "oracle_rotation_deg": distribution(oracle_r),
         "rotation_improved_fraction": (
             rotation_improved / rotation_count if rotation_count else None
         ),
