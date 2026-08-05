@@ -227,6 +227,7 @@ class ObjectFrameWindowDataset(Dataset):
         ).astype(np.float32)
 
         sample = {
+            "dataset_index": torch.tensor(index, dtype=torch.long),
             "features": torch.from_numpy(features),
             "initial_translation": torch.from_numpy(
                 clean_initial_t_normalized.astype(np.float32)
