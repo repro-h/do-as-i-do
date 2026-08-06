@@ -14,8 +14,8 @@ import json
 from pathlib import Path
 
 import numpy as np
-import smplx
 import torch
+from manopth.manolayer import ManoLayer
 from scipy.spatial.transform import Rotation
 
 
@@ -48,9 +48,9 @@ def rotation_matrices(rotvec: np.ndarray) -> np.ndarray:
 def load_mano(mano_dir: Path, device: torch.device):
     # HandFlow stores raw parameters from the right-hand model for mirrored
     # left-hand inputs.  Left normalization is applied after rendering.
-    layer = smplx.MANOLayer(
-        model_path=str(mano_dir),
-        is_rhand=True,
+    layer = ManoLayer(
+        mano_root=str(mano_dir),
+        side="right",
         use_pca=False,
         flat_hand_mean=True,
     )
@@ -66,8 +66,8 @@ def mano_local_vertices(
     batch_size: int,
 ) -> np.ndarray:
     count = len(pose)
-    hand_rot = rotation_matrices(pose[:, 3:]).astype(np.float32)
-    zero_global = np.broadcast_to(np.eye(3, dtype=np.float32), (count, 1, 3, 3))
+    zero_pose = pose.copy().astype(np.float32)
+    zero_pose[:, :3] = 0.0
     betas = np.asarray(betas, dtype=np.float32)
     if betas.ndim == 1:
         beta_batch = np.broadcast_to(
@@ -83,13 +83,13 @@ def mano_local_vertices(
     with torch.no_grad():
         for start in range(0, count, batch_size):
             end = min(start + batch_size, count)
-            output = layer(
-                global_orient=torch.from_numpy(zero_global[start:end]).to(device),
-                hand_pose=torch.from_numpy(hand_rot[start:end]).to(device),
-                betas=torch.from_numpy(beta_batch[start:end]).to(device),
-                pose2rot=False,
+            output, _ = layer(
+                torch.from_numpy(zero_pose[start:end]).to(device),
+                th_betas=torch.from_numpy(beta_batch[start:end]).to(device),
+                th_trans=torch.zeros((end - start, 3), device=device),
             )
-            vertices.append(output.vertices.detach().cpu().numpy())
+            # manopth returns millimetres; the rest of this pipeline uses m.
+            vertices.append(output.detach().cpu().numpy() / 1000.0)
     return np.concatenate(vertices, axis=0).astype(np.float32)
 
 
