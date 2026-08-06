@@ -26,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pi3x-root", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--out-root", required=True)
+    parser.add_argument("--handflow-root")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--device", default="cuda")
@@ -90,6 +91,7 @@ def main() -> None:
     )
 
     accumulated: dict[str, dict[str, np.ndarray]] = {}
+    supervision_paths: dict[str, str] = {}
     with torch.no_grad():
         for batch in tqdm(loader, desc="apply local SE3 residual", dynamic_ncols=True):
             initial_r = batch["initial_rotation"].to(device)
@@ -150,6 +152,7 @@ def main() -> None:
                         "valid_t": np.zeros(frame_count, dtype=bool),
                         "valid_r": np.zeros(frame_count, dtype=bool),
                     }
+                    supervision_paths[stream_id] = str(row["supervision_npz"])
                 target = accumulated[stream_id]
                 weight = blend_weights(length)
                 target["weight"][start:end] += weight
@@ -205,6 +208,49 @@ def main() -> None:
         output["target_rotation_object"] = data["target_r"].astype(np.float32)
         output["checkpoint"] = np.asarray(str(checkpoint_path))
         output["model_version"] = np.asarray(checkpoint["model_version"])
+
+        if args.handflow_root:
+            supervision = np.load(
+                supervision_paths[stream_id], allow_pickle=False
+            )
+            filtered_pose = np.asarray(
+                supervision["filtered_object_pose"], dtype=np.float64
+            )
+            handflow_path = (
+                Path(args.handflow_root).expanduser().resolve()
+                / stream_id
+                / "handflow_camera_result.npz"
+            )
+            if not handflow_path.is_file():
+                raise FileNotFoundError(handflow_path)
+            with np.load(handflow_path, allow_pickle=False) as archive:
+                handflow = {
+                    key: np.asarray(archive[key]) for key in archive.files
+                }
+            vertices = np.asarray(handflow["verts_cam"], dtype=np.float64)
+            count = min(len(vertices), len(filtered_pose), len(valid_t))
+            corrected_vertices = vertices.copy()
+            correction_valid = valid_t & valid_r
+            for frame in np.flatnonzero(correction_valid[:count]):
+                object_rotation = filtered_pose[frame, :3, :3]
+                object_translation = filtered_pose[frame, :3, 3]
+                vertices_object = (
+                    vertices[frame] - object_translation
+                ) @ object_rotation
+                vertices_local = (
+                    vertices_object - initial_t[frame]
+                ) @ data["initial_r"][frame]
+                vertices_final_object = (
+                    vertices_local @ data["predicted_r"][frame].T
+                    + predicted_t[frame]
+                )
+                corrected_vertices[frame] = (
+                    vertices_final_object @ object_rotation.T
+                    + object_translation
+                )
+            output["verts_cam"] = corrected_vertices.astype(np.float32)
+            output["handflow_camera_result"] = np.asarray(str(handflow_path))
+            output["camera_mesh_correction_valid"] = correction_valid
         np.savez_compressed(result_path, **output)
         stream_rows.append({"stream_id": stream_id, "result": str(result_path)})
 
