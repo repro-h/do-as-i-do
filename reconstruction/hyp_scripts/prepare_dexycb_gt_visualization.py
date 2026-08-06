@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import pickle
+from collections import namedtuple
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +15,18 @@ import smplx
 import torch
 import yaml
 from scipy.spatial.transform import Rotation
+
+
+# DexYCB's legacy MANO pickle imports chumpy, which still calls the removed
+# inspect.getargspec API under Python 3.11.
+if not hasattr(inspect, "getargspec"):
+    _ArgSpec = namedtuple("ArgSpec", "args varargs keywords defaults")
+
+    def _getargspec(function):
+        full = inspect.getfullargspec(function)
+        return _ArgSpec(full.args, full.varargs, full.varkw, full.defaults)
+
+    inspect.getargspec = _getargspec
 
 
 def parse_args() -> argparse.Namespace:
