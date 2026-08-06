@@ -28,6 +28,18 @@ if not hasattr(inspect, "getargspec"):
 
     inspect.getargspec = _getargspec
 
+# The same legacy chumpy import also expects NumPy 1.x scalar aliases.
+for _name, _value in {
+    "bool": bool,
+    "int": int,
+    "float": float,
+    "complex": complex,
+    "object": object,
+    "str": str,
+}.items():
+    if _name not in np.__dict__:
+        setattr(np, _name, _value)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
