@@ -68,9 +68,17 @@ def mano_local_vertices(
     count = len(pose)
     hand_rot = rotation_matrices(pose[:, 3:]).astype(np.float32)
     zero_global = np.broadcast_to(np.eye(3, dtype=np.float32), (count, 1, 3, 3))
-    beta_batch = np.broadcast_to(
-        betas.astype(np.float32)[None], (count, betas.shape[-1])
-    )
+    betas = np.asarray(betas, dtype=np.float32)
+    if betas.ndim == 1:
+        beta_batch = np.broadcast_to(
+            betas[None], (count, betas.shape[-1])
+        ).copy()
+    elif betas.ndim == 2 and betas.shape[0] >= count:
+        beta_batch = betas[:count].copy()
+    else:
+        raise ValueError(
+            f"Expected betas with shape (10,) or (T,10), got {betas.shape}"
+        )
     vertices = []
     with torch.no_grad():
         for start in range(0, count, batch_size):
