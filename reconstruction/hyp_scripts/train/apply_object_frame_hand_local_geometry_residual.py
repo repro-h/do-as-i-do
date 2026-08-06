@@ -174,7 +174,8 @@ def main() -> None:
         result_path = stream_out / "hand_object_pose_local_residual.npz"
         if result_path.is_file() and not args.overwrite:
             continue
-        weight = np.maximum(data.pop("weight"), 1e-8)
+        covered = data.pop("weight") > 0.0
+        weight = np.maximum(covered.astype(np.float64), 1e-8)
         for name, value in data.items():
             if value.ndim >= 1 and value.shape[0] == len(weight):
                 if name not in ("valid_t", "valid_r"):
@@ -232,7 +233,11 @@ def main() -> None:
             vertices = np.asarray(handflow["verts_cam"], dtype=np.float64)
             count = min(len(vertices), len(filtered_pose), len(valid_t))
             corrected_vertices = vertices.copy()
-            correction_valid = valid_t & valid_r
+            correction_valid = (
+                covered[:count]
+                & np.isfinite(data["predicted_t"][:count]).all(axis=-1)
+                & np.isfinite(data["predicted_r"][:count]).all(axis=(1, 2))
+            )
             for frame in np.flatnonzero(correction_valid[:count]):
                 object_rotation = filtered_pose[frame, :3, :3]
                 object_translation = filtered_pose[frame, :3, 3]
@@ -252,7 +257,11 @@ def main() -> None:
                 )
             output["verts_cam"] = corrected_vertices.astype(np.float32)
             output["handflow_camera_result"] = np.asarray(str(handflow_path))
-            output["camera_mesh_correction_valid"] = correction_valid
+            output["camera_mesh_correction_valid"] = (
+                covered
+                & np.isfinite(data["predicted_t"]).all(axis=-1)
+                & np.isfinite(data["predicted_r"]).all(axis=(1, 2))
+            )
         np.savez_compressed(result_path, **output)
         stream_rows.append({"stream_id": stream_id, "result": str(result_path)})
 

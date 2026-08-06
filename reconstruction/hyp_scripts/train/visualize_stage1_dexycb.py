@@ -311,7 +311,10 @@ def main() -> None:
         if prediction_is_corrected_handflow
         else "Relative median"
     )
-    print(f"{metric_label}: {before:.3f} -> {after:.3f} mm")
+    if before is None or after is None:
+        print(f"{metric_label}: unavailable for this prediction format")
+    else:
+        print(f"{metric_label}: {before:.3f} -> {after:.3f} mm")
     print(f"Prepared: {stream_out}")
     if args.prepare_only:
         return
