@@ -271,6 +271,8 @@ def main() -> None:
         "--invalid-hand-mode",
         "keep",
     ]
+    if record["hand_side"] == "left":
+        common.append("--mirror-x")
     original_layout = original_out / "foundationpose_layout_camera_frame.json"
     corrected_layout = corrected_out / "foundationpose_layout_camera_frame.json"
     if args.force_prepare or not original_layout.is_file():

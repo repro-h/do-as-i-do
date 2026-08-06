@@ -160,6 +160,10 @@ def adapt_handflow(
         vertices[..., 0] *= -1.0
         faces = faces[:, [0, 2, 1]].copy()
 
+        if stage1_vertices is not None:
+            stage1_vertices = stage1_vertices.copy()
+            stage1_vertices[..., 0] *= -1.0
+
     if stage1_vertices is not None:
         count = min(len(vertices), len(stage1_vertices))
         active = np.ones(count, dtype=bool)
