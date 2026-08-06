@@ -174,8 +174,9 @@ def main() -> None:
         result_path = stream_out / "hand_object_pose_local_residual.npz"
         if result_path.is_file() and not args.overwrite:
             continue
-        covered = data.pop("weight") > 0.0
-        weight = np.maximum(covered.astype(np.float64), 1e-8)
+        blend_weight = data.pop("weight")
+        covered = blend_weight > 0.0
+        weight = np.maximum(blend_weight, 1e-8)
         for name, value in data.items():
             if value.ndim >= 1 and value.shape[0] == len(weight):
                 if name not in ("valid_t", "valid_r"):
