@@ -139,6 +139,7 @@ def adapt_handflow(
     mirror_x: bool,
     hand_delta: Optional[np.ndarray] = None,
     stage1_predicted: Optional[np.ndarray] = None,
+    stage1_vertices: Optional[np.ndarray] = None,
 ) -> dict:
     with np.load(source_path, allow_pickle=True) as data:
         vertices = np.asarray(data["verts_cam"], dtype=np.float32)
@@ -158,6 +159,15 @@ def adapt_handflow(
         vertices = vertices.copy()
         vertices[..., 0] *= -1.0
         faces = faces[:, [0, 2, 1]].copy()
+
+    if stage1_vertices is not None:
+        count = min(len(vertices), len(stage1_vertices))
+        active = np.ones(count, dtype=bool)
+        if stage1_predicted is not None:
+            active &= np.asarray(stage1_predicted[:count]).astype(bool)
+        vertices = vertices.copy()
+        active_indices = np.flatnonzero(active)
+        vertices[active_indices] = stage1_vertices[active_indices]
 
     num_stage1_frames = 0
     if hand_delta is not None:
@@ -233,18 +243,27 @@ def main() -> None:
     frame_map_payload = load_json(frame_map_path)
     hand_delta = None
     stage1_predicted = None
+    stage1_vertices = None
     object_delta_by_frame = None
     if stage1_path is not None:
         with np.load(stage1_path, allow_pickle=False) as data:
             frame_ids = [str(value).zfill(6) for value in data["frame_ids"]]
-            hand_delta = np.asarray(data["hand_delta"], dtype=np.float32)
-            object_delta = np.asarray(data["object_delta"], dtype=np.float32)
-            stage1_predicted = np.asarray(data["predicted"]).astype(bool)
-        object_delta_by_frame = {
-            frame: object_delta[index]
-            for index, frame in enumerate(frame_ids)
-            if stage1_predicted[index]
-        }
+            if "verts_cam" in data.files:
+                stage1_vertices = np.asarray(data["verts_cam"], dtype=np.float32)
+                stage1_predicted = np.asarray(
+                    data["camera_mesh_correction_valid"]
+                    if "camera_mesh_correction_valid" in data.files
+                    else np.ones(len(stage1_vertices), dtype=bool)
+                ).astype(bool)
+            else:
+                hand_delta = np.asarray(data["hand_delta"], dtype=np.float32)
+                object_delta = np.asarray(data["object_delta"], dtype=np.float32)
+                stage1_predicted = np.asarray(data["predicted"]).astype(bool)
+                object_delta_by_frame = {
+                    frame: object_delta[index]
+                    for index, frame in enumerate(frame_ids)
+                    if stage1_predicted[index]
+                }
     layout_summary = adapt_layout(
         pose_payload,
         frame_map_payload,
@@ -260,6 +279,7 @@ def main() -> None:
         args.mirror_x,
         hand_delta,
         stage1_predicted,
+        stage1_vertices,
     )
 
     summary = {
