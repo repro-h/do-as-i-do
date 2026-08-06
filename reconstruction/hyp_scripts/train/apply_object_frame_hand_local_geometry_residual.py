@@ -5,9 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections import defaultdict
+from argparse import Namespace
 from pathlib import Path
-from types import Namespace
 
 import numpy as np
 import torch
