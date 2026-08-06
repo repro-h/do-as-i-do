@@ -12,6 +12,7 @@ SHARD_INDEX=${SHARD_INDEX:-0}
 LIMIT=${LIMIT:-0}
 STREAM_ID=${STREAM_ID:-}
 OVERWRITE=${OVERWRITE:-0}
+DISABLE_POSE_GATE=${DISABLE_POSE_GATE:-0}
 
 HYBRID_ROOT=${HYBRID_ROOT:-$DO_AS_I_DO/reconstruction/data/dexycb/hybrid_training_v1}
 GLOBAL_V2_ROOT=${GLOBAL_V2_ROOT:-$HYBRID_ROOT/stage1_global_hand_v2}
@@ -62,6 +63,9 @@ command=(
 )
 if [[ -n "$STREAM_ID" ]]; then
   command+=(--stream-id "$STREAM_ID")
+fi
+if [[ "$DISABLE_POSE_GATE" == "1" ]]; then
+  command+=(--disable-pose-gate)
 fi
 if [[ "$OVERWRITE" == "1" ]]; then
   command+=(--overwrite)

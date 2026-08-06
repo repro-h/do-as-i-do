@@ -36,6 +36,7 @@ for _name, _value in {
     "complex": complex,
     "object": object,
     "str": str,
+    "unicode": str,
 }.items():
     if _name not in np.__dict__:
         setattr(np, _name, _value)

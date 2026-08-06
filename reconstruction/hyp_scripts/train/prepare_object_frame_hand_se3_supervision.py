@@ -44,6 +44,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--stream-id", action="append", default=[])
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument(
+        "--disable-pose-gate",
+        action="store_true",
+        help="Export inference-only windows even when FoundationPose quality fails.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -650,6 +655,11 @@ def main() -> None:
         print(f"[{index}/{len(selected)}] {stream_id}", flush=True)
         try:
             if args.overwrite or not out_path.is_file():
+                stream_profile = merged_profile(
+                    profile_payload, str(record["object_name"])
+                )
+                if args.disable_pose_gate:
+                    stream_profile.setdefault("pose_gate", {})["enabled"] = False
                 metrics = prepare_stream(
                     record,
                     global_root,
@@ -658,9 +668,7 @@ def main() -> None:
                     args.scale_warning_threshold,
                     args.min_visible_hand_pixels,
                     args.hand_presence_mode,
-                    merged_profile(
-                        profile_payload, str(record["object_name"])
-                    ),
+                    stream_profile,
                 )
             else:
                 with np.load(out_path, allow_pickle=False) as archive:
