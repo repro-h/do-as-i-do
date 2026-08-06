@@ -37,9 +37,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def rotation_matrices(rotvec: np.ndarray) -> np.ndarray:
-    return Rotation.from_rotvec(rotvec.reshape(-1, 3)).as_matrix().reshape(
-        rotvec.shape[:-1] + (3, 3)
-    )
+    rotvec = np.asarray(rotvec)
+    num_rotations = rotvec.shape[-1] // 3
+    if rotvec.shape[-1] != num_rotations * 3:
+        raise ValueError(f"Rotation vector width must be divisible by 3: {rotvec.shape}")
+    matrices = Rotation.from_rotvec(rotvec.reshape(-1, 3)).as_matrix()
+    return matrices.reshape(rotvec.shape[:-1] + (num_rotations, 3, 3))
 
 
 def load_mano(mano_dir: Path, device: torch.device):
@@ -167,7 +170,7 @@ def main() -> None:
     output_vertices[valid] = rendered[valid]
 
     if args.validate_handflow:
-        raw_global = rotation_matrices(raw_pose[:, :3])
+        raw_global = rotation_matrices(raw_pose[:, :3])[:, 0]
         raw_translation = np.asarray(
             np.load(raw_path, allow_pickle=False)["handflow_raw_trans"],
             dtype=np.float32,
