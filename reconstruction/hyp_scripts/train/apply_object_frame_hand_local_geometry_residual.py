@@ -208,6 +208,8 @@ def main() -> None:
         output["target_rotation_object"] = data["target_r"].astype(np.float32)
         output["checkpoint"] = np.asarray(str(checkpoint_path))
         output["model_version"] = np.asarray(checkpoint["model_version"])
+        with np.load(supervision_paths[stream_id], allow_pickle=False) as archive:
+            output["frame_ids"] = np.asarray(archive["frame_ids"])
 
         if args.handflow_root:
             supervision = np.load(
