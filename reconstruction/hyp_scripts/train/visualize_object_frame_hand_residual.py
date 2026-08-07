@@ -160,11 +160,16 @@ def main() -> None:
 
     gt_vertices = None
     gt_faces = None
+    gt_valid = np.zeros(count, dtype=bool)
     if options.gt_hand_npz:
         gt = load_npz(Path(options.gt_hand_npz).expanduser().resolve())
         side = str(supervision.get("hand_side", np.asarray("right")).item())
         gt_vertices = np.asarray(gt[f"{side}_vertices"], dtype=np.float32)[:count]
         gt_faces = np.asarray(gt[f"{side}_faces"], dtype=np.int64)
+        gt_valid = np.asarray(
+            gt.get(f"{side}_valid", np.ones(len(gt_vertices), dtype=bool)),
+            dtype=bool,
+        )[:count]
 
     sam_vertices = sam_faces = None
     if options.object_mesh:
@@ -234,7 +239,8 @@ def main() -> None:
         if gt_vertices is not None:
             entries.append(("gt_hand", gt_vertices[index], gt_faces, 0.32))
         for name, vertices, mesh_faces, opacity in entries:
-            if controls[name].value and (name != "gt_hand" or valid[index]):
+            visible = gt_valid[index] if name == "gt_hand" else True
+            if controls[name].value and visible:
                 handles.append(server.scene.add_mesh_simple(
                     f"/{name}_hand", vertices, mesh_faces,
                     color=COLORS[name], opacity=opacity,
