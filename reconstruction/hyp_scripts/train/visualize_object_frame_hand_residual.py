@@ -163,7 +163,10 @@ def main() -> None:
     gt_valid = np.zeros(count, dtype=bool)
     if options.gt_hand_npz:
         gt = load_npz(Path(options.gt_hand_npz).expanduser().resolve())
-        side = str(supervision.get("hand_side", np.asarray("right")).item())
+        side_value = raw.get("hand_side", np.asarray("right"))
+        side = str(np.asarray(side_value).item()).lower()
+        if side not in ("left", "right"):
+            raise ValueError(f"Unsupported hand side: {side!r}")
         gt_vertices = np.asarray(gt[f"{side}_vertices"], dtype=np.float32)[:count]
         gt_faces = np.asarray(gt[f"{side}_faces"], dtype=np.int64)
         gt_valid = np.asarray(
