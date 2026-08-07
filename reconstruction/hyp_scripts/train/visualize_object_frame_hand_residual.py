@@ -60,11 +60,18 @@ def load_pose_rows(path: Path) -> dict[str, np.ndarray]:
     import json
 
     payload = json.loads(path.read_text(encoding="utf-8"))
-    rows = payload.get("by_frame") or payload.get("frames") or {}
-    if isinstance(rows, list):
-        rows = {str(i): row for i, row in enumerate(rows)}
+    if payload.get("objects") is not None:
+        rows = payload["objects"]
+        iterator = enumerate(rows)
+    else:
+        rows = payload.get("by_frame") or payload.get("frames") or {}
+        iterator = (
+            enumerate(rows)
+            if isinstance(rows, list)
+            else rows.items()
+        )
     output = {}
-    for key, row in rows.items():
+    for key, row in iterator:
         if not isinstance(row, dict):
             continue
         matrix = row.get("object_in_camera")
@@ -77,7 +84,9 @@ def load_pose_rows(path: Path) -> dict[str, np.ndarray]:
                 matrix[:3, :3] = quaternion_wxyz_to_matrix(quat)
                 matrix[:3, 3] = np.asarray(trans, dtype=np.float32)
         if matrix is not None:
-            frame = str(row.get("frame", row.get("frame_id", key)))
+            frame = str(
+                row.get("frame", row.get("frame_id", row.get("frame_idx", key)))
+            )
             digits = "".join(c for c in frame if c.isdigit())
             output[(digits[-6:] if digits else str(key)).zfill(6)] = np.asarray(matrix, dtype=np.float32).reshape(4, 4)
     return output
@@ -192,6 +201,13 @@ def main() -> None:
         )
     if options.gt_object_pose_json:
         gt_ycb_poses = load_pose_rows(Path(options.gt_object_pose_json).expanduser().resolve())
+    print(
+        "reference assets:",
+        "SAM_mesh=", sam_vertices is not None,
+        "GT_YCB_mesh=", gt_ycb_vertices is not None,
+        "GT_YCB_poses=", len(gt_ycb_poses),
+        "GT_hand=", gt_vertices is not None,
+    )
 
     server = viser.ViserServer(port=options.port)
     server.scene.set_up_direction("-y")
