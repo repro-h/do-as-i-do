@@ -18,6 +18,7 @@ COLORS = {
     "target": (235, 70, 190),
     "gt_hand": (60, 205, 105),
     "sam": (245, 165, 45),
+    "sam_gt_pose": (255, 125, 30),
     "gt_ycb": (30, 215, 225),
 }
 
@@ -140,7 +141,12 @@ def main() -> None:
     raw_vertices = np.asarray(raw["verts_cam"], dtype=np.float32)
     faces = np.asarray(raw["faces"], dtype=np.int64)
     saved_vertices = np.asarray(prediction["verts_cam"], dtype=np.float32)
-    object_pose = np.asarray(supervision["object_pose"], dtype=np.float32)
+    pose_key = "filtered_object_pose" if "filtered_object_pose" in supervision else "object_pose"
+    object_pose = np.asarray(supervision[pose_key], dtype=np.float32)
+    gt_sam_pose = np.asarray(
+        supervision.get("gt_sam_object_pose", np.full_like(object_pose, np.nan)),
+        dtype=np.float32,
+    )
     initial_t = np.asarray(prediction["initial_translation_object"], dtype=np.float32)
     initial_r = np.asarray(prediction["initial_rotation_object"], dtype=np.float32)
     predicted_t = np.asarray(prediction["predicted_translation_object"], dtype=np.float32)
@@ -206,6 +212,7 @@ def main() -> None:
         "SAM_mesh=", sam_vertices is not None,
         "GT_YCB_mesh=", gt_ycb_vertices is not None,
         "GT_YCB_poses=", len(gt_ycb_poses),
+        "GT-SAM_poses=", int(np.isfinite(gt_sam_pose).all(axis=(1, 2)).sum()),
         "GT_hand=", gt_vertices is not None,
     )
 
@@ -219,6 +226,11 @@ def main() -> None:
         "target": server.gui.add_checkbox("Supervision target", initial_value=True),
         "gt_hand": server.gui.add_checkbox("GT hand", initial_value=gt_vertices is not None),
         "sam": server.gui.add_checkbox("SAM3D object", initial_value=sam_vertices is not None),
+        "sam_gt_pose": server.gui.add_checkbox(
+            "SAM3D at GT-SAM pose",
+            initial_value=sam_vertices is not None
+            and bool(np.isfinite(gt_sam_pose).any()),
+        ),
         "gt_ycb": server.gui.add_checkbox("GT YCB object", initial_value=gt_ycb_vertices is not None),
     }
     handles = []
@@ -235,6 +247,19 @@ def main() -> None:
             handles.append(server.scene.add_mesh_simple(
                 "/sam_object", sam_vertices @ object_pose[index, :3, :3].T + object_pose[index, :3, 3],
                 sam_faces, color=COLORS["sam"], opacity=0.45,
+            ))
+        if (
+            controls["sam_gt_pose"].value
+            and sam_vertices is not None
+            and np.isfinite(gt_sam_pose[index]).all()
+        ):
+            handles.append(server.scene.add_mesh_simple(
+                "/sam_gt_pose",
+                sam_vertices @ gt_sam_pose[index, :3, :3].T
+                + gt_sam_pose[index, :3, 3],
+                sam_faces,
+                color=COLORS["sam_gt_pose"],
+                opacity=0.34,
             ))
         target_vertices = apply_delta(
             raw_vertices[index],
@@ -301,7 +326,10 @@ def main() -> None:
     threading.Thread(target=playback, daemon=True).start()
     show(0)
     print(f"Viewer: http://localhost:{options.port}")
-    print("GT hand=green, prediction=blue, supervision target=magenta, SAM3D=amber, GT YCB=cyan")
+    print(
+        "GT hand=green, prediction=blue, target=magenta, "
+        "SAM(filtered)=amber, SAM(GT-SAM pose)=orange, GT YCB=cyan"
+    )
     print("Press Ctrl+C to stop")
     while True:
         time.sleep(1.0)
