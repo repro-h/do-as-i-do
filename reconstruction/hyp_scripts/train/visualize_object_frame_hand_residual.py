@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""Viser viewer for object-frame hand pose residual predictions."""
+
+from __future__ import annotations
+
+import argparse
+import threading
+import time
+from pathlib import Path
+
+import numpy as np
+import trimesh
+import viser
+
+
+COLORS = {
+    "raw": (245, 170, 55),
+    "saved": (245, 70, 70),
+    "delta": (70, 140, 245),
+    "gt": (60, 205, 105),
+    "object": (245, 165, 45),
+}
+
+
+def args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--prediction-npz", required=True)
+    parser.add_argument("--supervision-npz", required=True)
+    parser.add_argument("--object-mesh")
+    parser.add_argument("--object-scale", type=float, default=1.0)
+    parser.add_argument("--gt-hand-npz")
+    parser.add_argument("--port", type=int, default=8098)
+    parser.add_argument("--fps", type=float, default=10.0)
+    parser.add_argument("--max-object-faces", type=int, default=120000)
+    return parser.parse_args()
+
+
+def load_npz(path: Path) -> dict[str, np.ndarray]:
+    with np.load(path, allow_pickle=False) as data:
+        return {key: np.asarray(data[key]) for key in data.files}
+
+
+def mesh_data(path: Path, scale: float, max_faces: int):
+    loaded = trimesh.load(path, process=False)
+    mesh = loaded.to_geometry() if isinstance(loaded, trimesh.Scene) else loaded
+    vertices = np.asarray(mesh.vertices, dtype=np.float32) * scale
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    if max_faces > 0 and len(faces) > max_faces:
+        indices = np.linspace(0, len(faces) - 1, max_faces, dtype=np.int64)
+        faces = faces[indices]
+    return vertices, faces
+
+
+def rigid_delta_camera(
+    object_pose: np.ndarray,
+    initial_t: np.ndarray,
+    initial_r: np.ndarray,
+    predicted_t: np.ndarray,
+    predicted_r: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert object-frame T_pred*T_initial^-1 into a camera-frame delta."""
+    r_co = object_pose[:, :3, :3]
+    t_co = object_pose[:, :3, 3]
+    r_delta_o = predicted_r @ np.swapaxes(initial_r, -1, -2)
+    t_delta_o = predicted_t - np.einsum("nij,nj->ni", r_delta_o, initial_t)
+    r_delta_c = r_co @ r_delta_o @ np.swapaxes(r_co, -1, -2)
+    t_delta_c = (
+        t_co
+        - np.einsum("nij,nj->ni", r_delta_c, t_co)
+        + np.einsum("nij,nj->ni", r_co, t_delta_o)
+    )
+    return r_delta_c, t_delta_c
+
+
+def apply_delta(vertices: np.ndarray, rotation: np.ndarray, translation: np.ndarray):
+    return vertices @ rotation.T + translation[None]
+
+
+def main() -> None:
+    options = args()
+    prediction_path = Path(options.prediction_npz).expanduser().resolve()
+    supervision_path = Path(options.supervision_npz).expanduser().resolve()
+    prediction = load_npz(prediction_path)
+    supervision = load_npz(supervision_path)
+
+    raw_path = Path(str(prediction["handflow_camera_result"].item()))
+    raw = load_npz(raw_path)
+    raw_vertices = np.asarray(raw["verts_cam"], dtype=np.float32)
+    faces = np.asarray(raw["faces"], dtype=np.int64)
+    saved_vertices = np.asarray(prediction["verts_cam"], dtype=np.float32)
+    object_pose = np.asarray(supervision["object_pose"], dtype=np.float32)
+    initial_t = np.asarray(prediction["initial_translation_object"], dtype=np.float32)
+    initial_r = np.asarray(prediction["initial_rotation_object"], dtype=np.float32)
+    predicted_t = np.asarray(prediction["predicted_translation_object"], dtype=np.float32)
+    predicted_r = np.asarray(prediction["predicted_rotation_object"], dtype=np.float32)
+    valid = np.asarray(
+        prediction.get("camera_mesh_correction_valid", np.ones(len(raw_vertices))),
+        dtype=bool,
+    )
+    frame_ids = np.asarray(prediction.get("frame_ids", np.arange(len(raw_vertices))))
+    count = min(
+        len(raw_vertices), len(saved_vertices), len(object_pose), len(valid), len(frame_ids)
+    )
+    raw_vertices = raw_vertices[:count]
+    saved_vertices = saved_vertices[:count]
+    object_pose = object_pose[:count]
+    valid = valid[:count]
+    frame_ids = frame_ids[:count]
+
+    delta_r, delta_t = rigid_delta_camera(
+        object_pose[:count], initial_t[:count], initial_r[:count],
+        predicted_t[:count], predicted_r[:count],
+    )
+    delta_vertices = np.stack(
+        [apply_delta(raw_vertices[i], delta_r[i], delta_t[i]) for i in range(count)]
+    ).astype(np.float32)
+
+    gt_vertices = None
+    gt_faces = None
+    if options.gt_hand_npz:
+        gt = load_npz(Path(options.gt_hand_npz).expanduser().resolve())
+        side = str(supervision.get("hand_side", np.asarray("right")).item())
+        gt_vertices = np.asarray(gt[f"{side}_vertices"], dtype=np.float32)[:count]
+        gt_faces = np.asarray(gt[f"{side}_faces"], dtype=np.int64)
+
+    object_vertices = object_faces = None
+    if options.object_mesh:
+        object_vertices, object_faces = mesh_data(
+            Path(options.object_mesh).expanduser().resolve(),
+            options.object_scale,
+            options.max_object_faces,
+        )
+
+    server = viser.ViserServer(port=options.port)
+    server.scene.set_up_direction("-y")
+    slider = server.gui.add_slider("Frame", min=0, max=count - 1, step=1, initial_value=0)
+    play = server.gui.add_button("Play")
+    fps = server.gui.add_slider("FPS", min=1, max=30, step=1, initial_value=int(options.fps))
+    controls = {
+        "raw": server.gui.add_checkbox("Raw HandFlow", initial_value=True),
+        "saved": server.gui.add_checkbox("Saved prediction", initial_value=True),
+        "delta": server.gui.add_checkbox("Recomputed camera delta", initial_value=True),
+        "gt": server.gui.add_checkbox("GT hand", initial_value=gt_vertices is not None),
+        "object": server.gui.add_checkbox("Object", initial_value=object_vertices is not None),
+    }
+    handles = []
+    playing = {"value": False}
+
+    def clear():
+        while handles:
+            handles.pop().remove()
+
+    def show(index: int):
+        index = max(0, min(count - 1, int(index)))
+        clear()
+        if controls["object"].value and object_vertices is not None:
+            handles.append(server.scene.add_mesh_simple(
+                "/object", object_vertices @ object_pose[index, :3, :3].T + object_pose[index, :3, 3],
+                object_faces, color=COLORS["object"], opacity=0.45,
+            ))
+        entries = [
+            ("raw", raw_vertices[index], faces, 0.28),
+            ("saved", saved_vertices[index], faces, 0.38),
+            ("delta", delta_vertices[index], faces, 0.38),
+        ]
+        if gt_vertices is not None:
+            entries.append(("gt", gt_vertices[index], gt_faces, 0.32))
+        for name, vertices, mesh_faces, opacity in entries:
+            if controls[name].value and (name != "gt" or valid[index]):
+                handles.append(server.scene.add_mesh_simple(
+                    f"/{name}_hand", vertices, mesh_faces,
+                    color=COLORS[name], opacity=opacity,
+                ))
+        saved_err = np.linalg.norm(saved_vertices[index].mean(0) - delta_vertices[index].mean(0)) * 1000
+        print(
+            f"frame={str(frame_ids[index])} valid={bool(valid[index])} "
+            f"saved_vs_delta_center={saved_err:.2f}mm",
+            flush=True,
+        )
+
+    @slider.on_update
+    def _(_):
+        show(slider.value)
+
+    @play.on_click
+    def _(_):
+        playing["value"] = not playing["value"]
+
+    for control in controls.values():
+        control.on_update(lambda _: show(slider.value))
+
+    def playback():
+        while True:
+            if playing["value"]:
+                slider.value = (int(slider.value) + 1) % count
+                time.sleep(1.0 / max(float(fps.value), 1.0))
+            else:
+                time.sleep(0.05)
+
+    threading.Thread(target=playback, daemon=True).start()
+    show(0)
+    print(f"Viewer: http://localhost:{options.port}")
+    print("Raw=orange, saved prediction=red, recomputed delta=blue, GT=green, object=amber")
+    print("Press Ctrl+C to stop")
+    while True:
+        time.sleep(1.0)
+
+
+if __name__ == "__main__":
+    main()
