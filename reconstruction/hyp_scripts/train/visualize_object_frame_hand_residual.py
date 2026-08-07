@@ -14,11 +14,11 @@ import viser
 
 
 COLORS = {
-    "raw": (245, 170, 55),
-    "saved": (245, 70, 70),
-    "delta": (70, 140, 245),
-    "gt": (60, 205, 105),
-    "object": (245, 165, 45),
+    "prediction": (70, 140, 245),
+    "target": (235, 70, 190),
+    "gt_hand": (60, 205, 105),
+    "sam": (245, 165, 45),
+    "gt_ycb": (30, 215, 225),
 }
 
 
@@ -26,8 +26,11 @@ def args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--prediction-npz", required=True)
     parser.add_argument("--supervision-npz", required=True)
-    parser.add_argument("--object-mesh")
+    parser.add_argument("--object-mesh", help="SAM3D mesh")
     parser.add_argument("--object-scale", type=float, default=1.0)
+    parser.add_argument("--gt-object-mesh")
+    parser.add_argument("--gt-object-scale", type=float, default=1.0)
+    parser.add_argument("--gt-object-pose-json")
     parser.add_argument("--gt-hand-npz")
     parser.add_argument("--port", type=int, default=8098)
     parser.add_argument("--fps", type=float, default=10.0)
@@ -38,6 +41,46 @@ def args() -> argparse.Namespace:
 def load_npz(path: Path) -> dict[str, np.ndarray]:
     with np.load(path, allow_pickle=False) as data:
         return {key: np.asarray(data[key]) for key in data.files}
+
+
+def quaternion_wxyz_to_matrix(value) -> np.ndarray:
+    w, x, y, z = np.asarray(value, dtype=np.float64).reshape(4)
+    norm = np.linalg.norm([w, x, y, z])
+    if norm <= 1e-12:
+        raise ValueError("zero-length quaternion")
+    w, x, y, z = np.asarray([w, x, y, z]) / norm
+    return np.asarray([
+        [1 - 2 * (y*y + z*z), 2 * (x*y - z*w), 2 * (x*z + y*w)],
+        [2 * (x*y + z*w), 1 - 2 * (x*x + z*z), 2 * (y*z - x*w)],
+        [2 * (x*z - y*w), 2 * (y*z + x*w), 1 - 2 * (x*x + y*y)],
+    ], dtype=np.float32)
+
+
+def load_pose_rows(path: Path) -> dict[str, np.ndarray]:
+    import json
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    rows = payload.get("by_frame") or payload.get("frames") or {}
+    if isinstance(rows, list):
+        rows = {str(i): row for i, row in enumerate(rows)}
+    output = {}
+    for key, row in rows.items():
+        if not isinstance(row, dict):
+            continue
+        matrix = row.get("object_in_camera")
+        if matrix is None:
+            local = row.get("local_to_scene") or {}
+            quat = local.get("quat_wxyz_camera_frame")
+            trans = local.get("translation_camera_frame")
+            if quat is not None and trans is not None:
+                matrix = np.eye(4, dtype=np.float32)
+                matrix[:3, :3] = quaternion_wxyz_to_matrix(quat)
+                matrix[:3, 3] = np.asarray(trans, dtype=np.float32)
+        if matrix is not None:
+            frame = str(row.get("frame", row.get("frame_id", key)))
+            digits = "".join(c for c in frame if c.isdigit())
+            output[(digits[-6:] if digits else str(key)).zfill(6)] = np.asarray(matrix, dtype=np.float32).reshape(4, 4)
+    return output
 
 
 def mesh_data(path: Path, scale: float, max_faces: int):
@@ -123,13 +166,24 @@ def main() -> None:
         gt_vertices = np.asarray(gt[f"{side}_vertices"], dtype=np.float32)[:count]
         gt_faces = np.asarray(gt[f"{side}_faces"], dtype=np.int64)
 
-    object_vertices = object_faces = None
+    sam_vertices = sam_faces = None
     if options.object_mesh:
-        object_vertices, object_faces = mesh_data(
+        sam_vertices, sam_faces = mesh_data(
             Path(options.object_mesh).expanduser().resolve(),
             options.object_scale,
             options.max_object_faces,
         )
+
+    gt_ycb_vertices = gt_ycb_faces = None
+    gt_ycb_poses = {}
+    if options.gt_object_mesh:
+        gt_ycb_vertices, gt_ycb_faces = mesh_data(
+            Path(options.gt_object_mesh).expanduser().resolve(),
+            options.gt_object_scale,
+            options.max_object_faces,
+        )
+    if options.gt_object_pose_json:
+        gt_ycb_poses = load_pose_rows(Path(options.gt_object_pose_json).expanduser().resolve())
 
     server = viser.ViserServer(port=options.port)
     server.scene.set_up_direction("-y")
@@ -137,11 +191,11 @@ def main() -> None:
     play = server.gui.add_button("Play")
     fps = server.gui.add_slider("FPS", min=1, max=30, step=1, initial_value=int(options.fps))
     controls = {
-        "raw": server.gui.add_checkbox("Raw HandFlow", initial_value=True),
-        "saved": server.gui.add_checkbox("Saved prediction", initial_value=True),
-        "delta": server.gui.add_checkbox("Recomputed camera delta", initial_value=True),
-        "gt": server.gui.add_checkbox("GT hand", initial_value=gt_vertices is not None),
-        "object": server.gui.add_checkbox("Object", initial_value=object_vertices is not None),
+        "prediction": server.gui.add_checkbox("Prediction hand", initial_value=True),
+        "target": server.gui.add_checkbox("Supervision target", initial_value=True),
+        "gt_hand": server.gui.add_checkbox("GT hand", initial_value=gt_vertices is not None),
+        "sam": server.gui.add_checkbox("SAM3D object", initial_value=sam_vertices is not None),
+        "gt_ycb": server.gui.add_checkbox("GT YCB object", initial_value=gt_ycb_vertices is not None),
     }
     handles = []
     playing = {"value": False}
@@ -153,24 +207,46 @@ def main() -> None:
     def show(index: int):
         index = max(0, min(count - 1, int(index)))
         clear()
-        if controls["object"].value and object_vertices is not None:
+        if controls["sam"].value and sam_vertices is not None:
             handles.append(server.scene.add_mesh_simple(
-                "/object", object_vertices @ object_pose[index, :3, :3].T + object_pose[index, :3, 3],
-                object_faces, color=COLORS["object"], opacity=0.45,
+                "/sam_object", sam_vertices @ object_pose[index, :3, :3].T + object_pose[index, :3, 3],
+                sam_faces, color=COLORS["sam"], opacity=0.45,
             ))
+        target_vertices = apply_delta(
+            raw_vertices[index],
+            rigid_delta_camera(
+                object_pose[index:index+1],
+                initial_t[index:index+1], initial_r[index:index+1],
+                np.asarray(prediction["target_translation_object"][index:index+1], dtype=np.float32),
+                np.asarray(prediction["target_rotation_object"][index:index+1], dtype=np.float32),
+            )[0][0],
+            rigid_delta_camera(
+                object_pose[index:index+1],
+                initial_t[index:index+1], initial_r[index:index+1],
+                np.asarray(prediction["target_translation_object"][index:index+1], dtype=np.float32),
+                np.asarray(prediction["target_rotation_object"][index:index+1], dtype=np.float32),
+            )[1][0],
+        )
         entries = [
-            ("raw", raw_vertices[index], faces, 0.28),
-            ("saved", saved_vertices[index], faces, 0.38),
-            ("delta", delta_vertices[index], faces, 0.38),
+            ("prediction", delta_vertices[index], faces, 0.38),
+            ("target", target_vertices, faces, 0.38),
         ]
         if gt_vertices is not None:
-            entries.append(("gt", gt_vertices[index], gt_faces, 0.32))
+            entries.append(("gt_hand", gt_vertices[index], gt_faces, 0.32))
         for name, vertices, mesh_faces, opacity in entries:
-            if controls[name].value and (name != "gt" or valid[index]):
+            if controls[name].value and (name != "gt_hand" or valid[index]):
                 handles.append(server.scene.add_mesh_simple(
                     f"/{name}_hand", vertices, mesh_faces,
                     color=COLORS[name], opacity=opacity,
                 ))
+        gt_pose = gt_ycb_poses.get(str(frame_ids[index]).zfill(6))
+        if controls["gt_ycb"].value and gt_ycb_vertices is not None and gt_pose is not None:
+            handles.append(server.scene.add_mesh_simple(
+                "/gt_ycb_object",
+                gt_ycb_vertices @ gt_pose[:3, :3].T + gt_pose[:3, 3],
+                gt_ycb_faces,
+                color=COLORS["gt_ycb"], opacity=0.32,
+            ))
         saved_err = np.linalg.norm(saved_vertices[index].mean(0) - delta_vertices[index].mean(0)) * 1000
         print(
             f"frame={str(frame_ids[index])} valid={bool(valid[index])} "
@@ -200,7 +276,7 @@ def main() -> None:
     threading.Thread(target=playback, daemon=True).start()
     show(0)
     print(f"Viewer: http://localhost:{options.port}")
-    print("Raw=orange, saved prediction=red, recomputed delta=blue, GT=green, object=amber")
+    print("GT hand=green, prediction=blue, supervision target=magenta, SAM3D=amber, GT YCB=cyan")
     print("Press Ctrl+C to stop")
     while True:
         time.sleep(1.0)
