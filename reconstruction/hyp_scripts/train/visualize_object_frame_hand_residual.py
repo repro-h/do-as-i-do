@@ -147,6 +147,14 @@ def main() -> None:
         supervision.get("gt_sam_object_pose", np.full_like(object_pose, np.nan)),
         dtype=np.float32,
     )
+    gt_ycb_pose_supervision = np.asarray(
+        supervision.get("gt_ycb_object_pose", np.full_like(object_pose, np.nan)),
+        dtype=np.float32,
+    )
+    canonical_sam_to_ycb = np.asarray(
+        supervision.get("canonical_sam_to_ycb", np.eye(4)),
+        dtype=np.float32,
+    )
     initial_t = np.asarray(prediction["initial_translation_object"], dtype=np.float32)
     initial_r = np.asarray(prediction["initial_rotation_object"], dtype=np.float32)
     predicted_t = np.asarray(prediction["predicted_translation_object"], dtype=np.float32)
@@ -196,6 +204,13 @@ def main() -> None:
             options.object_scale,
             options.max_object_faces,
         )
+
+    sam_vertices_ycb = None
+    if sam_vertices is not None:
+        sam_vertices_ycb = (
+            sam_vertices @ canonical_sam_to_ycb[:3, :3].T
+            + canonical_sam_to_ycb[:3, 3]
+        ).astype(np.float32)
 
     gt_ycb_vertices = gt_ycb_faces = None
     gt_ycb_poses = {}
@@ -250,13 +265,13 @@ def main() -> None:
             ))
         if (
             controls["sam_gt_pose"].value
-            and sam_vertices is not None
-            and np.isfinite(gt_sam_pose[index]).all()
+            and sam_vertices_ycb is not None
+            and np.isfinite(gt_ycb_pose_supervision[index]).all()
         ):
             handles.append(server.scene.add_mesh_simple(
                 "/sam_gt_pose",
-                sam_vertices @ gt_sam_pose[index, :3, :3].T
-                + gt_sam_pose[index, :3, 3],
+                sam_vertices_ycb @ gt_ycb_pose_supervision[index, :3, :3].T
+                + gt_ycb_pose_supervision[index, :3, 3],
                 sam_faces,
                 color=COLORS["sam_gt_pose"],
                 opacity=0.34,
@@ -289,7 +304,11 @@ def main() -> None:
                     f"/{name}_hand", vertices, mesh_faces,
                     color=COLORS[name], opacity=opacity,
                 ))
-        gt_pose = gt_ycb_poses.get(str(frame_ids[index]).zfill(6))
+        gt_pose = (
+            gt_ycb_pose_supervision[index]
+            if np.isfinite(gt_ycb_pose_supervision[index]).all()
+            else gt_ycb_poses.get(str(frame_ids[index]).zfill(6))
+        )
         if controls["gt_ycb"].value and gt_ycb_vertices is not None and gt_pose is not None:
             handles.append(server.scene.add_mesh_simple(
                 "/gt_ycb_object",
