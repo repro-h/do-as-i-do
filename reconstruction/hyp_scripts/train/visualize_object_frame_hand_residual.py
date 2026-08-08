@@ -21,6 +21,7 @@ COLORS = {
     "sam_gt_pose": (255, 125, 30),
     "gt_ycb": (30, 215, 225),
 }
+MIRROR_X = np.diag([-1.0, 1.0, 1.0]).astype(np.float32)
 
 
 def args() -> argparse.Namespace:
@@ -129,6 +130,23 @@ def apply_delta(vertices: np.ndarray, rotation: np.ndarray, translation: np.ndar
     return vertices @ rotation.T + translation[None]
 
 
+def mirror_poses(poses: np.ndarray) -> np.ndarray:
+    """Mirror both local and parent frames; this operation is its own inverse."""
+    output = np.asarray(poses, dtype=np.float32).copy()
+    output[..., :3, :3] = MIRROR_X @ output[..., :3, :3] @ MIRROR_X
+    output[..., :3, 3] = (MIRROR_X @ output[..., :3, 3, None])[..., 0]
+    return output
+
+
+def mirror_vectors(vectors: np.ndarray) -> np.ndarray:
+    return (MIRROR_X @ np.asarray(vectors, dtype=np.float32)[..., None])[..., 0]
+
+
+def mirror_rotations(rotations: np.ndarray) -> np.ndarray:
+    values = np.asarray(rotations, dtype=np.float32)
+    return MIRROR_X @ values @ MIRROR_X
+
+
 def main() -> None:
     options = args()
     prediction_path = Path(options.prediction_npz).expanduser().resolve()
@@ -141,14 +159,9 @@ def main() -> None:
 
     raw_path = Path(str(prediction["handflow_camera_result"].item()))
     raw = load_npz(raw_path)
-    raw_vertices = np.asarray(raw["verts_cam"], dtype=np.float32).copy()
+    raw_vertices = np.asarray(raw["verts_cam"], dtype=np.float32)
     faces = np.asarray(raw["faces"], dtype=np.int64)
-    saved_vertices = np.asarray(prediction["verts_cam"], dtype=np.float32).copy()
-    if normalized_left:
-        # Supervision poses live in the mirrored left-normalized camera frame.
-        raw_vertices[..., 0] *= -1.0
-        saved_vertices[..., 0] *= -1.0
-        faces = faces[:, [0, 2, 1]]
+    saved_vertices = np.asarray(prediction["verts_cam"], dtype=np.float32)
     pose_key = "filtered_object_pose" if "filtered_object_pose" in supervision else "object_pose"
     object_pose = np.asarray(supervision[pose_key], dtype=np.float32)
     gt_sam_pose = np.asarray(
@@ -163,10 +176,25 @@ def main() -> None:
         supervision.get("canonical_sam_to_ycb", np.eye(4)),
         dtype=np.float32,
     )
-    initial_t = np.asarray(prediction["initial_translation_object"], dtype=np.float32)
-    initial_r = np.asarray(prediction["initial_rotation_object"], dtype=np.float32)
+    initial_t = np.asarray(supervision["initial_translation_object"], dtype=np.float32)
+    initial_r = np.asarray(supervision["initial_rotation_object"], dtype=np.float32)
+    target_t = np.asarray(supervision["target_translation_object"], dtype=np.float32)
+    target_r = np.asarray(supervision["target_rotation_object"], dtype=np.float32)
     predicted_t = np.asarray(prediction["predicted_translation_object"], dtype=np.float32)
     predicted_r = np.asarray(prediction["predicted_rotation_object"], dtype=np.float32)
+    if normalized_left:
+        # Convert normalized-left supervision back to the physical camera and
+        # physical object frames. Mesh vertices remain in their original frames.
+        object_pose = mirror_poses(object_pose)
+        gt_sam_pose = mirror_poses(gt_sam_pose)
+        gt_ycb_pose_supervision = mirror_poses(gt_ycb_pose_supervision)
+        canonical_sam_to_ycb = mirror_poses(canonical_sam_to_ycb)
+        initial_t = mirror_vectors(initial_t)
+        target_t = mirror_vectors(target_t)
+        predicted_t = mirror_vectors(predicted_t)
+        initial_r = mirror_rotations(initial_r)
+        target_r = mirror_rotations(target_r)
+        predicted_r = mirror_rotations(predicted_r)
     valid = np.asarray(
         prediction.get("camera_mesh_correction_valid", np.ones(len(raw_vertices))),
         dtype=bool,
@@ -198,13 +226,8 @@ def main() -> None:
         side = str(np.asarray(side_value).item()).lower()
         if side not in ("left", "right"):
             raise ValueError(f"Unsupported hand side: {side!r}")
-        gt_vertices = np.asarray(
-            gt[f"{side}_vertices"], dtype=np.float32
-        )[:count].copy()
+        gt_vertices = np.asarray(gt[f"{side}_vertices"], dtype=np.float32)[:count]
         gt_faces = np.asarray(gt[f"{side}_faces"], dtype=np.int64)
-        if normalized_left:
-            gt_vertices[..., 0] *= -1.0
-            gt_faces = gt_faces[:, [0, 2, 1]]
         gt_valid = np.asarray(
             gt.get(f"{side}_valid", np.ones(len(gt_vertices), dtype=bool)),
             dtype=bool,
@@ -237,7 +260,8 @@ def main() -> None:
         gt_ycb_poses = load_pose_rows(Path(options.gt_object_pose_json).expanduser().resolve())
     print(
         "reference assets:",
-        "camera_frame=", "normalized_left" if normalized_left else "physical",
+        "camera_frame=", "physical",
+        "denormalized_left=", normalized_left,
         "SAM_mesh=", sam_vertices is not None,
         "GT_YCB_mesh=", gt_ycb_vertices is not None,
         "GT_YCB_poses=", len(gt_ycb_poses),
@@ -295,14 +319,12 @@ def main() -> None:
             rigid_delta_camera(
                 object_pose[index:index+1],
                 initial_t[index:index+1], initial_r[index:index+1],
-                np.asarray(prediction["target_translation_object"][index:index+1], dtype=np.float32),
-                np.asarray(prediction["target_rotation_object"][index:index+1], dtype=np.float32),
+                target_t[index:index+1], target_r[index:index+1],
             )[0][0],
             rigid_delta_camera(
                 object_pose[index:index+1],
                 initial_t[index:index+1], initial_r[index:index+1],
-                np.asarray(prediction["target_translation_object"][index:index+1], dtype=np.float32),
-                np.asarray(prediction["target_rotation_object"][index:index+1], dtype=np.float32),
+                target_t[index:index+1], target_r[index:index+1],
             )[1][0],
         )
         entries = [
