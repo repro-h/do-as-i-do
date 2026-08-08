@@ -397,6 +397,9 @@ def prepare_stream(
             target_rotation_object[index] = symmetry[:3, :3] @ raw_rotation
 
     pose_rotation_error_deg = np.full(count, np.nan, dtype=np.float64)
+    pose_rotation_error_symmetry_deg = np.full(
+        count, np.nan, dtype=np.float64
+    )
     pose_translation_error_mm = np.full(count, np.nan, dtype=np.float64)
     pose_quality_valid = np.ones(count, dtype=bool)
     gate_profile = object_profile.get("pose_gate", {})
@@ -412,6 +415,21 @@ def prepare_stream(
         pose_rotation_error_deg[index] = np.degrees(
             np.linalg.norm(Rotation.from_matrix(relative_rotation).as_rotvec())
         )
+        symmetry = np.asarray(
+            candidates[selected_symmetry[index]]["matrix"], dtype=np.float64
+        )
+        if normalized_left:
+            symmetry = mirror_pose(symmetry)
+        effective_rotation = (
+            filtered_pose[index, :3, :3]
+            @ symmetry[:3, :3]
+            @ gt_sam_object_pose[index, :3, :3].T
+        )
+        pose_rotation_error_symmetry_deg[index] = np.degrees(
+            np.linalg.norm(
+                Rotation.from_matrix(effective_rotation).as_rotvec()
+            )
+        )
         pose_translation_error_mm[index] = (
             np.linalg.norm(
                 filtered_pose[index, :3, 3]
@@ -421,7 +439,7 @@ def prepare_stream(
         )
         if gate_enabled:
             pose_quality_valid[index] = bool(
-                pose_rotation_error_deg[index]
+                pose_rotation_error_symmetry_deg[index]
                 <= float(gate_profile.get("max_rotation_error_deg", 20.0))
                 and pose_translation_error_mm[index]
                 <= float(gate_profile.get("max_translation_error_mm", 30.0))
@@ -524,6 +542,9 @@ def prepare_stream(
         gt_object_valid=gt_object_valid,
         pose_quality_valid=pose_quality_valid,
         pose_rotation_error_deg=pose_rotation_error_deg.astype(np.float32),
+        pose_rotation_error_symmetry_deg=(
+            pose_rotation_error_symmetry_deg.astype(np.float32)
+        ),
         pose_translation_error_mm=pose_translation_error_mm.astype(np.float32),
         visible_hand_pixels=visible_hand_pixels,
         hand_observed=hand_observed,
@@ -581,6 +602,9 @@ def prepare_stream(
         "pose_gate_enabled": gate_enabled,
         "pose_gate_valid_frames": int(pose_quality_valid.sum()),
         "pose_rotation_error_deg": distribution(pose_rotation_error_deg),
+        "pose_rotation_error_symmetry_deg": distribution(
+            pose_rotation_error_symmetry_deg
+        ),
         "pose_translation_error_mm": distribution(pose_translation_error_mm),
         "symmetry_axis": symmetry_axis,
         "symmetry_selection_mode": selection_mode,

@@ -20,38 +20,38 @@ default:
 objects:
   002_master_chef_can:
     symmetry: {axis: y, step_deg: 15.0, allow_axis_flip: true, selection_mode: temporal}
-    pose_gate: {enabled: false}
+    pose_gate: {enabled: true}
   003_cracker_box:
     symmetry: {axis: y, step_deg: 180.0, allow_axis_flip: true, selection_mode: sequence}
-    pose_gate: {enabled: false}
+    pose_gate: {enabled: true}
   004_sugar_box:
     symmetry: {axis: y, step_deg: 180.0, allow_axis_flip: true, selection_mode: sequence}
-    pose_gate: {enabled: false}
+    pose_gate: {enabled: true}
   005_tomato_soup_can:
     symmetry: {axis: y, step_deg: 15.0, allow_axis_flip: true, selection_mode: temporal}
-    pose_gate: {enabled: false}
+    pose_gate: {enabled: true}
   008_pudding_box:
     symmetry: {axis: y, step_deg: 180.0, allow_axis_flip: true, selection_mode: sequence}
-    pose_gate: {enabled: false}
+    pose_gate: {enabled: true}
   009_gelatin_box:
     symmetry: {axis: y, step_deg: 180.0, allow_axis_flip: true, selection_mode: sequence}
-    pose_gate: {enabled: false}
+    pose_gate: {enabled: true}
   019_pitcher_base:
     pose_gate: {enabled: true, max_rotation_error_deg: 30.0, max_translation_error_mm: 30.0}
     rotation_supervision_weight: 0.5
   024_bowl:
     symmetry: {axis: y, step_deg: 15.0, allow_axis_flip: false, selection_mode: temporal}
-    pose_gate: {enabled: false}
+    pose_gate: {enabled: true}
   036_wood_block:
     symmetry: {axis: y, step_deg: 180.0, allow_axis_flip: true, selection_mode: sequence}
-    pose_gate: {enabled: false}
+    pose_gate: {enabled: true}
   040_large_marker:
     symmetry: {axis: y, step_deg: 5.0, allow_axis_flip: false, selection_mode: temporal}
-    pose_gate: {enabled: false}
+    pose_gate: {enabled: true}
   052_extra_large_clamp:
     pose_gate: {enabled: true, max_rotation_error_deg: 45.0, max_translation_error_mm: 40.0}
     rotation_supervision_weight: 0.25
   061_foam_brick:
     symmetry: {axis: y, step_deg: 180.0, allow_axis_flip: true, selection_mode: sequence}
-    pose_gate: {enabled: false}
+    pose_gate: {enabled: true}
     rotation_supervision_weight: 0.5
