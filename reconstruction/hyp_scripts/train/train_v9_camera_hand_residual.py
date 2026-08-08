@@ -147,10 +147,10 @@ class CameraWindowDataset(Dataset):
             glob["gt_root_rotvec"], dtype=np.float64
         )[start:end]
         initial_r = Rotation.from_rotvec(
-            np.nan_to_num(initial_rotvec)
+            np.nan_to_num(initial_rotvec, nan=0.0, posinf=0.0, neginf=0.0)
         ).as_matrix().astype(np.float32)
         target_r = Rotation.from_rotvec(
-            np.nan_to_num(target_rotvec)
+            np.nan_to_num(target_rotvec, nan=0.0, posinf=0.0, neginf=0.0)
         ).as_matrix().astype(np.float32)
 
         initial_t = pred_joints[:, 0]
@@ -167,16 +167,30 @@ class CameraWindowDataset(Dataset):
 
         # Invalid supervision must be made finite before masking. Multiplying
         # NaN by a zero mask still produces NaN in PyTorch.
-        initial_t = np.nan_to_num(initial_t).astype(np.float32)
-        target_t = np.nan_to_num(target_t).astype(np.float32)
-        delta_t = np.nan_to_num(delta_t).astype(np.float32)
-        initial_r = np.nan_to_num(initial_r).astype(np.float32)
-        target_r = np.nan_to_num(target_r).astype(np.float32)
-        delta_r = np.nan_to_num(delta_r).astype(np.float32)
+        initial_t = np.nan_to_num(
+            initial_t, nan=0.0, posinf=0.0, neginf=0.0
+        ).astype(np.float32)
+        target_t = np.nan_to_num(
+            target_t, nan=0.0, posinf=0.0, neginf=0.0
+        ).astype(np.float32)
+        delta_t = np.nan_to_num(
+            delta_t, nan=0.0, posinf=0.0, neginf=0.0
+        ).astype(np.float32)
+        initial_r = np.nan_to_num(
+            initial_r, nan=0.0, posinf=0.0, neginf=0.0
+        ).astype(np.float32)
+        target_r = np.nan_to_num(
+            target_r, nan=0.0, posinf=0.0, neginf=0.0
+        ).astype(np.float32)
+        delta_r = np.nan_to_num(
+            delta_r, nan=0.0, posinf=0.0, neginf=0.0
+        ).astype(np.float32)
 
         relative_joints = pred_joints[:, KEY_JOINTS] - pred_joints[:, 0, None]
         local_hand = (relative_joints / 0.1).reshape(len(relative_joints), -1)
-        local_hand = np.nan_to_num(local_hand).astype(np.float32)
+        local_hand = np.nan_to_num(
+            local_hand, nan=0.0, posinf=0.0, neginf=0.0
+        ).astype(np.float32)
 
         pi3x_path = self.pi3x_root / stream_id / "pi3x_geometry_features_compact.npz"
         pi3x = load_npz(str(pi3x_path.resolve()))
@@ -200,8 +214,12 @@ class CameraWindowDataset(Dataset):
             metadata = np.concatenate((points, indices, coverage[..., None], confidence[..., None]), axis=-1)
             valid_tokens = np.asarray(pi3x[f"{prefix}_valid"][positions], dtype=bool)
             return (
-                np.nan_to_num(features).astype(np.float32),
-                np.nan_to_num(metadata).astype(np.float32),
+                np.nan_to_num(
+                    features, nan=0.0, posinf=0.0, neginf=0.0
+                ).astype(np.float32),
+                np.nan_to_num(
+                    metadata, nan=0.0, posinf=0.0, neginf=0.0
+                ).astype(np.float32),
                 valid_tokens,
             )
 
@@ -261,6 +279,12 @@ def run_epoch(model, loader, device, args, optimizer=None):
     iterator = tqdm(loader, desc="train" if training else "val")
     for batch in iterator:
         batch = {k: v.to(device) for k, v in batch.items()}
+        bad = [
+            key for key, value in batch.items()
+            if value.is_floating_point() and not torch.isfinite(value).all()
+        ]
+        if bad:
+            raise RuntimeError(f"non-finite batch inputs: {bad}")
         with torch.set_grad_enabled(training):
             delta_t, delta_r = model(batch)
             pred_t = batch["initial_t"] + delta_t
@@ -272,6 +296,15 @@ def run_epoch(model, loader, device, args, optimizer=None):
             acceleration = temporal_loss(pred_t, batch["target_t"], valid, 2, args.smooth_l1_beta_mm / 1000.0)
             residual = masked_mean(smooth_l1(delta_t, 0.02), valid[..., None])
             total = args.w_translation * translation + args.w_rotation * rotation + args.w_velocity * velocity + args.w_acceleration * acceleration + args.w_residual * residual
+            if not torch.isfinite(total):
+                raise RuntimeError(
+                    "non-finite loss: "
+                    f"translation={translation.item()} "
+                    f"rotation={rotation.item()} "
+                    f"velocity={velocity.item()} "
+                    f"acceleration={acceleration.item()} "
+                    f"residual={residual.item()}"
+                )
             if training:
                 optimizer.zero_grad(set_to_none=True); total.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
         for name, value in (("total", total), ("translation", translation), ("rotation", rotation), ("velocity", velocity), ("acceleration", acceleration), ("residual", residual)):
