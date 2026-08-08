@@ -140,11 +140,17 @@ class CameraWindowDataset(Dataset):
 
         pred_joints = np.asarray(glob["pred_joints_3d"], dtype=np.float32)[start:end]
         gt_joints = np.asarray(glob["gt_joints_3d"], dtype=np.float32)[start:end]
+        initial_rotvec = np.asarray(
+            glob["initial_root_rotvec"], dtype=np.float64
+        )[start:end]
+        target_rotvec = np.asarray(
+            glob["gt_root_rotvec"], dtype=np.float64
+        )[start:end]
         initial_r = Rotation.from_rotvec(
-            np.asarray(glob["initial_root_rotvec"], dtype=np.float64)[start:end]
+            np.nan_to_num(initial_rotvec)
         ).as_matrix().astype(np.float32)
         target_r = Rotation.from_rotvec(
-            np.asarray(glob["gt_root_rotvec"], dtype=np.float64)[start:end]
+            np.nan_to_num(target_rotvec)
         ).as_matrix().astype(np.float32)
 
         initial_t = pred_joints[:, 0]
@@ -158,6 +164,15 @@ class CameraWindowDataset(Dataset):
             & np.isfinite(delta_t).all(axis=-1)
             & np.isfinite(delta_r).all(axis=(1, 2))
         )
+
+        # Invalid supervision must be made finite before masking. Multiplying
+        # NaN by a zero mask still produces NaN in PyTorch.
+        initial_t = np.nan_to_num(initial_t).astype(np.float32)
+        target_t = np.nan_to_num(target_t).astype(np.float32)
+        delta_t = np.nan_to_num(delta_t).astype(np.float32)
+        initial_r = np.nan_to_num(initial_r).astype(np.float32)
+        target_r = np.nan_to_num(target_r).astype(np.float32)
+        delta_r = np.nan_to_num(delta_r).astype(np.float32)
 
         relative_joints = pred_joints[:, KEY_JOINTS] - pred_joints[:, 0, None]
         local_hand = (relative_joints / 0.1).reshape(len(relative_joints), -1)
@@ -173,7 +188,9 @@ class CameraWindowDataset(Dataset):
         grid = np.asarray(pi3x["geometry_feature_grid_hw"], dtype=np.float32)
 
         def tokens(prefix: str):
-            features = np.asarray(pi3x[f"{prefix}_features"][positions], dtype=np.float32)
+            features = np.asarray(
+                pi3x[f"{prefix}_features"][positions], dtype=np.float32
+            )
             points = np.asarray(pi3x[f"{prefix}_points"][positions], dtype=np.float32)
             coverage = np.asarray(pi3x[f"{prefix}_coverage"][positions], dtype=np.float32)
             confidence = np.asarray(pi3x[f"{prefix}_confidence"][positions], dtype=np.float32)
@@ -182,7 +199,11 @@ class CameraWindowDataset(Dataset):
             indices[..., 1] /= max(float(grid[1] - 1), 1.0)
             metadata = np.concatenate((points, indices, coverage[..., None], confidence[..., None]), axis=-1)
             valid_tokens = np.asarray(pi3x[f"{prefix}_valid"][positions], dtype=bool)
-            return features, np.nan_to_num(metadata).astype(np.float32), valid_tokens
+            return (
+                np.nan_to_num(features).astype(np.float32),
+                np.nan_to_num(metadata).astype(np.float32),
+                valid_tokens,
+            )
 
         hand_f, hand_m, hand_v = tokens("hand")
         object_f, object_m, object_v = tokens("object")
