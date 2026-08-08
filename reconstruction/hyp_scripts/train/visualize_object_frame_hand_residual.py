@@ -135,12 +135,20 @@ def main() -> None:
     supervision_path = Path(options.supervision_npz).expanduser().resolve()
     prediction = load_npz(prediction_path)
     supervision = load_npz(supervision_path)
+    normalized_left = bool(
+        np.asarray(supervision.get("normalized_left", False)).item()
+    )
 
     raw_path = Path(str(prediction["handflow_camera_result"].item()))
     raw = load_npz(raw_path)
-    raw_vertices = np.asarray(raw["verts_cam"], dtype=np.float32)
+    raw_vertices = np.asarray(raw["verts_cam"], dtype=np.float32).copy()
     faces = np.asarray(raw["faces"], dtype=np.int64)
-    saved_vertices = np.asarray(prediction["verts_cam"], dtype=np.float32)
+    saved_vertices = np.asarray(prediction["verts_cam"], dtype=np.float32).copy()
+    if normalized_left:
+        # Supervision poses live in the mirrored left-normalized camera frame.
+        raw_vertices[..., 0] *= -1.0
+        saved_vertices[..., 0] *= -1.0
+        faces = faces[:, [0, 2, 1]]
     pose_key = "filtered_object_pose" if "filtered_object_pose" in supervision else "object_pose"
     object_pose = np.asarray(supervision[pose_key], dtype=np.float32)
     gt_sam_pose = np.asarray(
@@ -190,8 +198,13 @@ def main() -> None:
         side = str(np.asarray(side_value).item()).lower()
         if side not in ("left", "right"):
             raise ValueError(f"Unsupported hand side: {side!r}")
-        gt_vertices = np.asarray(gt[f"{side}_vertices"], dtype=np.float32)[:count]
+        gt_vertices = np.asarray(
+            gt[f"{side}_vertices"], dtype=np.float32
+        )[:count].copy()
         gt_faces = np.asarray(gt[f"{side}_faces"], dtype=np.int64)
+        if normalized_left:
+            gt_vertices[..., 0] *= -1.0
+            gt_faces = gt_faces[:, [0, 2, 1]]
         gt_valid = np.asarray(
             gt.get(f"{side}_valid", np.ones(len(gt_vertices), dtype=bool)),
             dtype=bool,
@@ -224,6 +237,7 @@ def main() -> None:
         gt_ycb_poses = load_pose_rows(Path(options.gt_object_pose_json).expanduser().resolve())
     print(
         "reference assets:",
+        "camera_frame=", "normalized_left" if normalized_left else "physical",
         "SAM_mesh=", sam_vertices is not None,
         "GT_YCB_mesh=", gt_ycb_vertices is not None,
         "GT_YCB_poses=", len(gt_ycb_poses),
