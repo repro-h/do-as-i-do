@@ -236,6 +236,10 @@ def main() -> None:
         prediction.get("camera_mesh_correction_valid", np.ones(len(raw_vertices))),
         dtype=bool,
     )
+    supervision_valid = (
+        np.asarray(supervision["valid_translation"], dtype=bool)
+        & np.asarray(supervision["valid_rotation"], dtype=bool)
+    )
     frame_ids = np.asarray(prediction.get("frame_ids", np.arange(len(raw_vertices))))
     count = min(
         len(raw_vertices), len(saved_vertices), len(object_pose), len(valid), len(frame_ids)
@@ -244,6 +248,7 @@ def main() -> None:
     saved_vertices = saved_vertices[:count]
     object_pose = object_pose[:count]
     valid = valid[:count]
+    supervision_valid = supervision_valid[:count]
     frame_ids = frame_ids[:count]
 
     delta_r, delta_t = rigid_delta_camera(
@@ -431,6 +436,10 @@ def main() -> None:
                 visible = gt_valid[index]
             elif name == "oracle_target":
                 visible = oracle_target_valid[index]
+            elif name == "target":
+                visible = supervision_valid[index]
+            elif name == "prediction":
+                visible = valid[index]
             else:
                 visible = True
             if controls[name].value and visible:
@@ -452,7 +461,9 @@ def main() -> None:
             ))
         saved_err = np.linalg.norm(saved_vertices[index].mean(0) - delta_vertices[index].mean(0)) * 1000
         print(
-            f"frame={str(frame_ids[index])} valid={bool(valid[index])} "
+            f"frame={str(frame_ids[index])} "
+            f"prediction_valid={bool(valid[index])} "
+            f"target_valid={bool(supervision_valid[index])} "
             f"saved_vs_delta_center={saved_err:.2f}mm",
             flush=True,
         )
