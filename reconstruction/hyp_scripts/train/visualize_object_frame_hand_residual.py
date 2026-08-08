@@ -11,11 +11,13 @@ from pathlib import Path
 import numpy as np
 import trimesh
 import viser
+from scipy.spatial.transform import Rotation
 
 
 COLORS = {
     "prediction": (70, 140, 245),
     "target": (235, 70, 190),
+    "oracle_target": (235, 65, 65),
     "gt_hand": (60, 205, 105),
     "sam": (245, 165, 45),
     "sam_gt_pose": (255, 125, 30),
@@ -147,6 +149,15 @@ def mirror_rotations(rotations: np.ndarray) -> np.ndarray:
     return MIRROR_X @ values @ MIRROR_X
 
 
+def rotvecs_to_matrices(rotvecs: np.ndarray) -> np.ndarray:
+    values = np.asarray(rotvecs, dtype=np.float32)
+    output = np.full((*values.shape[:-1], 3, 3), np.nan, dtype=np.float32)
+    valid = np.isfinite(values).all(axis=-1)
+    if valid.any():
+        output[valid] = Rotation.from_rotvec(values[valid]).as_matrix()
+    return output
+
+
 def main() -> None:
     options = args()
     prediction_path = Path(options.prediction_npz).expanduser().resolve()
@@ -156,6 +167,12 @@ def main() -> None:
     normalized_left = bool(
         np.asarray(supervision.get("normalized_left", False)).item()
     )
+    global_supervision = None
+    source_global = supervision.get("source_global_supervision")
+    if source_global is not None:
+        source_global_path = Path(str(np.asarray(source_global).item()))
+        if source_global_path.is_file():
+            global_supervision = load_npz(source_global_path)
 
     raw_path = Path(str(prediction["handflow_camera_result"].item()))
     raw = load_npz(raw_path)
@@ -182,6 +199,21 @@ def main() -> None:
     target_r = np.asarray(supervision["target_rotation_object"], dtype=np.float32)
     predicted_t = np.asarray(prediction["predicted_translation_object"], dtype=np.float32)
     predicted_r = np.asarray(prediction["predicted_rotation_object"], dtype=np.float32)
+    target_wrist_camera = np.asarray(
+        supervision["target_wrist_camera_oracle"], dtype=np.float32
+    )
+    target_root_camera = np.asarray(
+        supervision["target_root_rotation_camera_oracle"], dtype=np.float32
+    )
+    gt_wrist_camera = None
+    gt_root_camera = None
+    if global_supervision is not None:
+        gt_wrist_camera = np.asarray(
+            global_supervision["gt_joints_3d"], dtype=np.float32
+        )[:, 0]
+        gt_root_camera = rotvecs_to_matrices(
+            global_supervision["gt_root_rotvec"]
+        )
     if normalized_left:
         # Convert normalized-left supervision back to the physical camera and
         # physical object frames. Mesh vertices remain in their original frames.
@@ -195,6 +227,11 @@ def main() -> None:
         initial_r = mirror_rotations(initial_r)
         target_r = mirror_rotations(target_r)
         predicted_r = mirror_rotations(predicted_r)
+        target_wrist_camera = mirror_vectors(target_wrist_camera)
+        target_root_camera = mirror_rotations(target_root_camera)
+        if gt_wrist_camera is not None:
+            gt_wrist_camera = mirror_vectors(gt_wrist_camera)
+            gt_root_camera = mirror_rotations(gt_root_camera)
     valid = np.asarray(
         prediction.get("camera_mesh_correction_valid", np.ones(len(raw_vertices))),
         dtype=bool,
@@ -220,6 +257,8 @@ def main() -> None:
     gt_vertices = None
     gt_faces = None
     gt_valid = np.zeros(count, dtype=bool)
+    oracle_target_vertices = None
+    oracle_target_valid = np.zeros(count, dtype=bool)
     if options.gt_hand_npz:
         gt = load_npz(Path(options.gt_hand_npz).expanduser().resolve())
         side_value = raw.get("hand_side", np.asarray("right"))
@@ -232,6 +271,27 @@ def main() -> None:
             gt.get(f"{side}_valid", np.ones(len(gt_vertices), dtype=bool)),
             dtype=bool,
         )[:count]
+        if gt_wrist_camera is not None and gt_root_camera is not None:
+            oracle_target_vertices = np.full_like(gt_vertices, np.nan)
+            oracle_target_valid = (
+                gt_valid
+                & np.isfinite(gt_wrist_camera[:count]).all(axis=1)
+                & np.isfinite(gt_root_camera[:count]).all(axis=(1, 2))
+                & np.isfinite(target_wrist_camera[:count]).all(axis=1)
+                & np.isfinite(target_root_camera[:count]).all(axis=(1, 2))
+            )
+            for index in np.flatnonzero(oracle_target_valid):
+                rotation = (
+                    target_root_camera[index]
+                    @ gt_root_camera[index].T
+                )
+                translation = (
+                    target_wrist_camera[index]
+                    - rotation @ gt_wrist_camera[index]
+                )
+                oracle_target_vertices[index] = apply_delta(
+                    gt_vertices[index], rotation, translation
+                )
 
     sam_vertices = sam_faces = None
     if options.object_mesh:
@@ -267,6 +327,7 @@ def main() -> None:
         "GT_YCB_poses=", len(gt_ycb_poses),
         "GT-SAM_poses=", int(np.isfinite(gt_sam_pose).all(axis=(1, 2)).sum()),
         "GT_hand=", gt_vertices is not None,
+        "GT_transferred_target=", int(oracle_target_valid.sum()),
     )
 
     server = viser.ViserServer(port=options.port)
@@ -277,6 +338,10 @@ def main() -> None:
     controls = {
         "prediction": server.gui.add_checkbox("Prediction hand", initial_value=True),
         "target": server.gui.add_checkbox("Supervision target", initial_value=True),
+        "oracle_target": server.gui.add_checkbox(
+            "GT-transferred target",
+            initial_value=oracle_target_vertices is not None,
+        ),
         "gt_hand": server.gui.add_checkbox("GT hand", initial_value=gt_vertices is not None),
         "sam": server.gui.add_checkbox("SAM3D object", initial_value=sam_vertices is not None),
         "sam_gt_pose": server.gui.add_checkbox(
@@ -333,8 +398,20 @@ def main() -> None:
         ]
         if gt_vertices is not None:
             entries.append(("gt_hand", gt_vertices[index], gt_faces, 0.32))
+        if oracle_target_vertices is not None:
+            entries.append((
+                "oracle_target",
+                oracle_target_vertices[index],
+                gt_faces,
+                0.36,
+            ))
         for name, vertices, mesh_faces, opacity in entries:
-            visible = gt_valid[index] if name == "gt_hand" else True
+            if name == "gt_hand":
+                visible = gt_valid[index]
+            elif name == "oracle_target":
+                visible = oracle_target_valid[index]
+            else:
+                visible = True
             if controls[name].value and visible:
                 handles.append(server.scene.add_mesh_simple(
                     f"/{name}_hand", vertices, mesh_faces,
@@ -383,6 +460,7 @@ def main() -> None:
     print(f"Viewer: http://localhost:{options.port}")
     print(
         "GT hand=green, prediction=blue, target=magenta, "
+        "GT-transferred target=red, "
         "SAM(filtered)=amber, SAM(GT-SAM pose)=orange, GT YCB=cyan"
     )
     print("Press Ctrl+C to stop")
