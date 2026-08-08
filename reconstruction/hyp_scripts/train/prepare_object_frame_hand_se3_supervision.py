@@ -260,8 +260,11 @@ def prepare_stream(
         matrices = Rotation.from_rotvec(
             initial_root_rotvec[initial_root_valid]
         ).as_matrix()
-        if normalized_left:
-            matrices = mirror_rotations(matrices)
+        # HandFlow estimates left hands from a mirrored right-hand input. Its
+        # saved MANO root rotation is therefore already in the normalized-left
+        # frame used by the mirrored vertices and joints in global supervision.
+        # Mirroring it again here makes the root inconsistent with the hand
+        # geometry by roughly 90--180 degrees.
         initial_root_rotation[initial_root_valid] = matrices
     if gt_root_valid.any():
         target_root_rotation[gt_root_valid] = Rotation.from_rotvec(
