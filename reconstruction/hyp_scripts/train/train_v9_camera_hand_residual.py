@@ -88,7 +88,9 @@ def rotation_6d_to_matrix(value: torch.Tensor) -> torch.Tensor:
 def rotation_angle(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     relative = a.transpose(-1, -2) @ b
     trace = relative.diagonal(dim1=-2, dim2=-1).sum(-1)
-    cosine = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
+    # Avoid acos'(1)=inf when the zero-initialized residual is already
+    # close to the target rotation.
+    cosine = ((trace - 1.0) * 0.5).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
     return torch.acos(cosine)
 
 
