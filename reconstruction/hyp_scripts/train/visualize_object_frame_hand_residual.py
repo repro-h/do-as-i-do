@@ -350,6 +350,7 @@ def main() -> None:
             and bool(np.isfinite(gt_sam_pose).any()),
         ),
         "gt_ycb": server.gui.add_checkbox("GT YCB object", initial_value=gt_ycb_vertices is not None),
+        "wrist_markers": server.gui.add_checkbox("Wrist markers", initial_value=True),
     }
     handles = []
     playing = {"value": False}
@@ -361,6 +362,26 @@ def main() -> None:
     def show(index: int):
         index = max(0, min(count - 1, int(index)))
         clear()
+        if controls["wrist_markers"].value:
+            initial_wrist = (
+                object_pose[index, :3, :3] @ initial_t[index]
+                + object_pose[index, :3, 3]
+            )
+            predicted_wrist = (
+                object_pose[index, :3, :3] @ predicted_t[index]
+                + object_pose[index, :3, 3]
+            )
+            marker_points = [initial_wrist, target_wrist_camera[index], predicted_wrist]
+            marker_colors = [(245, 245, 245), COLORS["target"], COLORS["prediction"]]
+            if gt_wrist_camera is not None and np.isfinite(gt_wrist_camera[index]).all():
+                marker_points.append(gt_wrist_camera[index])
+                marker_colors.append(COLORS["gt_hand"])
+            handles.append(server.scene.add_point_cloud(
+                "/wrist_markers",
+                points=np.asarray(marker_points, dtype=np.float32),
+                colors=np.asarray(marker_colors, dtype=np.uint8),
+                point_size=0.012,
+            ))
         if controls["sam"].value and sam_vertices is not None:
             handles.append(server.scene.add_mesh_simple(
                 "/sam_object", sam_vertices @ object_pose[index, :3, :3].T + object_pose[index, :3, 3],
@@ -463,6 +484,7 @@ def main() -> None:
         "GT-transferred target=red, "
         "SAM(filtered)=amber, SAM(GT-SAM pose)=orange, GT YCB=cyan"
     )
+    print("Wrist markers: initial=white, GT=green, target=magenta, prediction=blue")
     print("Press Ctrl+C to stop")
     while True:
         time.sleep(1.0)
