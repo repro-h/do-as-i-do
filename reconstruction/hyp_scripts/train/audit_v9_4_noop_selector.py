@@ -69,10 +69,15 @@ def correction_metrics(
     target_ray = np.sum((target - initial) * ray, axis=-1)
     ray_error = np.abs(correction - target_ray) * 1000.0
     increase = corrected_error - initial_error
+    # Reconstructing an unchanged point can introduce sub-micrometer floating
+    # noise. Do not count that as a behavioral degradation.
+    degradation_tolerance_mm = 1e-3
     return {
         "ray_error_mm": distribution(ray_error),
         "translation_error_mm": distribution(corrected_error),
-        "degraded_fraction": float(np.mean(increase > 0)),
+        "degraded_fraction": float(
+            np.mean(increase > degradation_tolerance_mm)
+        ),
         "worse_2mm_fraction": float(np.mean(increase > 2.0)),
         "worse_5mm_fraction": float(np.mean(increase > 5.0)),
         "worse_10mm_fraction": float(np.mean(increase > 10.0)),
