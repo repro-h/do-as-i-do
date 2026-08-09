@@ -299,6 +299,36 @@ def predict(model: dict, x: np.ndarray) -> np.ndarray:
     return design @ model["weight"]
 
 
+def model_parameters(model: dict) -> dict:
+    return {
+        "weights": {
+            name: float(weight)
+            for name, weight in zip(FEATURE_NAMES, model["weight"][1:])
+        },
+        "bias": float(model["weight"][0]),
+    }
+
+
+def calibration_report(
+    train_y: np.ndarray,
+    train_prediction: np.ndarray,
+    val_y: np.ndarray,
+    val_prediction: np.ndarray,
+    val_side: np.ndarray,
+) -> dict:
+    return {
+        "train": metrics(train_y, train_prediction),
+        "val": metrics(val_y, val_prediction),
+        "val_by_side": {
+            name: metrics(
+                val_y[val_side == value],
+                val_prediction[val_side == value],
+            )
+            for name, value in (("left", 0), ("right", 1))
+        },
+    }
+
+
 def main() -> None:
     args = parse_args()
     train_x, train_y, train_side = collect(
@@ -324,27 +354,53 @@ def main() -> None:
             "train_spearman": train_corr[1],
             "val_pearson": val_corr[0],
             "val_spearman": val_corr[1],
+            "val_by_side": {
+                side_name: {
+                    "pearson": correlation(
+                        val_x[val_side == side_value, index],
+                        val_y[val_side == side_value],
+                    )[0],
+                    "spearman": correlation(
+                        val_x[val_side == side_value, index],
+                        val_y[val_side == side_value],
+                    )[1],
+                }
+                for side_name, side_value in (("left", 0), ("right", 1))
+            },
         }
+
+    per_side_prediction_train = np.zeros_like(train_y)
+    per_side_prediction_val = np.zeros_like(val_y)
+    per_side_parameters = {}
+    for side_name, side_value in (("left", 0), ("right", 1)):
+        train_mask = train_side == side_value
+        val_mask = val_side == side_value
+        side_model = fit_ridge(
+            train_x[train_mask], train_y[train_mask], args.ridge
+        )
+        per_side_prediction_train[train_mask] = predict(
+            side_model, train_x[train_mask]
+        )
+        per_side_prediction_val[val_mask] = predict(
+            side_model, val_x[val_mask]
+        )
+        per_side_parameters[side_name] = model_parameters(side_model)
+
+    shared_report = calibration_report(
+        train_y, train_prediction, val_y, val_prediction, val_side
+    )
+    shared_report.update(model_parameters(model))
+    per_side_report = calibration_report(
+        train_y, per_side_prediction_train,
+        val_y, per_side_prediction_val, val_side,
+    )
+    per_side_report["parameters"] = per_side_parameters
     output = {
         "train_unique_frames": int(len(train_y)),
         "val_unique_frames": int(len(val_y)),
         "features": feature_audit,
-        "ridge": {
-            "train": metrics(train_y, train_prediction),
-            "val": metrics(val_y, val_prediction),
-            "val_by_side": {
-                name: metrics(
-                    val_y[val_side == value],
-                    val_prediction[val_side == value],
-                )
-                for name, value in (("left", 0), ("right", 1))
-            },
-            "weights": {
-                name: float(weight)
-                for name, weight in zip(FEATURE_NAMES, model["weight"][1:])
-            },
-            "bias": float(model["weight"][0]),
-        },
+        "ridge": shared_report,
+        "ridge_per_side": per_side_report,
     }
     out_path = Path(args.out_json).expanduser().resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
