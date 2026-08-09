@@ -35,7 +35,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--pi3x-ablation",
-        choices=("none", "feature_zero", "all_zero", "time_reverse"),
+        choices=(
+            "none",
+            "feature_zero",
+            "hand_feature_zero",
+            "key_feature_zero",
+            "object_feature_zero",
+            "context_feature_zero",
+            "all_zero",
+            "time_reverse",
+        ),
         default="none",
     )
     parser.add_argument("--overwrite", action="store_true")
@@ -221,6 +230,29 @@ def main() -> None:
             if args.pi3x_ablation == "feature_zero":
                 for key in feature_keys:
                     device_batch[key] = torch.zeros_like(device_batch[key])
+            elif args.pi3x_ablation == "hand_feature_zero":
+                device_batch["hand_token_features"] = torch.zeros_like(
+                    device_batch["hand_token_features"]
+                )
+            elif args.pi3x_ablation == "key_feature_zero":
+                device_batch["key_token_features"] = torch.zeros_like(
+                    device_batch["key_token_features"]
+                )
+            elif args.pi3x_ablation in {
+                "object_feature_zero",
+                "context_feature_zero",
+            }:
+                token_type = (
+                    0
+                    if args.pi3x_ablation == "object_feature_zero"
+                    else 1
+                )
+                mask = device_batch["key_token_types"] == token_type
+                device_batch["key_token_features"] = torch.where(
+                    mask[..., None],
+                    torch.zeros_like(device_batch["key_token_features"]),
+                    device_batch["key_token_features"],
+                )
             elif args.pi3x_ablation == "all_zero":
                 for key in feature_keys + metadata_keys:
                     device_batch[key] = torch.zeros_like(device_batch[key])
