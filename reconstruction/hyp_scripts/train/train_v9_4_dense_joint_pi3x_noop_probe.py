@@ -163,6 +163,10 @@ class DenseJointDataset(FeatureTrajectoryDataset):
         self.dense_root = dense_root
         self.min_confidence = min_confidence
         self.min_object_coverage = min_object_coverage
+        stream_ids = sorted({str(row["stream_id"]) for row in self.rows})
+        self.stream_indices = {
+            stream_id: index for index, stream_id in enumerate(stream_ids)
+        }
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         sample = super().__getitem__(index)
@@ -318,6 +322,10 @@ class DenseJointDataset(FeatureTrajectoryDataset):
             "joint_token_valid": torch.from_numpy(joint_valid),
             "hand_observed": torch.from_numpy(observed),
             "hand_presence": torch.from_numpy(presence),
+            "stream_index": torch.full(
+                (end - start,), self.stream_indices[stream_id]
+            ),
+            "frame_index": torch.arange(start, end),
         })
         return sample
 
