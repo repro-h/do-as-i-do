@@ -33,6 +33,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--pi3x-ablation",
+        choices=("none", "feature_zero", "all_zero", "time_reverse"),
+        default="none",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -200,6 +205,28 @@ def main() -> None:
             device_batch = {
                 key: value.to(args.device) for key, value in batch.items()
             }
+            feature_keys = (
+                "hand_token_features",
+                "key_token_features",
+            )
+            metadata_keys = (
+                "hand_token_metadata",
+                "key_token_metadata",
+            )
+            temporal_keys = feature_keys + metadata_keys + (
+                "hand_token_valid",
+                "key_token_valid",
+                "key_token_types",
+            )
+            if args.pi3x_ablation == "feature_zero":
+                for key in feature_keys:
+                    device_batch[key] = torch.zeros_like(device_batch[key])
+            elif args.pi3x_ablation == "all_zero":
+                for key in feature_keys + metadata_keys:
+                    device_batch[key] = torch.zeros_like(device_batch[key])
+            elif args.pi3x_ablation == "time_reverse":
+                for key in temporal_keys:
+                    device_batch[key] = torch.flip(device_batch[key], dims=(1,))
             prediction = model(device_batch).cpu().numpy()
             for batch_index, window_index in enumerate(indices):
                 row = base_dataset.rows[int(window_index)]
@@ -315,6 +342,7 @@ def main() -> None:
         "checkpoint": str(checkpoint_path),
         "checkpoint_epoch": int(checkpoint["epoch"]),
         "model_version": checkpoint["model_version"],
+        "pi3x_ablation": args.pi3x_ablation,
         "windows": str(windows_path),
         "num_windows": len(base_dataset),
         "num_streams": len(stream_rows),
