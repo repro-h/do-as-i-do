@@ -212,13 +212,24 @@ class JointConditionedDataset(FeatureTrajectoryDataset):
         delta_uv = projected_uv - selected_uv
         type_one_hot = np.eye(3, dtype=np.float32)[selected_types]
 
-        observed = np.asarray(
-            se3.get("hand_observed", np.ones(len(se3["frame_indices"]), bool)),
-            dtype=bool,
-        )[start:end]
-        presence = np.asarray(
-            se3.get("hand_presence", observed), dtype=bool
-        )[start:end]
+        if "valid_translation" in se3:
+            sequence_length = len(se3["valid_translation"])
+        elif "valid_rotation" in se3:
+            sequence_length = len(se3["valid_rotation"])
+        else:
+            sequence_length = len(glob["frame_ids"])
+        observed_source = (
+            se3["hand_observed"]
+            if "hand_observed" in se3
+            else np.ones(sequence_length, dtype=bool)
+        )
+        observed = np.asarray(observed_source, dtype=bool)[start:end]
+        presence_source = (
+            se3["hand_presence"]
+            if "hand_presence" in se3
+            else observed_source
+        )
+        presence = np.asarray(presence_source, dtype=bool)[start:end]
         hand_token_present = np.asarray(
             cache["hand_valid"][positions], dtype=bool
         ).any(axis=-1)
