@@ -25,6 +25,10 @@ MODES = (
     "dense_all_zero",
     "dense_time_mean",
     "dense_time_reverse",
+    "compact_feature_zero",
+    "compact_all_zero",
+    "compact_time_reverse",
+    "all_pi3x_zero",
 )
 
 
@@ -39,6 +43,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--modes",
+        default=",".join(MODES),
+        help="Comma-separated ablation modes.",
+    )
     return parser.parse_args()
 
 
@@ -76,6 +85,31 @@ class AblationDataset(Dataset):
             sample["joint_token_valid"] = sample[
                 "joint_token_valid"
             ].flip(0)
+        if self.mode in (
+            "compact_feature_zero", "compact_all_zero", "all_pi3x_zero"
+        ):
+            for key in (
+                "hand_token_features", "object_token_features"
+            ):
+                sample[key] = torch.zeros_like(sample[key])
+        if self.mode in ("compact_all_zero", "all_pi3x_zero"):
+            for key in (
+                "hand_token_metadata", "object_token_metadata"
+            ):
+                sample[key] = torch.zeros_like(sample[key])
+        if self.mode == "compact_time_reverse":
+            for key in (
+                "hand_token_features",
+                "hand_token_metadata",
+                "hand_token_valid",
+                "object_token_features",
+                "object_token_metadata",
+                "object_token_valid",
+            ):
+                sample[key] = sample[key].flip(0)
+        if self.mode == "all_pi3x_zero":
+            sample["joint_token_features"] = torch.zeros_like(features)
+            sample["joint_token_metadata"] = torch.zeros_like(metadata)
         return sample
 
 
@@ -114,7 +148,13 @@ def main() -> None:
     model.to(device)
 
     results: dict[str, dict] = {}
-    for mode in MODES:
+    modes = tuple(
+        mode.strip() for mode in args.modes.split(",") if mode.strip()
+    )
+    unknown = sorted(set(modes) - set(MODES))
+    if unknown:
+        raise ValueError(f"Unknown modes: {unknown}")
+    for mode in modes:
         print(f"\n===== {mode} =====", flush=True)
         loader = DataLoader(
             AblationDataset(source, mode),
