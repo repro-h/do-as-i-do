@@ -202,6 +202,9 @@ class CameraWindowDataset(Dataset):
         if np.any(positions >= len(frame_indices)) or not np.array_equal(frame_indices[positions], expected):
             raise ValueError(f"{pi3x_path} does not cover [{start}, {end})")
         grid = np.asarray(pi3x["geometry_feature_grid_hw"], dtype=np.float32)
+        normalized_left = bool(
+            np.asarray(glob.get("normalized_left", False)).item()
+        )
 
         def tokens(prefix: str):
             features = np.asarray(
@@ -211,6 +214,14 @@ class CameraWindowDataset(Dataset):
             coverage = np.asarray(pi3x[f"{prefix}_coverage"][positions], dtype=np.float32)
             confidence = np.asarray(pi3x[f"{prefix}_confidence"][positions], dtype=np.float32)
             indices = np.asarray(pi3x[f"{prefix}_indices"][positions], dtype=np.float32)
+            if normalized_left:
+                # Global hand supervision is expressed in the mirrored camera
+                # frame for left hands. Keep Pi3X geometry metadata in that
+                # same frame before relation attention sees it.
+                points = points.copy()
+                points[..., 0] *= -1.0
+                indices = indices.copy()
+                indices[..., 1] = (float(grid[1]) - 1.0) - indices[..., 1]
             indices[..., 0] /= max(float(grid[0] - 1), 1.0)
             indices[..., 1] /= max(float(grid[1] - 1), 1.0)
             metadata = np.concatenate((points, indices, coverage[..., None], confidence[..., None]), axis=-1)

@@ -23,7 +23,7 @@ from train_v9_camera_hand_residual import (
 )
 
 
-MODEL_VERSION = "v9_1_camera_ray_depth_residual_observation_only_v1"
+MODEL_VERSION = "v9_1_camera_ray_depth_residual_observation_only_v2"
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-acceleration", type=float, default=0.02)
     parser.add_argument("--w-residual", type=float, default=0.001)
     parser.add_argument("--w-small-anchor", type=float, default=0.25)
+    parser.add_argument("--w-degradation-guard", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--data-parallel", action="store_true")
@@ -156,6 +157,7 @@ def run_epoch(
             "acceleration",
             "residual",
             "small_anchor",
+            "degradation_guard",
         )
     }
     metrics = {
@@ -223,12 +225,23 @@ def run_epoch(
             small_anchor = masked_mean(
                 smooth_l1(predicted_ray, 0.005), small
             )
+            degradation = torch.relu(
+                (predicted_ray - target_ray).abs() - target_ray.abs()
+            )
+            degradation_guard = masked_mean(
+                smooth_l1(
+                    degradation,
+                    args.smooth_l1_beta_mm / 1000.0,
+                ),
+                valid,
+            )
             total = (
                 args.w_depth * depth
                 + args.w_velocity * velocity
                 + args.w_acceleration * acceleration
                 + args.w_residual * residual
                 + args.w_small_anchor * small_anchor
+                + args.w_degradation_guard * degradation_guard
             )
             if not torch.isfinite(total):
                 raise RuntimeError(
@@ -237,6 +250,7 @@ def run_epoch(
                     f"acceleration={acceleration.item()} "
                     f"residual={residual.item()} "
                     f"small_anchor={small_anchor.item()}"
+                    f" degradation_guard={degradation_guard.item()}"
                 )
             if training:
                 optimizer.zero_grad(set_to_none=True)
@@ -251,6 +265,7 @@ def run_epoch(
             ("acceleration", acceleration),
             ("residual", residual),
             ("small_anchor", small_anchor),
+            ("degradation_guard", degradation_guard),
         ):
             sums[key] += float(value.detach())
         batches += 1
