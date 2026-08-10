@@ -30,6 +30,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--confidence-threshold", type=float, default=0.1)
     parser.add_argument("--feature-dtype", default="float16")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--export-metric-features",
+        action="store_true",
+        help="Also cache the metric_decoder global window latent.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -177,6 +182,8 @@ def main() -> None:
                 ]
                 if args.overwrite:
                     command.append("--overwrite")
+                if args.export_metric_features:
+                    command.append("--export-metric-features")
                 print(
                     f"[{index + 1}/{len(rows)}] {stream_id} "
                     f"object_label={object_label}",
