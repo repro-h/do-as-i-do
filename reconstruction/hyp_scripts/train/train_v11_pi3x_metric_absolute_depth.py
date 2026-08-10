@@ -53,6 +53,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-confidence", type=float, default=0.1)
     parser.add_argument("--max-depth-m", type=float, default=2.5)
     parser.add_argument("--initial-depth-m", type=float, default=0.8)
+    parser.add_argument(
+        "--use-metric-scalar",
+        action="store_true",
+        help="Also condition on Pi3X's final metric scalar.",
+    )
     parser.add_argument("--smooth-l1-beta-mm", type=float, default=5.0)
     parser.add_argument("--w-depth", type=float, default=1.0)
     parser.add_argument("--w-velocity", type=float, default=0.05)
@@ -93,6 +98,7 @@ class Pi3XMetricAbsoluteDepthModel(nn.Module):
             raise ValueError("initial-depth-m must be in (0, max-depth-m)")
         self.max_depth = float(args.max_depth_m)
         self.feature_mode = args.feature_mode
+        self.use_metric_scalar = bool(args.use_metric_scalar)
         self.point_encoder = nn.Sequential(
             nn.LayerNorm(point_dim),
             nn.Linear(point_dim, args.token_dim),
@@ -107,15 +113,23 @@ class Pi3XMetricAbsoluteDepthModel(nn.Module):
             nn.GELU(),
             nn.Linear(args.token_dim, args.token_dim),
         )
-        self.metric_scalar_encoder = nn.Sequential(
-            nn.LayerNorm(1),
-            nn.Linear(1, args.token_dim),
-            nn.GELU(),
-            nn.Linear(args.token_dim, args.token_dim),
-        )
+        if self.use_metric_scalar:
+            self.metric_scalar_encoder = nn.Sequential(
+                nn.LayerNorm(1),
+                nn.Linear(1, args.token_dim),
+                nn.GELU(),
+                nn.Linear(args.token_dim, args.token_dim),
+            )
+        else:
+            self.metric_scalar_encoder = None
         self.fusion = nn.Sequential(
-            nn.LayerNorm(args.token_dim * 3),
-            nn.Linear(args.token_dim * 3, args.token_dim),
+            nn.LayerNorm(
+                args.token_dim * (3 if self.use_metric_scalar else 2)
+            ),
+            nn.Linear(
+                args.token_dim * (3 if self.use_metric_scalar else 2),
+                args.token_dim,
+            ),
             nn.GELU(),
         )
         self.joint_embedding = nn.Embedding(num_joints, args.token_dim)
@@ -168,13 +182,13 @@ class Pi3XMetricAbsoluteDepthModel(nn.Module):
     def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         point = batch["neighborhood_features"]
         metric = batch["metric_neighborhood_features"]
-        scalar = batch["metric_scalar"]
+        scalar = batch.get("metric_scalar")
         mode = self.feature_mode
         if mode in ("point_zero", "all_zero"):
             point = torch.zeros_like(point)
         if mode in ("metric_zero", "all_zero"):
             metric = torch.zeros_like(metric)
-        if mode in ("scalar_zero", "all_zero"):
+        if scalar is not None and mode in ("scalar_zero", "all_zero"):
             scalar = torch.zeros_like(scalar)
         if mode == "spatial_shuffle":
             point = torch.roll(point, shifts=7, dims=3)
@@ -182,19 +196,25 @@ class Pi3XMetricAbsoluteDepthModel(nn.Module):
         if mode == "time_reverse":
             point = torch.flip(point, dims=(1,))
             metric = torch.flip(metric, dims=(1,))
-            scalar = torch.flip(scalar, dims=(1,))
+            if scalar is not None:
+                scalar = torch.flip(scalar, dims=(1,))
 
-        scalar_token = self.metric_scalar_encoder(
-            self.scalar_feature(scalar)
-        )
-        scalar_local = scalar_token[:, :, None, None].expand(
-            *point.shape[:-1], scalar_token.shape[-1]
-        )
-        token = self.fusion(torch.cat((
+        inputs = [
             self.point_encoder(point),
             self.metric_encoder(metric),
-            scalar_local,
-        ), dim=-1))
+        ]
+        if self.use_metric_scalar:
+            if scalar is None or self.metric_scalar_encoder is None:
+                raise KeyError("metric_scalar is required by this checkpoint")
+            scalar_token = self.metric_scalar_encoder(
+                self.scalar_feature(scalar)
+            )
+            inputs.append(
+                scalar_token[:, :, None, None].expand(
+                    *point.shape[:-1], scalar_token.shape[-1]
+                )
+            )
+        token = self.fusion(torch.cat(inputs, dim=-1))
         token = token + self.metadata_encoder(
             batch["neighborhood_metadata"]
         )
@@ -257,11 +277,9 @@ def run_epoch(
     iterator = tqdm(loader, desc="train" if training else "val")
     for batch in iterator:
         batch = {key: value.to(device) for key, value in batch.items()}
-        required = (
-            "metric_neighborhood_features",
-            "metric_scalar",
-            "metric_scalar_valid",
-        )
+        required = ("metric_neighborhood_features",)
+        if args.use_metric_scalar:
+            required += ("metric_scalar", "metric_scalar_valid")
         missing = [key for key in required if key not in batch]
         if missing:
             raise KeyError(
@@ -402,6 +420,7 @@ def checkpoint_payload(
         "metadata_dim": int(sample["neighborhood_metadata"].shape[-1]),
         "num_joints": int(sample["neighborhood_features"].shape[1]),
         "initial_pose_usage": "2d_patch_localization_and_output_ray_only",
+        "uses_metric_scalar": bool(args.use_metric_scalar),
         "val_total": val["total"],
         "val_ray_median_mm": val["predicted_ray_depth"]["median_mm"],
         "val_degraded_fraction": val["degraded_fraction"],
@@ -426,10 +445,9 @@ def main() -> None:
         args.dense_val_root, args,
     )
     sample = train_data[0]
-    required = (
-        "metric_neighborhood_features", "metric_scalar",
-        "metric_scalar_valid",
-    )
+    required = ("metric_neighborhood_features",)
+    if args.use_metric_scalar:
+        required += ("metric_scalar", "metric_scalar_valid")
     missing = [key for key in required if key not in sample]
     if missing:
         raise KeyError(
@@ -444,6 +462,7 @@ def main() -> None:
             sample["metric_neighborhood_features"].shape
         ),
         "metric_scalar_shape": list(sample["metric_scalar"].shape),
+        "uses_metric_scalar": bool(args.use_metric_scalar),
         "valid_tokens": int(sample["neighborhood_valid"].sum()),
         "valid_frames": int(sample["valid"].sum()),
         "initial_pose_usage": "2d_patch_localization_and_output_ray_only",
