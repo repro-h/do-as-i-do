@@ -230,10 +230,14 @@ class HandNeighborhoodDataset(Dataset):
             dense["geometry_patch_features"], flat_feature_uv
         ).reshape(time, joints, neighbors, -1)
         metric_features = None
-        if "metric_patch_features" in dense:
-            metric_features = bilinear_sample(
-                dense["metric_patch_features"], flat_feature_uv
-            ).reshape(time, joints, neighbors, -1)
+        if "metric_window_features" in dense:
+            metric_features = np.asarray(
+                dense["metric_window_features"], dtype=np.float32
+            ).reshape(-1, dense["metric_window_features"].shape[-1])
+            metric_features = finite_float(metric_features.mean(axis=0))
+            metric_features = np.broadcast_to(
+                metric_features[None], (time, metric_features.shape[-1])
+            ).copy()
 
         sample_pixels = np.empty_like(sample_xy)
         sample_pixels[..., 0] = (
@@ -254,8 +258,6 @@ class HandNeighborhoodDataset(Dataset):
             sample_image_uv.reshape(time, joints * neighbors, 2),
         ).reshape(time, joints, neighbors)
         sample_valid &= np.isfinite(features).all(axis=-1)
-        if metric_features is not None:
-            sample_valid &= np.isfinite(metric_features).all(axis=-1)
         sample_valid &= np.isfinite(confidence)
         sample_valid &= confidence >= self.min_confidence
         offset_scale = max(float(self.offsets[:, 0].max()), 1.0)
@@ -309,7 +311,7 @@ class HandNeighborhoodDataset(Dataset):
                     f"Unexpected metric shape {metric.shape}: {dense_file}"
                 )
             output.update(
-                metric_neighborhood_features=torch.from_numpy(
+                metric_window_features=torch.from_numpy(
                     finite_float(metric_features)
                 ),
                 metric_scalar=torch.from_numpy(

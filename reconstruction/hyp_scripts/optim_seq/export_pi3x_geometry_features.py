@@ -306,22 +306,13 @@ def main() -> None:
                         f"{None if output_metric is None else tuple(output_metric.shape)}",
                         flush=True,
                     )
-                metric_tokens = ret_metric[:, int(model.patch_start_idx):]
-                if metric_tokens.ndim != 3:
+                if ret_metric.ndim != 3:
                     raise RuntimeError(
-                        "Expected metric_decoder tokens with shape [T,N,C], "
-                        f"got {tuple(metric_tokens.shape)}"
+                        "Expected metric_decoder output with shape [B,N,C], "
+                        f"got {tuple(ret_metric.shape)}"
                     )
-                if metric_tokens.shape[1] != patch_h * patch_w:
-                    raise RuntimeError(
-                        f"Unexpected metric token count {metric_tokens.shape[1]} "
-                        f"for grid {patch_h}x{patch_w}"
-                    )
-                metric_features = metric_tokens.reshape(
-                    len(window_rows),
-                    patch_h,
-                    patch_w,
-                    metric_tokens.shape[-1],
+                metric_features = ret_metric.reshape(
+                    -1, ret_metric.shape[-1]
                 )
 
             hand_coverage = []
@@ -415,7 +406,7 @@ def main() -> None:
             )
             if metric_features is not None:
                 payload.update(
-                    metric_patch_features=metric_features
+                    metric_window_features=metric_features
                     .float()
                     .cpu()
                     .numpy()
@@ -423,6 +414,7 @@ def main() -> None:
                     metric_feature_layer=np.asarray(
                         "metric_decoder.final_output"
                     ),
+                    metric_feature_scope=np.asarray("window_global"),
                     metric_feature_dim=np.int32(
                         metric_features.shape[-1]
                     ),

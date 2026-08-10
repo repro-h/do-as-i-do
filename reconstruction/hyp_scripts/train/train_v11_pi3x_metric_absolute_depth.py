@@ -106,6 +106,7 @@ class Pi3XMetricAbsoluteDepthModel(nn.Module):
         self.metric_encoder = nn.Sequential(
             nn.LayerNorm(metric_dim),
             nn.Linear(metric_dim, args.token_dim),
+            nn.GELU(),
         )
         self.metadata_encoder = nn.Sequential(
             nn.LayerNorm(metadata_dim),
@@ -122,16 +123,6 @@ class Pi3XMetricAbsoluteDepthModel(nn.Module):
             )
         else:
             self.metric_scalar_encoder = None
-        self.fusion = nn.Sequential(
-            nn.LayerNorm(
-                args.token_dim * (3 if self.use_metric_scalar else 2)
-            ),
-            nn.Linear(
-                args.token_dim * (3 if self.use_metric_scalar else 2),
-                args.token_dim,
-            ),
-            nn.GELU(),
-        )
         self.joint_embedding = nn.Embedding(num_joints, args.token_dim)
         self.local_score = nn.Sequential(
             nn.LayerNorm(args.token_dim),
@@ -150,8 +141,13 @@ class Pi3XMetricAbsoluteDepthModel(nn.Module):
         )
         self.joint_encoder = nn.TransformerEncoder(encoder, num_layers=1)
         self.frame_encoder = nn.Sequential(
-            nn.LayerNorm(args.token_dim * 2),
-            nn.Linear(args.token_dim * 2, args.hidden_dim),
+            nn.LayerNorm(
+                args.token_dim * (4 if self.use_metric_scalar else 3)
+            ),
+            nn.Linear(
+                args.token_dim * (4 if self.use_metric_scalar else 3),
+                args.hidden_dim,
+            ),
             nn.GELU(),
             nn.Dropout(args.dropout),
         )
@@ -181,7 +177,7 @@ class Pi3XMetricAbsoluteDepthModel(nn.Module):
 
     def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         point = batch["neighborhood_features"]
-        metric = batch["metric_neighborhood_features"]
+        metric = batch["metric_window_features"]
         scalar = batch.get("metric_scalar")
         mode = self.feature_mode
         if mode in ("point_zero", "all_zero"):
@@ -192,29 +188,22 @@ class Pi3XMetricAbsoluteDepthModel(nn.Module):
             scalar = torch.zeros_like(scalar)
         if mode == "spatial_shuffle":
             point = torch.roll(point, shifts=7, dims=3)
-            metric = torch.roll(metric, shifts=7, dims=3)
         if mode == "time_reverse":
             point = torch.flip(point, dims=(1,))
             metric = torch.flip(metric, dims=(1,))
             if scalar is not None:
                 scalar = torch.flip(scalar, dims=(1,))
 
-        inputs = [
-            self.point_encoder(point),
-            self.metric_encoder(metric),
-        ]
+        metric_token = self.metric_encoder(metric)
+        token = self.point_encoder(point)
         if self.use_metric_scalar:
             if scalar is None or self.metric_scalar_encoder is None:
                 raise KeyError("metric_scalar is required by this checkpoint")
             scalar_token = self.metric_scalar_encoder(
                 self.scalar_feature(scalar)
             )
-            inputs.append(
-                scalar_token[:, :, None, None].expand(
-                    *point.shape[:-1], scalar_token.shape[-1]
-                )
-            )
-        token = self.fusion(torch.cat(inputs, dim=-1))
+        else:
+            scalar_token = None
         token = token + self.metadata_encoder(
             batch["neighborhood_metadata"]
         )
@@ -244,8 +233,11 @@ class Pi3XMetricAbsoluteDepthModel(nn.Module):
         pooled = (encoded * joint_weight[..., None]).sum(dim=2)
         pooled = pooled / joint_weight.sum(dim=2, keepdim=True).clamp_min(1.0)
         wrist = encoded[:, :, 0]
+        frame_inputs = [wrist, pooled, metric_token]
+        if scalar_token is not None:
+            frame_inputs.append(scalar_token)
         temporal, _ = self.temporal(
-            self.frame_encoder(torch.cat((wrist, pooled), dim=-1))
+            self.frame_encoder(torch.cat(frame_inputs, dim=-1))
         )
         return torch.sigmoid(
             self.depth_head(temporal).squeeze(-1)
@@ -277,7 +269,7 @@ def run_epoch(
     iterator = tqdm(loader, desc="train" if training else "val")
     for batch in iterator:
         batch = {key: value.to(device) for key, value in batch.items()}
-        required = ("metric_neighborhood_features",)
+        required = ("metric_window_features",)
         if args.use_metric_scalar:
             required += ("metric_scalar", "metric_scalar_valid")
         missing = [key for key in required if key not in batch]
@@ -415,7 +407,7 @@ def checkpoint_payload(
         "args": vars(args),
         "point_feature_dim": int(sample["neighborhood_features"].shape[-1]),
         "metric_feature_dim": int(
-            sample["metric_neighborhood_features"].shape[-1]
+            sample["metric_window_features"].shape[-1]
         ),
         "metadata_dim": int(sample["neighborhood_metadata"].shape[-1]),
         "num_joints": int(sample["neighborhood_features"].shape[1]),
@@ -445,7 +437,7 @@ def main() -> None:
         args.dense_val_root, args,
     )
     sample = train_data[0]
-    required = ("metric_neighborhood_features",)
+    required = ("metric_window_features",)
     if args.use_metric_scalar:
         required += ("metric_scalar", "metric_scalar_valid")
     missing = [key for key in required if key not in sample]
@@ -459,7 +451,7 @@ def main() -> None:
         "val_windows": len(val_data),
         "point_feature_shape": list(sample["neighborhood_features"].shape),
         "metric_feature_shape": list(
-            sample["metric_neighborhood_features"].shape
+            sample["metric_window_features"].shape
         ),
         "metric_scalar_shape": list(sample["metric_scalar"].shape),
         "uses_metric_scalar": bool(args.use_metric_scalar),
@@ -473,7 +465,7 @@ def main() -> None:
 
     model = Pi3XMetricAbsoluteDepthModel(
         int(sample["neighborhood_features"].shape[-1]),
-        int(sample["metric_neighborhood_features"].shape[-1]),
+        int(sample["metric_window_features"].shape[-1]),
         int(sample["neighborhood_metadata"].shape[-1]),
         int(sample["neighborhood_features"].shape[1]),
         args,
