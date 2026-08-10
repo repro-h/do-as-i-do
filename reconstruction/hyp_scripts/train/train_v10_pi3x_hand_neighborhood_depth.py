@@ -257,8 +257,13 @@ class HandNeighborhoodDataset(Dataset):
             dense["confidence"],
             sample_image_uv.reshape(time, joints * neighbors, 2),
         ).reshape(time, joints, neighbors)
+        points = bilinear_sample(
+            dense["local_points"],
+            sample_image_uv.reshape(time, joints * neighbors, 2),
+        ).reshape(time, joints, neighbors, 3)
         sample_valid &= np.isfinite(features).all(axis=-1)
         sample_valid &= np.isfinite(confidence)
+        sample_valid &= np.isfinite(points).all(axis=-1)
         sample_valid &= confidence >= self.min_confidence
         offset_scale = max(float(self.offsets[:, 0].max()), 1.0)
         offset_metadata = np.broadcast_to(
@@ -277,6 +282,7 @@ class HandNeighborhoodDataset(Dataset):
         side = 0 if scalar_text(glob["hand_side"]) == "left" else 1
         output = {
             "neighborhood_features": torch.from_numpy(finite_float(features)),
+            "neighborhood_points": torch.from_numpy(finite_float(points)),
             "neighborhood_metadata": torch.from_numpy(finite_float(metadata)),
             "neighborhood_valid": torch.from_numpy(sample_valid),
             "pred_joints": torch.from_numpy(pred),
