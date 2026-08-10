@@ -143,6 +143,23 @@ def adapt_result(
     for key in ("pose", "trans", "betas"):
         if key in payload:
             output[f"handflow_raw_{key}"] = payload[key]
+    latent_shapes = {}
+    for source_key, output_key in (
+        ("translation_latent", "handflow_translation_latent"),
+        ("image_tokens", "handflow_image_tokens"),
+    ):
+        if source_key not in payload:
+            continue
+        feature = np.asarray(payload[source_key], dtype=np.float32)
+        if feature.ndim != 2 or feature.shape[0] != vertices.shape[0]:
+            raise ValueError(
+                f"Unexpected {source_key} shape {feature.shape}; "
+                f"expected ({vertices.shape[0]}, D)"
+            )
+        if not np.isfinite(feature).all():
+            raise ValueError(f"Non-finite values in {source_key}")
+        output[output_key] = feature.astype(np.float16)
+        latent_shapes[output_key] = list(feature.shape)
     np.savez_compressed(out_path, **output)
     return {
         "num_frames": int(vertices.shape[0]),
@@ -150,6 +167,7 @@ def adapt_result(
         "num_vertices": int(vertices.shape[1]),
         "mirrored_left_input": mirrored_left,
         "raw_side": scalar_text(payload.get("side", "")),
+        "latent_shapes": latent_shapes,
     }
 
 
