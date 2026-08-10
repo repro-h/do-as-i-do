@@ -35,6 +35,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also cache the metric_decoder global window latent.",
     )
+    parser.add_argument(
+        "--canonical-right",
+        action="store_true",
+        help="Mirror left-hand streams before Pi3X feature extraction.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -120,6 +125,7 @@ def main() -> None:
     failures = []
     status = {
         "manifest": str(manifest_path),
+        "canonical_right": args.canonical_right,
         "num_shards": args.num_shards,
         "shard_index": args.shard_index,
         "num_requested": len(rows),
@@ -184,9 +190,20 @@ def main() -> None:
                     command.append("--overwrite")
                 if args.export_metric_features:
                     command.append("--export-metric-features")
+                hand_side = str(record.get("hand_side", "")).lower()
+                mirror_horizontal = (
+                    args.canonical_right and hand_side == "left"
+                )
+                if mirror_horizontal:
+                    command.append("--mirror-horizontal")
+                coordinate_frame = (
+                    "canonical_right"
+                    if mirror_horizontal else "original_camera"
+                )
                 print(
                     f"[{index + 1}/{len(rows)}] {stream_id} "
-                    f"object_label={object_label}",
+                    f"object_label={object_label} "
+                    f"coordinate_frame={coordinate_frame}",
                     flush=True,
                 )
                 subprocess.run(command, check=True)

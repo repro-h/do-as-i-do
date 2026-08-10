@@ -40,6 +40,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Cache metric_decoder patch tokens in addition to point tokens.",
     )
+    parser.add_argument(
+        "--mirror-horizontal",
+        action="store_true",
+        help=(
+            "Mirror RGB, labels, and intrinsics before Pi3X inference. "
+            "Use this for left-hand streams in a canonical-right cache."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -249,11 +257,17 @@ def main() -> None:
                 image_paths,
                 pixel_limit=args.pixel_limit,
             )
+            if args.mirror_horizontal:
+                images = torch.flip(images, dims=(-1,))
             K_resized = resize_intrinsics(
                 intrinsics,
                 original_wh,
                 resized_wh,
             )
+            if args.mirror_horizontal:
+                K_resized[0, 2] = (
+                    float(resized_wh[0] - 1) - K_resized[0, 2]
+                )
             images_device = images[None].to(device)
             intrinsics_device = (
                 torch.from_numpy(K_resized)
@@ -321,6 +335,8 @@ def main() -> None:
                 segmentation = load_segmentation(
                     Path(row["label_path"]).expanduser().resolve()
                 )
+                if args.mirror_horizontal:
+                    segmentation = np.flip(segmentation, axis=1).copy()
                 hand_coverage.append(
                     patch_coverage(
                         segmentation,
@@ -403,6 +419,11 @@ def main() -> None:
                 gt_intrinsics_conditioned=np.asarray(True),
                 object_label=np.int32(args.object_label),
                 hand_label=np.int32(args.hand_label),
+                horizontal_mirror=np.asarray(args.mirror_horizontal),
+                coordinate_frame=np.asarray(
+                    "canonical_right"
+                    if args.mirror_horizontal else "original_camera"
+                ),
             )
             if metric_features is not None:
                 payload.update(
@@ -456,6 +477,11 @@ def main() -> None:
         "window_stride": stride,
         "object_label": args.object_label,
         "hand_label": args.hand_label,
+        "horizontal_mirror": args.mirror_horizontal,
+        "coordinate_frame": (
+            "canonical_right"
+            if args.mirror_horizontal else "original_camera"
+        ),
         "windows": records,
     }
     summary_path = out_dir / "summary.json"

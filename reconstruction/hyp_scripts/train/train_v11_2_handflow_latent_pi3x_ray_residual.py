@@ -283,6 +283,7 @@ def main() -> None:
         ),
         "valid_tokens": int(sample["neighborhood_valid"].sum()),
         "valid_frames": int(sample["valid"].sum()),
+        "sample_cache_mirrored": bool(sample["cache_mirrored"].all()),
         "explicit_hand_depth_input": False,
     }
     print(json.dumps(audit, indent=2), flush=True)

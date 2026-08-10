@@ -154,10 +154,9 @@ class HandNeighborhoodDataset(Dataset):
         target = np.asarray(
             glob["gt_joints_3d"], dtype=np.float32
         )[start:end].copy()
-        if bool(np.asarray(glob.get("normalized_left", False)).item()):
-            # Pi3X cache uses the original RGB camera frame.
-            pred[..., 0] *= -1.0
-            target[..., 0] *= -1.0
+        normalized_left = bool(
+            np.asarray(glob.get("normalized_left", False)).item()
+        )
         pred = pred[:, JOINT_IDS]
         target = target[:, JOINT_IDS]
         valid = (
@@ -176,6 +175,18 @@ class HandNeighborhoodDataset(Dataset):
 
         dense_file = dense_path(row, self.dense_root, stream_id)
         dense = load_dense_npz(dense_file)
+        cache_mirrored = bool(
+            np.asarray(dense.get("horizontal_mirror", False)).item()
+        )
+        if cache_mirrored and not normalized_left:
+            raise ValueError(
+                f"Mirrored cache is only valid for normalized-left data: "
+                f"{dense_file}"
+            )
+        if normalized_left and not cache_mirrored:
+            # Legacy Pi3X caches use the original RGB camera frame.
+            pred[..., 0] *= -1.0
+            target[..., 0] *= -1.0
         frame_indices = np.asarray(dense["frame_indices"], dtype=np.int64)
         if not np.array_equal(
             frame_indices, np.arange(start, end, dtype=np.int64)
@@ -297,6 +308,9 @@ class HandNeighborhoodDataset(Dataset):
                 (end - start,), self.stream_indices[stream_id], dtype=torch.long
             ),
             "frame_index": torch.arange(start, end, dtype=torch.long),
+            "cache_mirrored": torch.full(
+                (end - start,), cache_mirrored, dtype=torch.bool
+            ),
         }
         if metric_features is not None:
             metric = np.asarray(dense.get("metric", []), dtype=np.float32)
