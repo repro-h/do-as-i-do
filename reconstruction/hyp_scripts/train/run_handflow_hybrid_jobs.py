@@ -22,6 +22,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fm-ckpt", required=True)
     parser.add_argument("--out-root", required=True)
     parser.add_argument("--status-json", required=True)
+    parser.add_argument(
+        "--latent-state-root",
+        default=None,
+        help=(
+            "Optional existing HandFlow cache root. Reuse each stream's "
+            "pose/trans/betas and replay only the latent readout."
+        ),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--keep-videos", action="store_true")
     parser.add_argument(
@@ -179,6 +187,10 @@ def main() -> None:
     checkpoint = Path(args.fm_ckpt).expanduser().resolve()
     out_root = Path(args.out_root).expanduser().resolve()
     status_path = Path(args.status_json).expanduser().resolve()
+    latent_state_root = (
+        Path(args.latent_state_root).expanduser().resolve()
+        if args.latent_state_root else None
+    )
     demo_path = handflow_root / "scripts" / "demo.py"
     for path in (manifest_path, handflow_python, checkpoint, demo_path):
         if not path.exists():
@@ -259,6 +271,13 @@ def main() -> None:
                     "--device",
                     args.device,
                 ]
+                if latent_state_root is not None:
+                    state_path = (
+                        latent_state_root / stream_id / "handflow_camera_result.npz"
+                    )
+                    if not state_path.is_file():
+                        raise FileNotFoundError(state_path)
+                    command.extend(["--state_npz", str(state_path)])
                 with log_path.open("w", encoding="utf-8") as log:
                     log.write("command: " + " ".join(command) + "\n")
                     log.flush()
