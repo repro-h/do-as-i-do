@@ -35,6 +35,15 @@ from train_v9_camera_hand_residual import (
 MODEL_VERSION = "v10_pi3x_hand_neighborhood_ray_residual_v1"
 
 
+def disable_mha_fastpath() -> None:
+    """Avoid the fused eval path failing on padded DataParallel batches."""
+    mha_backend = getattr(torch.backends, "mha", None)
+    if mha_backend is not None and hasattr(
+        mha_backend, "set_fastpath_enabled"
+    ):
+        mha_backend.set_fastpath_enabled(False)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-windows", required=True)
@@ -558,6 +567,7 @@ def make_dataset(
 
 def main() -> None:
     args = parse_args()
+    disable_mha_fastpath()
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -614,6 +624,8 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         print(f"\n===== epoch {epoch} =====", flush=True)
         train = run_epoch(model, train_loader, device, args, optimizer)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         val = run_epoch(model, val_loader, device, args)
         scheduler.step()
         row = {

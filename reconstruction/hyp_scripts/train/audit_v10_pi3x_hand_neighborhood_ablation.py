@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 
 from train_v10_pi3x_hand_neighborhood_depth import (
     HandNeighborhoodDepthModel,
+    disable_mha_fastpath,
     make_dataset,
 )
 
@@ -132,6 +133,7 @@ def evaluate(
 
 def main() -> None:
     args = parse_args()
+    disable_mha_fastpath()
     checkpoint = torch.load(
         args.checkpoint, map_location="cpu", weights_only=False
     )
