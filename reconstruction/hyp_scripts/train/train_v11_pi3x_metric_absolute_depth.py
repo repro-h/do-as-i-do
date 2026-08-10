@@ -164,7 +164,10 @@ class Pi3XMetricAbsoluteDepthModel(nn.Module):
             nn.GELU(),
             nn.Linear(args.hidden_dim // 2, 1),
         )
-        nn.init.zeros_(self.depth_head[-1].weight)
+        # Absolute-depth heads must expose feature gradients immediately.
+        # A zero weight is appropriate for residual no-op initialization, but
+        # here it produces a constant depth predictor during short smoke runs.
+        nn.init.normal_(self.depth_head[-1].weight, mean=0.0, std=1e-3)
         ratio = args.initial_depth_m / args.max_depth_m
         nn.init.constant_(
             self.depth_head[-1].bias,
