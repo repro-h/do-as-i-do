@@ -29,7 +29,7 @@ from train_v9_camera_hand_residual import (
 )
 
 
-MODEL_VERSION = "v11_4_per_joint_rigid_pi3x_depth_v1"
+MODEL_VERSION = "v11_4_per_joint_rigid_pi3x_depth_v2"
 
 
 def parse_args() -> argparse.Namespace:
@@ -255,12 +255,41 @@ def binary_stats(
     score = np.concatenate(logits)
     target = np.concatenate(targets).astype(bool)
     predicted = score >= 0.0
+    true_positive = int((predicted & target).sum())
+    true_negative = int((~predicted & ~target).sum())
+    false_positive = int((predicted & ~target).sum())
+    false_negative = int((~predicted & target).sum())
+    recall = true_positive / max(true_positive + false_negative, 1)
+    specificity = true_negative / max(true_negative + false_positive, 1)
     return {
         "count": int(len(target)),
         "accuracy": float((predicted == target).mean()),
+        "balanced_accuracy": float((recall + specificity) * 0.5),
+        "precision": true_positive / max(true_positive + false_positive, 1),
+        "recall": recall,
+        "specificity": specificity,
         "positive_fraction": float(target.mean()),
         "predicted_positive_fraction": float(predicted.mean()),
     }
+
+
+def balanced_binary_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Balance positive and negative BCE mass within the valid batch."""
+    target = target.to(logits.dtype)
+    positive = (target * mask.to(target.dtype)).sum().detach()
+    negative = ((1.0 - target) * mask.to(target.dtype)).sum().detach()
+    total = (positive + negative).clamp_min(1.0)
+    positive_weight = total / (2.0 * positive.clamp_min(1.0))
+    negative_weight = total / (2.0 * negative.clamp_min(1.0))
+    weight = torch.where(target > 0.5, positive_weight, negative_weight)
+    loss = F.binary_cross_entropy_with_logits(
+        logits, target, reduction="none"
+    )
+    return masked_mean(loss * weight, mask)
 
 
 def run_epoch(
@@ -274,7 +303,8 @@ def run_epoch(
     model.train(training)
     names = (
         "total", "depth", "joint_observation", "rigid_consistency",
-        "reliability", "noop", "velocity", "acceleration", "small_anchor",
+        "reliability_loss", "noop_loss", "velocity", "acceleration",
+        "small_anchor",
     )
     sums = {name: 0.0 for name in names}
     metric_names = ("initial_full", "corrected_full", "initial_ray", "corrected_ray")
@@ -341,20 +371,14 @@ def run_epoch(
                 ),
                 observation_mask,
             )
-            reliability_loss = masked_mean(
-                F.binary_cross_entropy_with_logits(
-                    output["reliability_logits"],
-                    reliability_target.to(output["reliability_logits"].dtype),
-                    reduction="none",
-                ),
+            reliability_loss = balanced_binary_loss(
+                output["reliability_logits"],
+                reliability_target,
                 observation_mask,
             )
-            noop_loss = masked_mean(
-                F.binary_cross_entropy_with_logits(
-                    output["noop_logits"],
-                    noop_target.to(output["noop_logits"].dtype),
-                    reduction="none",
-                ),
+            noop_loss = balanced_binary_loss(
+                output["noop_logits"],
+                noop_target,
                 valid,
             )
             velocity_loss = temporal_loss(
