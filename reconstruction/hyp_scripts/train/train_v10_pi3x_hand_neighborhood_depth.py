@@ -229,6 +229,11 @@ class HandNeighborhoodDataset(Dataset):
         features = bilinear_sample(
             dense["geometry_patch_features"], flat_feature_uv
         ).reshape(time, joints, neighbors, -1)
+        metric_features = None
+        if "metric_patch_features" in dense:
+            metric_features = bilinear_sample(
+                dense["metric_patch_features"], flat_feature_uv
+            ).reshape(time, joints, neighbors, -1)
 
         sample_pixels = np.empty_like(sample_xy)
         sample_pixels[..., 0] = (
@@ -249,6 +254,8 @@ class HandNeighborhoodDataset(Dataset):
             sample_image_uv.reshape(time, joints * neighbors, 2),
         ).reshape(time, joints, neighbors)
         sample_valid &= np.isfinite(features).all(axis=-1)
+        if metric_features is not None:
+            sample_valid &= np.isfinite(metric_features).all(axis=-1)
         sample_valid &= np.isfinite(confidence)
         sample_valid &= confidence >= self.min_confidence
         offset_scale = max(float(self.offsets[:, 0].max()), 1.0)
@@ -266,7 +273,7 @@ class HandNeighborhoodDataset(Dataset):
         )
         observed = np.asarray(observed_source, dtype=bool)[start:end]
         side = 0 if scalar_text(glob["hand_side"]) == "left" else 1
-        return {
+        output = {
             "neighborhood_features": torch.from_numpy(finite_float(features)),
             "neighborhood_metadata": torch.from_numpy(finite_float(metadata)),
             "neighborhood_valid": torch.from_numpy(sample_valid),
@@ -283,6 +290,34 @@ class HandNeighborhoodDataset(Dataset):
             ),
             "frame_index": torch.arange(start, end, dtype=torch.long),
         }
+        if metric_features is not None:
+            metric = np.asarray(dense.get("metric", []), dtype=np.float32)
+            metric = metric.reshape(-1)
+            if metric.size == 0:
+                metric_values = np.zeros((time, 1), dtype=np.float32)
+                metric_valid = np.zeros((time,), dtype=bool)
+            elif metric.size == 1:
+                metric_values = np.full(
+                    (time, 1), float(metric[0]), dtype=np.float32
+                )
+                metric_valid = np.isfinite(metric_values[:, 0])
+            elif metric.size == time:
+                metric_values = metric.reshape(time, 1)
+                metric_valid = np.isfinite(metric_values[:, 0])
+            else:
+                raise ValueError(
+                    f"Unexpected metric shape {metric.shape}: {dense_file}"
+                )
+            output.update(
+                metric_neighborhood_features=torch.from_numpy(
+                    finite_float(metric_features)
+                ),
+                metric_scalar=torch.from_numpy(
+                    finite_float(metric_values)
+                ),
+                metric_scalar_valid=torch.from_numpy(metric_valid),
+            )
+        return output
 
 
 class HandNeighborhoodDepthModel(nn.Module):

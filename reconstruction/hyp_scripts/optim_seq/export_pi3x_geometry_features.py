@@ -35,6 +35,11 @@ def parse_args() -> argparse.Namespace:
         default="float16",
     )
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--export-metric-features",
+        action="store_true",
+        help="Cache metric_decoder patch tokens in addition to point tokens.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -108,6 +113,25 @@ def window_starts(count: int, size: int, stride: int) -> list[int]:
     return starts
 
 
+def final_tensor(value) -> torch.Tensor:
+    """Return the last tensor from decoder outputs with nested containers."""
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, dict):
+        for item in reversed(list(value.values())):
+            try:
+                return final_tensor(item)
+            except TypeError:
+                pass
+    if isinstance(value, (tuple, list)):
+        for item in reversed(value):
+            try:
+                return final_tensor(item)
+            except TypeError:
+                pass
+    raise TypeError(f"Decoder output contains no tensor: {type(value)!r}")
+
+
 def main() -> None:
     args = parse_args()
     frame_map_path = Path(args.frame_map_json).expanduser().resolve()
@@ -163,9 +187,27 @@ def main() -> None:
         _inputs: tuple[torch.Tensor, ...],
         output: torch.Tensor,
     ) -> None:
-        captured["ret_point"] = output.detach()
+        captured["ret_point"] = final_tensor(output).detach()
 
-    hook = model.point_decoder.register_forward_hook(capture_point_decoder)
+    hooks = [
+        model.point_decoder.register_forward_hook(capture_point_decoder)
+    ]
+    if args.export_metric_features:
+        if not hasattr(model, "metric_decoder"):
+            raise AttributeError("Pi3X model has no metric_decoder")
+
+        def capture_metric_decoder(
+            _module: torch.nn.Module,
+            _inputs: tuple[torch.Tensor, ...],
+            output,
+        ) -> None:
+            captured["ret_metric"] = final_tensor(output).detach()
+
+        hooks.append(
+            model.metric_decoder.register_forward_hook(
+                capture_metric_decoder
+            )
+        )
     size = min(max(1, args.window_size), len(selected_rows))
     stride = max(1, min(args.window_stride, size))
     starts = window_starts(len(selected_rows), size, stride)
@@ -232,6 +274,8 @@ def main() -> None:
                 )
             if "ret_point" not in captured:
                 raise RuntimeError("Pi3X point_decoder hook was not called")
+            if args.export_metric_features and "ret_metric" not in captured:
+                raise RuntimeError("Pi3X metric_decoder hook was not called")
 
             ret_point = captured["ret_point"]
             point_tokens = ret_point[:, int(model.patch_start_idx):]
@@ -249,6 +293,36 @@ def main() -> None:
                 patch_w,
                 point_tokens.shape[-1],
             )
+            metric_features = None
+            if args.export_metric_features:
+                ret_metric = captured["ret_metric"]
+                if window_number == 0:
+                    output_metric = outputs.get("metric")
+                    print(
+                        "decoder shapes: "
+                        f"ret_point={tuple(ret_point.shape)} "
+                        f"ret_metric={tuple(ret_metric.shape)} "
+                        "metric="
+                        f"{None if output_metric is None else tuple(output_metric.shape)}",
+                        flush=True,
+                    )
+                metric_tokens = ret_metric[:, int(model.patch_start_idx):]
+                if metric_tokens.ndim != 3:
+                    raise RuntimeError(
+                        "Expected metric_decoder tokens with shape [T,N,C], "
+                        f"got {tuple(metric_tokens.shape)}"
+                    )
+                if metric_tokens.shape[1] != patch_h * patch_w:
+                    raise RuntimeError(
+                        f"Unexpected metric token count {metric_tokens.shape[1]} "
+                        f"for grid {patch_h}x{patch_w}"
+                    )
+                metric_features = metric_tokens.reshape(
+                    len(window_rows),
+                    patch_h,
+                    patch_w,
+                    metric_tokens.shape[-1],
+                )
 
             hand_coverage = []
             object_coverage = []
@@ -276,8 +350,7 @@ def main() -> None:
             confidence = torch.sigmoid(outputs["conf"][0, ..., 0])
             local_points = outputs["local_points"][0]
             metric = outputs.get("metric")
-            np.savez_compressed(
-                output_path,
+            payload = dict(
                 start=np.int32(global_start),
                 end=np.int32(global_end),
                 frame_indices=np.arange(
@@ -340,17 +413,37 @@ def main() -> None:
                 object_label=np.int32(args.object_label),
                 hand_label=np.int32(args.hand_label),
             )
+            if metric_features is not None:
+                payload.update(
+                    metric_patch_features=metric_features
+                    .float()
+                    .cpu()
+                    .numpy()
+                    .astype(feature_dtype),
+                    metric_feature_layer=np.asarray(
+                        "metric_decoder.final_output"
+                    ),
+                    metric_feature_dim=np.int32(
+                        metric_features.shape[-1]
+                    ),
+                )
+            np.savez_compressed(output_path, **payload)
             records.append(
                 {
                     "start": global_start,
                     "end": global_end,
                     "path": str(output_path),
                     "feature_shape": list(geometry_features.shape),
+                    "metric_feature_shape": (
+                        None if metric_features is None
+                        else list(metric_features.shape)
+                    ),
                     "size_bytes": output_path.stat().st_size,
                 }
             )
     finally:
-        hook.remove()
+        for hook in hooks:
+            hook.remove()
 
     summary = {
         "model": "Pi3X",
@@ -359,6 +452,10 @@ def main() -> None:
         "hand_npz": str(hand_path),
         "uses_gt_intrinsics": True,
         "feature_layer": "point_decoder.final_output",
+        "metric_feature_layer": (
+            "metric_decoder.final_output"
+            if args.export_metric_features else None
+        ),
         "feature_dtype": args.feature_dtype,
         "frame_start": frame_start,
         "frame_end": frame_end,
