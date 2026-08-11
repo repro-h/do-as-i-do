@@ -36,6 +36,11 @@ def parse_args() -> argparse.Namespace:
         help="Also cache the metric_decoder global window latent.",
     )
     parser.add_argument(
+        "--v13-minimal-cache",
+        action="store_true",
+        help="Export only fields consumed by the V13 trajectory model.",
+    )
+    parser.add_argument(
         "--canonical-right",
         action="store_true",
         help="Mirror left-hand streams before Pi3X feature extraction.",
@@ -53,7 +58,11 @@ def frame_token(path: Path) -> str:
     return path.stem.rsplit("_", 1)[-1].zfill(6)
 
 
-def prepare_frame_map(record: dict, out_path: Path) -> tuple[Path, int]:
+def prepare_frame_map(
+    record: dict,
+    out_path: Path,
+    require_labels: bool = True,
+) -> tuple[Path, int]:
     stream_dir = Path(record["stream_dir"]).expanduser().resolve()
     images = sorted(stream_dir.glob("color_*.jpg")) or sorted(
         stream_dir.glob("color_*.png")
@@ -76,7 +85,7 @@ def prepare_frame_map(record: dict, out_path: Path) -> tuple[Path, int]:
     for output_index, image_path in enumerate(images):
         token = frame_token(image_path)
         label_path = stream_dir / f"labels_{token}.npz"
-        if not label_path.is_file():
+        if require_labels and not label_path.is_file():
             raise FileNotFoundError(label_path)
         frames.append(
             {
@@ -126,6 +135,9 @@ def main() -> None:
     status = {
         "manifest": str(manifest_path),
         "canonical_right": args.canonical_right,
+        "cache_profile": (
+            "v13_minimal" if args.v13_minimal_cache else "full_geometry"
+        ),
         "num_shards": args.num_shards,
         "shard_index": args.shard_index,
         "num_requested": len(rows),
@@ -149,6 +161,7 @@ def main() -> None:
                 frame_map_path, object_label = prepare_frame_map(
                     record,
                     stream_out / "dexycb_frame_map.json",
+                    require_labels=not args.v13_minimal_cache,
                 )
                 hand_path = (
                     handflow_root / stream_id / "handflow_camera_result.npz"
@@ -190,6 +203,8 @@ def main() -> None:
                     command.append("--overwrite")
                 if args.export_metric_features:
                     command.append("--export-metric-features")
+                if args.v13_minimal_cache:
+                    command.append("--v13-minimal-cache")
                 hand_side = str(record.get("hand_side", "")).lower()
                 mirror_horizontal = (
                     args.canonical_right and hand_side == "left"

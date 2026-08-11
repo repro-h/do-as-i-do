@@ -41,6 +41,14 @@ def parse_args() -> argparse.Namespace:
         help="Cache metric_decoder patch tokens in addition to point tokens.",
     )
     parser.add_argument(
+        "--v13-minimal-cache",
+        action="store_true",
+        help=(
+            "Write only the decoder features and camera metadata consumed by "
+            "the V13 absolute trajectory model."
+        ),
+    )
+    parser.add_argument(
         "--mirror-horizontal",
         action="store_true",
         help=(
@@ -329,102 +337,115 @@ def main() -> None:
                     -1, ret_metric.shape[-1]
                 )
 
-            hand_coverage = []
-            object_coverage = []
-            for row in window_rows:
-                segmentation = load_segmentation(
-                    Path(row["label_path"]).expanduser().resolve()
-                )
-                if args.mirror_horizontal:
-                    segmentation = np.flip(segmentation, axis=1).copy()
-                hand_coverage.append(
-                    patch_coverage(
-                        segmentation,
-                        args.hand_label,
-                        resized_wh,
-                        (patch_h, patch_w),
-                    )
-                )
-                object_coverage.append(
-                    patch_coverage(
-                        segmentation,
-                        args.object_label,
-                        resized_wh,
-                        (patch_h, patch_w),
-                    )
-                )
-
             confidence = torch.sigmoid(outputs["conf"][0, ..., 0])
-            local_points = outputs["local_points"][0]
-            metric = outputs.get("metric")
-            payload = dict(
-                start=np.int32(global_start),
-                end=np.int32(global_end),
-                frame_indices=np.arange(
+            confidence_array = confidence.float().cpu().numpy()
+            if args.v13_minimal_cache:
+                confidence_array = np.stack([
+                    cv2.resize(
+                        frame,
+                        (patch_w, patch_h),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    for frame in confidence_array
+                ])
+
+            payload = {
+                "start": np.int32(global_start),
+                "end": np.int32(global_end),
+                "frame_indices": np.arange(
                     global_start,
                     global_end,
                     dtype=np.int32,
                 ),
-                geometry_patch_features=geometry_features
+                "geometry_patch_features": geometry_features
                 .float()
                 .cpu()
                 .numpy()
                 .astype(feature_dtype),
-                geometry_feature_layer=np.asarray(
+                "geometry_feature_layer": np.asarray(
                     "point_decoder.final_output"
                 ),
-                geometry_feature_grid_hw=np.asarray(
+                "geometry_feature_grid_hw": np.asarray(
                     [patch_h, patch_w], dtype=np.int32
                 ),
-                geometry_feature_dim=np.int32(
+                "geometry_feature_dim": np.int32(
                     geometry_features.shape[-1]
                 ),
-                geometry_feature_dtype=np.asarray(args.feature_dtype),
-                patch_size=np.int32(model.patch_size),
-                patch_start_idx=np.int32(model.patch_start_idx),
-                hand_patch_coverage=np.stack(hand_coverage),
-                object_patch_coverage=np.stack(object_coverage),
-                hand_patch_mask=(
-                    np.stack(hand_coverage) >= 0.5
-                ).astype(np.uint8),
-                object_patch_mask=(
-                    np.stack(object_coverage) >= 0.5
-                ).astype(np.uint8),
-                local_points=local_points
-                .float()
-                .cpu()
-                .numpy()
-                .astype(np.float16),
-                confidence=confidence
-                .float()
-                .cpu()
-                .numpy()
-                .astype(np.float16),
-                valid_mask=(
-                    confidence >= args.confidence_threshold
-                ).cpu().numpy().astype(np.uint8),
-                camera_poses=outputs["camera_poses"][0]
-                .float()
-                .cpu()
-                .numpy()
-                .astype(np.float32),
-                intrinsics_resized=K_resized.astype(np.float32),
-                resized_wh=np.asarray(resized_wh, dtype=np.int32),
-                original_wh=np.asarray(original_wh, dtype=np.int32),
-                metric=(
-                    np.asarray([], dtype=np.float32)
-                    if metric is None
-                    else metric.float().cpu().numpy().astype(np.float32)
-                ),
-                gt_intrinsics_conditioned=np.asarray(True),
-                object_label=np.int32(args.object_label),
-                hand_label=np.int32(args.hand_label),
-                horizontal_mirror=np.asarray(args.mirror_horizontal),
-                coordinate_frame=np.asarray(
+                "geometry_feature_dtype": np.asarray(args.feature_dtype),
+                "patch_size": np.int32(model.patch_size),
+                "patch_start_idx": np.int32(model.patch_start_idx),
+                "confidence": confidence_array.astype(np.float16),
+                "intrinsics_resized": K_resized.astype(np.float32),
+                "resized_wh": np.asarray(resized_wh, dtype=np.int32),
+                "gt_intrinsics_conditioned": np.asarray(True),
+                "object_label": np.int32(args.object_label),
+                "hand_label": np.int32(args.hand_label),
+                "horizontal_mirror": np.asarray(args.mirror_horizontal),
+                "coordinate_frame": np.asarray(
                     "canonical_right"
                     if args.mirror_horizontal else "original_camera"
                 ),
-            )
+            }
+            if not args.v13_minimal_cache:
+                hand_coverage = []
+                object_coverage = []
+                for row in window_rows:
+                    segmentation = load_segmentation(
+                        Path(row["label_path"]).expanduser().resolve()
+                    )
+                    if args.mirror_horizontal:
+                        segmentation = np.flip(
+                            segmentation, axis=1
+                        ).copy()
+                    hand_coverage.append(
+                        patch_coverage(
+                            segmentation,
+                            args.hand_label,
+                            resized_wh,
+                            (patch_h, patch_w),
+                        )
+                    )
+                    object_coverage.append(
+                        patch_coverage(
+                            segmentation,
+                            args.object_label,
+                            resized_wh,
+                            (patch_h, patch_w),
+                        )
+                    )
+                metric = outputs.get("metric")
+                payload.update(
+                    hand_patch_coverage=np.stack(hand_coverage),
+                    object_patch_coverage=np.stack(object_coverage),
+                    hand_patch_mask=(
+                        np.stack(hand_coverage) >= 0.5
+                    ).astype(np.uint8),
+                    object_patch_mask=(
+                        np.stack(object_coverage) >= 0.5
+                    ).astype(np.uint8),
+                    local_points=outputs["local_points"][0]
+                    .float()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float16),
+                    valid_mask=(
+                        confidence >= args.confidence_threshold
+                    ).cpu().numpy().astype(np.uint8),
+                    camera_poses=outputs["camera_poses"][0]
+                    .float()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32),
+                    original_wh=np.asarray(original_wh, dtype=np.int32),
+                    metric=(
+                        np.asarray([], dtype=np.float32)
+                        if metric is None
+                        else metric.float()
+                        .cpu()
+                        .numpy()
+                        .astype(np.float32)
+                    ),
+                )
             if metric_features is not None:
                 payload.update(
                     metric_window_features=metric_features
@@ -470,6 +491,9 @@ def main() -> None:
             if args.export_metric_features else None
         ),
         "feature_dtype": args.feature_dtype,
+        "cache_profile": (
+            "v13_minimal" if args.v13_minimal_cache else "full_geometry"
+        ),
         "frame_start": frame_start,
         "frame_end": frame_end,
         "num_frames": len(selected_rows),
