@@ -170,9 +170,9 @@ def evaluate(
         "availability_fraction": float(valid.mean()) if len(valid) else 0.0,
         "slope": slope,
         "bias_mm": bias * 1000.0,
-        "initial_ray_depth": distribution(before),
-        "anchor_ray_depth": distribution(after),
-        "oracle_select_ray_depth": distribution(oracle),
+        "initial_ray_depth": distribution([before]),
+        "anchor_ray_depth": distribution([after]),
+        "oracle_select_ray_depth": distribution([oracle]),
         "degraded_fraction": float(np.mean(after > before + 1e-6)),
         "improved_fraction": float(np.mean(after < before - 1e-6)),
         "residual_correlation": pearson(
