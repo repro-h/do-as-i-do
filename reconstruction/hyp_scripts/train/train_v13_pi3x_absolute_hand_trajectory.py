@@ -595,12 +595,33 @@ def overlap_loss(
     return torch.stack(losses).mean(), count
 
 
+def scalar_error_metrics(values: list[np.ndarray]) -> dict:
+    array = np.concatenate(values) if values else np.empty(0, dtype=np.float32)
+    result = distribution([array])
+    if not array.size:
+        return {
+            **result,
+            "mean_mm": None,
+            "rmse_mm": None,
+            "within_5mm_fraction": None,
+            "within_10mm_fraction": None,
+            "within_20mm_fraction": None,
+        }
+    millimeters = array * 1000.0
+    return {
+        **result,
+        "mean_mm": float(millimeters.mean()),
+        "rmse_mm": float(np.sqrt(np.mean(millimeters ** 2))),
+        "within_5mm_fraction": float(np.mean(millimeters <= 5.0)),
+        "within_10mm_fraction": float(np.mean(millimeters <= 10.0)),
+        "within_20mm_fraction": float(np.mean(millimeters <= 20.0)),
+    }
+
+
 def summarize_metrics(source: dict[str, list[np.ndarray]]) -> dict:
     return {
-        "initial_translation": distribution(source["initial_full"]),
-        "predicted_translation": distribution(source["predicted_full"]),
-        "initial_ray_depth": distribution(source["initial_ray"]),
-        "predicted_ray_depth": distribution(source["predicted_ray"]),
+        "translation_error": scalar_error_metrics(source["translation_error"]),
+        "ray_depth_error": scalar_error_metrics(source["ray_depth_error"]),
         "absolute_target_depth": distribution(source["target_depth"]),
         "absolute_predicted_depth": distribution(source["predicted_depth"]),
     }
@@ -621,7 +642,7 @@ def run_epoch(
     )
     sums = {name: 0.0 for name in names}
     metric_names = (
-        "initial_full", "predicted_full", "initial_ray", "predicted_ray",
+        "translation_error", "ray_depth_error",
         "target_depth", "predicted_depth",
     )
     metrics = {name: [] for name in metric_names}
@@ -630,7 +651,7 @@ def run_epoch(
         for side in ("left", "right")
     }
     stitched: dict[tuple[int, int], dict[str, object]] = {}
-    improved = degraded = evaluated = overlap_frames = batches = 0
+    evaluated = overlap_frames = batches = 0
     iterator = tqdm(loader, desc="train" if training else "val")
     for raw_batch in iterator:
         paired = "first" in raw_batch
@@ -643,12 +664,11 @@ def run_epoch(
         if bad:
             raise RuntimeError(f"non-finite batch inputs: {bad}")
 
-        initial_t, target_t = batch["initial_t"], batch["target_t"]
+        target_t = batch["target_t"]
         ray = batch["output_ray"]
         valid = batch["valid"]
         target_depth = (target_t * ray).sum(dim=-1)
         valid &= target_depth > 1e-5
-        initial_depth = (initial_t * ray).sum(dim=-1)
 
         with torch.set_grad_enabled(training):
             predicted_depth = model(batch)
@@ -703,13 +723,11 @@ def run_epoch(
         batches += 1
         iterator.set_postfix(loss=f"{sums['total'] / batches:.5f}")
 
-        initial_full = torch.linalg.norm(initial_t - target_t, dim=-1)
-        predicted_full = torch.linalg.norm(predicted_t - target_t, dim=-1)
         values = {
-            "initial_full": initial_full,
-            "predicted_full": predicted_full,
-            "initial_ray": (initial_depth - target_depth).abs(),
-            "predicted_ray": (predicted_depth - target_depth).abs(),
+            "translation_error": torch.linalg.norm(
+                predicted_t - target_t, dim=-1
+            ),
+            "ray_depth_error": (predicted_depth - target_depth).abs(),
             "target_depth": target_depth,
             "predicted_depth": predicted_depth,
         }
@@ -721,16 +739,11 @@ def run_epoch(
             for side_name, side_value in (("left", 0), ("right", 1)):
                 mask = valid_np & (side_np == side_value)
                 side_metrics[side_name][name].append(array[mask])
-        before = initial_full.detach().cpu().numpy()[valid_np]
-        after = predicted_full.detach().cpu().numpy()[valid_np]
-        improved += int((after < before).sum())
-        degraded += int((after > before + 1e-6).sum())
-        evaluated += len(before)
+        evaluated += int(valid_np.sum())
 
         if not training and not paired:
             pred_np = predicted_depth.detach().cpu().numpy()
             ray_np = ray.detach().cpu().numpy()
-            initial_np = initial_t.detach().cpu().numpy()
             target_np = target_t.detach().cpu().numpy()
             stream_np = batch["stream_index"].detach().cpu().numpy()
             frame_np = batch["frame_index"].detach().cpu().numpy()
@@ -747,7 +760,6 @@ def run_epoch(
                     item = stitched.setdefault(key, {
                         "sum": 0.0, "weight": 0.0,
                         "ray": ray_np[batch_index, local],
-                        "initial": initial_np[batch_index, local],
                         "target": target_np[batch_index, local],
                         "side": int(side_np[batch_index, local]),
                     })
@@ -763,9 +775,6 @@ def run_epoch(
             for side, source in side_metrics.items()
         },
         "evaluated": evaluated,
-        "improved": improved,
-        "degraded": degraded,
-        "degraded_fraction": degraded / max(evaluated, 1),
         "overlap_frames": overlap_frames,
     }
     if stitched:
@@ -774,20 +783,17 @@ def run_epoch(
             side: {name: [] for name in metric_names}
             for side in ("left", "right")
         }
-        stitched_degraded = 0
         for item in stitched.values():
             depth = float(item["sum"]) / max(float(item["weight"]), 1e-8)
             ray_value = np.asarray(item["ray"])
-            initial_value = np.asarray(item["initial"])
             target_value = np.asarray(item["target"])
             target_depth_value = float(np.dot(target_value, ray_value))
-            initial_depth_value = float(np.dot(initial_value, ray_value))
             prediction_value = depth * ray_value
             row = {
-                "initial_full": np.linalg.norm(initial_value - target_value),
-                "predicted_full": np.linalg.norm(prediction_value - target_value),
-                "initial_ray": abs(initial_depth_value - target_depth_value),
-                "predicted_ray": abs(depth - target_depth_value),
+                "translation_error": np.linalg.norm(
+                    prediction_value - target_value
+                ),
+                "ray_depth_error": abs(depth - target_depth_value),
                 "target_depth": target_depth_value,
                 "predicted_depth": depth,
             }
@@ -796,7 +802,6 @@ def run_epoch(
                 array = np.asarray([value], dtype=np.float32)
                 stitched_metrics[name].append(array)
                 stitched_sides[side_name][name].append(array)
-            stitched_degraded += int(row["predicted_full"] > row["initial_full"] + 1e-6)
         result["stitched"] = {
             **summarize_metrics(stitched_metrics),
             "by_side": {
@@ -804,7 +809,6 @@ def run_epoch(
                 for side, source in stitched_sides.items()
             },
             "evaluated": len(stitched),
-            "degraded_fraction": stitched_degraded / max(len(stitched), 1),
         }
     return result
 
@@ -833,8 +837,8 @@ def checkpoint_payload(
         "explicit_hand_depth_input": False,
         "uses_metric_scalar": False,
         "val_total": val["total"],
-        "val_ray_median_mm": selected["predicted_ray_depth"]["median_mm"],
-        "val_degraded_fraction": selected["degraded_fraction"],
+        "val_ray_median_mm": selected["ray_depth_error"]["median_mm"],
+        "val_translation_median_mm": selected["translation_error"]["median_mm"],
         "val": val,
     }
 
@@ -935,7 +939,7 @@ def main() -> None:
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     history = []
-    best_total = best_ray = best_degraded = float("inf")
+    best_total = best_ray = best_translation = float("inf")
     for epoch in range(1, args.epochs + 1):
         print(f"\n===== epoch {epoch} =====", flush=True)
         train = run_epoch(model, train_loader, device, args, optimizer)
@@ -957,14 +961,14 @@ def main() -> None:
         if val["total"] < best_total:
             best_total = val["total"]
             torch.save(payload, out_dir / "best.pt")
-        ray = selected["predicted_ray_depth"]["median_mm"]
+        ray = selected["ray_depth_error"]["median_mm"]
         if ray < best_ray:
             best_ray = ray
             torch.save(payload, out_dir / "best_ray.pt")
-        degraded_value = selected["degraded_fraction"]
-        if degraded_value < best_degraded:
-            best_degraded = degraded_value
-            torch.save(payload, out_dir / "best_degraded.pt")
+        translation = selected["translation_error"]["median_mm"]
+        if translation < best_translation:
+            best_translation = translation
+            torch.save(payload, out_dir / "best_translation.pt")
         (out_dir / "history.json").write_text(
             json.dumps(history, indent=2), encoding="utf-8"
         )
