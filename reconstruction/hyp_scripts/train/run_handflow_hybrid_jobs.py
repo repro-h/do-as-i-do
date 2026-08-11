@@ -168,6 +168,21 @@ def adapt_result(
             raise ValueError(f"Non-finite values in {source_key}")
         output[output_key] = feature.astype(np.float16)
         latent_shapes[output_key] = list(feature.shape)
+    for source_key, output_key in (
+        ("hamer_confidence", "handflow_hamer_confidence"),
+        ("bbox_confidence", "handflow_bbox_confidence"),
+    ):
+        if source_key not in payload:
+            continue
+        confidence = np.asarray(payload[source_key], dtype=np.float32).reshape(-1)
+        if len(confidence) != len(vertices):
+            raise ValueError(
+                f"Unexpected {source_key} shape {payload[source_key].shape}; "
+                f"expected ({len(vertices)},)"
+            )
+        if not np.isfinite(confidence).all():
+            raise ValueError(f"Non-finite values in {source_key}")
+        output[output_key] = confidence
     np.savez_compressed(out_path, **output)
     return {
         "num_frames": int(vertices.shape[0]),
