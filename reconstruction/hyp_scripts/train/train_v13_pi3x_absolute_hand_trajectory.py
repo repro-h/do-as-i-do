@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Train an absolute camera-ray hand trajectory from dense Pi3X tokens.
+"""Train an absolute camera-frame hand trajectory from dense Pi3X tokens.
 
 HandFlow contributes only 2D joint locations used as cross-attention queries.
-Its 3D translation/depth is retained for baseline evaluation and output-ray
-composition, but is never passed to the model.
+Its 3D translation/depth is retained for baseline evaluation, but is never
+passed to the model. The model predicts absolute depth and a 2D wrist offset,
+which are composed through the camera intrinsics into an XYZ trajectory.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ from train_v9_camera_hand_residual import (
 from train_v10_pi3x_hand_neighborhood_depth import disable_mha_fastpath
 
 
-MODEL_VERSION = "v13_pi3x_absolute_hand_trajectory_v1"
+MODEL_VERSION = "v13_1_pi3x_absolute_hand_translation_v1"
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,9 +68,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-depth-m", type=float, default=2.5)
     parser.add_argument("--initial-depth-m", type=float, default=0.85)
     parser.add_argument("--max-relative-offset-m", type=float, default=0.45)
+    parser.add_argument("--max-image-offset-fraction", type=float, default=0.2)
     parser.add_argument("--query-dropout", type=float, default=0.2)
     parser.add_argument("--smooth-l1-beta-mm", type=float, default=5.0)
     parser.add_argument("--w-absolute", type=float, default=1.0)
+    parser.add_argument("--w-depth", type=float, default=0.5)
     parser.add_argument("--w-relative", type=float, default=0.5)
     parser.add_argument("--w-velocity", type=float, default=0.05)
     parser.add_argument("--w-acceleration", type=float, default=0.02)
@@ -89,8 +92,8 @@ def parse_args() -> argparse.Namespace:
             "all_zero",
             "spatial_shuffle",
             "time_reverse",
-            "joint_query_zero",
-            "global_query_zero",
+        "joint_query_zero",
+        "global_query_zero",
         ),
         default="normal",
     )
@@ -297,6 +300,11 @@ class DenseTrajectoryDataset(Dataset):
             "joint_uv": torch.from_numpy(query_uv),
             "joint_query_valid": torch.from_numpy(query_valid),
             "output_ray": torch.from_numpy(finite_float(root_rays)),
+            "root_pixels": torch.from_numpy(finite_float(root_pixels)),
+            "intrinsics": torch.from_numpy(finite_float(intrinsics)),
+            "image_wh": torch.from_numpy(
+                np.broadcast_to(image_wh[None], (time, 2)).copy()
+            ),
             "initial_t": torch.from_numpy(initial_t),
             "target_t": torch.from_numpy(target_t),
             "valid": torch.from_numpy(valid),
@@ -354,6 +362,9 @@ class Pi3XAbsoluteTrajectoryModel(nn.Module):
             raise ValueError("initial-depth-m must be in (0, max-depth-m)")
         self.max_depth = float(args.max_depth_m)
         self.max_relative_offset = float(args.max_relative_offset_m)
+        self.max_image_offset_fraction = float(
+            args.max_image_offset_fraction
+        )
         self.spatial_bias = float(args.spatial_bias)
         self.feature_mode = str(args.feature_mode)
         self.heads = int(args.heads)
@@ -416,6 +427,12 @@ class Pi3XAbsoluteTrajectoryModel(nn.Module):
             nn.GELU(),
             nn.Linear(args.hidden_dim // 2, 1),
         )
+        self.image_offset_head = nn.Sequential(
+            nn.LayerNorm(args.hidden_dim),
+            nn.Linear(args.hidden_dim, args.hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(args.hidden_dim // 2, 2),
+        )
         ratio = args.initial_depth_m / args.max_depth_m
         nn.init.normal_(self.window_depth_head[-1].weight, std=1e-3)
         nn.init.constant_(
@@ -424,8 +441,12 @@ class Pi3XAbsoluteTrajectoryModel(nn.Module):
         )
         nn.init.normal_(self.relative_head[-1].weight, std=1e-3)
         nn.init.zeros_(self.relative_head[-1].bias)
+        nn.init.normal_(self.image_offset_head[-1].weight, std=1e-3)
+        nn.init.zeros_(self.image_offset_head[-1].bias)
 
-    def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self, batch: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         point = batch["point_features"]
         metric = batch["metric_window_features"]
         joint_uv = batch["joint_uv"]
@@ -535,7 +556,13 @@ class Pi3XAbsoluteTrajectoryModel(nn.Module):
             self.relative_head(frame).squeeze(-1)
         ) * self.max_relative_offset
         relative = relative - relative.mean(dim=1, keepdim=True)
-        return (base_depth[:, None] + relative).clamp(1e-4, self.max_depth)
+        depth = (base_depth[:, None] + relative).clamp(
+            1e-4, self.max_depth
+        )
+        image_offset = torch.tanh(
+            self.image_offset_head(frame)
+        ) * self.max_image_offset_fraction
+        return depth, image_offset
 
 
 def move_to_device(value, device: torch.device):
@@ -551,13 +578,13 @@ def combine_pair(batch: dict[str, dict[str, torch.Tensor]]) -> dict[str, torch.T
     }
 
 
-def centered_depth_loss(
+def centered_trajectory_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
     valid: torch.Tensor,
     beta: float,
 ) -> torch.Tensor:
-    weight = valid.to(prediction.dtype)
+    weight = valid.to(prediction.dtype)[..., None]
     denominator = weight.sum(dim=1, keepdim=True).clamp_min(1.0)
     pred_center = (prediction * weight).sum(dim=1, keepdim=True) / denominator
     target_center = (target * weight).sum(dim=1, keepdim=True) / denominator
@@ -565,8 +592,28 @@ def centered_depth_loss(
         smooth_l1(
             (prediction - pred_center) - (target - target_center), beta
         ),
-        valid,
+        valid[..., None],
     )
+
+
+def compose_translation(
+    depth: torch.Tensor,
+    image_offset: torch.Tensor,
+    batch: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    pixels = batch["root_pixels"] + image_offset * batch["image_wh"]
+    intrinsics = batch["intrinsics"]
+    x = (
+        (pixels[..., 0] - intrinsics[..., 0, 2])
+        / intrinsics[..., 0, 0].clamp_min(1e-6)
+        * depth
+    )
+    y = (
+        (pixels[..., 1] - intrinsics[..., 1, 2])
+        / intrinsics[..., 1, 1].clamp_min(1e-6)
+        * depth
+    )
+    return torch.stack((x, y, depth), dim=-1), pixels
 
 
 def overlap_loss(
@@ -637,7 +684,7 @@ def run_epoch(
     training = optimizer is not None
     model.train(training)
     names = (
-        "total", "absolute", "relative", "velocity",
+        "total", "absolute", "depth", "relative", "velocity",
         "acceleration", "overlap",
     )
     sums = {name: 0.0 for name in names}
@@ -667,41 +714,51 @@ def run_epoch(
         target_t = batch["target_t"]
         ray = batch["output_ray"]
         valid = batch["valid"]
-        target_depth = (target_t * ray).sum(dim=-1)
+        target_depth = target_t[..., 2]
         valid &= target_depth > 1e-5
 
         with torch.set_grad_enabled(training):
-            predicted_depth = model(batch)
-            predicted_t = predicted_depth[..., None] * ray
+            predicted_depth, image_offset = model(batch)
+            predicted_t, _ = compose_translation(
+                predicted_depth, image_offset, batch
+            )
             absolute = masked_mean(
+                smooth_l1(
+                    predicted_t - target_t,
+                    args.smooth_l1_beta_mm / 1000.0,
+                ),
+                valid[..., None],
+            )
+            depth = masked_mean(
                 smooth_l1(
                     predicted_depth - target_depth,
                     args.smooth_l1_beta_mm / 1000.0,
                 ),
                 valid,
             )
-            relative = centered_depth_loss(
-                predicted_depth, target_depth, valid,
+            relative = centered_trajectory_loss(
+                predicted_t, target_t, valid,
                 args.smooth_l1_beta_mm / 1000.0,
             )
             velocity = temporal_loss(
-                predicted_depth[..., None], target_depth[..., None],
+                predicted_t, target_t,
                 valid, 1, args.smooth_l1_beta_mm / 1000.0,
             )
             acceleration = temporal_loss(
-                predicted_depth[..., None], target_depth[..., None],
+                predicted_t, target_t,
                 valid, 2, args.smooth_l1_beta_mm / 1000.0,
             )
             if paired:
                 overlap, overlap_count = overlap_loss(
-                    predicted_depth, raw_batch,
+                    predicted_t, raw_batch,
                     args.smooth_l1_beta_mm / 1000.0,
                 )
             else:
-                overlap = predicted_depth.sum() * 0.0
+                overlap = predicted_t.sum() * 0.0
                 overlap_count = 0
             total = (
                 args.w_absolute * absolute
+                + args.w_depth * depth
                 + args.w_relative * relative
                 + args.w_velocity * velocity
                 + args.w_acceleration * acceleration
@@ -716,7 +773,11 @@ def run_epoch(
                 optimizer.step()
 
         for name, value in zip(
-            names, (total, absolute, relative, velocity, acceleration, overlap)
+            names,
+            (
+                total, absolute, depth, relative,
+                velocity, acceleration, overlap,
+            ),
         ):
             sums[name] += float(value.detach())
         overlap_frames += overlap_count
@@ -727,7 +788,9 @@ def run_epoch(
             "translation_error": torch.linalg.norm(
                 predicted_t - target_t, dim=-1
             ),
-            "ray_depth_error": (predicted_depth - target_depth).abs(),
+            "ray_depth_error": (
+                (predicted_t - target_t) * ray
+            ).sum(dim=-1).abs(),
             "target_depth": target_depth,
             "predicted_depth": predicted_depth,
         }
@@ -742,7 +805,7 @@ def run_epoch(
         evaluated += int(valid_np.sum())
 
         if not training and not paired:
-            pred_np = predicted_depth.detach().cpu().numpy()
+            pred_np = predicted_t.detach().cpu().numpy()
             ray_np = ray.detach().cpu().numpy()
             target_np = target_t.detach().cpu().numpy()
             stream_np = batch["stream_index"].detach().cpu().numpy()
@@ -758,13 +821,15 @@ def run_epoch(
                         continue
                     key = (int(stream_np[batch_index]), int(frame_np[batch_index, local]))
                     item = stitched.setdefault(key, {
-                        "sum": 0.0, "weight": 0.0,
+                        "sum": np.zeros(3, dtype=np.float64), "weight": 0.0,
                         "ray": ray_np[batch_index, local],
                         "target": target_np[batch_index, local],
                         "side": int(side_np[batch_index, local]),
                     })
                     weight = float(center_weight[local])
-                    item["sum"] = float(item["sum"]) + weight * float(pred_np[batch_index, local])
+                    item["sum"] = np.asarray(item["sum"]) + weight * pred_np[
+                        batch_index, local
+                    ]
                     item["weight"] = float(item["weight"]) + weight
 
     result = {
@@ -784,18 +849,21 @@ def run_epoch(
             for side in ("left", "right")
         }
         for item in stitched.values():
-            depth = float(item["sum"]) / max(float(item["weight"]), 1e-8)
+            prediction_value = np.asarray(item["sum"]) / max(
+                float(item["weight"]), 1e-8
+            )
             ray_value = np.asarray(item["ray"])
             target_value = np.asarray(item["target"])
-            target_depth_value = float(np.dot(target_value, ray_value))
-            prediction_value = depth * ray_value
+            target_depth_value = float(target_value[2])
             row = {
                 "translation_error": np.linalg.norm(
                     prediction_value - target_value
                 ),
-                "ray_depth_error": abs(depth - target_depth_value),
+                "ray_depth_error": abs(float(np.dot(
+                    prediction_value - target_value, ray_value
+                ))),
                 "target_depth": target_depth_value,
-                "predicted_depth": depth,
+                "predicted_depth": float(prediction_value[2]),
             }
             side_name = "left" if int(item["side"]) == 0 else "right"
             for name, value in row.items():
@@ -833,7 +901,8 @@ def checkpoint_payload(
         "point_feature_dim": int(sample["point_features"].shape[-1]),
         "metric_feature_dim": int(sample["metric_window_features"].shape[-1]),
         "num_joints": int(sample["joint_uv"].shape[1]),
-        "initial_pose_usage": "2d_query_and_output_ray_composition_only",
+        "initial_pose_usage": "2d_query_localization_only",
+        "output_parameterization": "absolute_depth_plus_normalized_uv_offset",
         "explicit_hand_depth_input": False,
         "uses_metric_scalar": False,
         "val_total": val["total"],
@@ -882,7 +951,8 @@ def main() -> None:
         "valid_query_fraction": round(
             float(sample["joint_query_valid"].float().mean()), 6
         ),
-        "initial_pose_usage": "2d_query_and_output_ray_composition_only",
+        "initial_pose_usage": "2d_query_localization_only",
+        "output_parameterization": "absolute_depth_plus_normalized_uv_offset",
         "explicit_hand_depth_input": False,
         "uses_metric_scalar": False,
     }
