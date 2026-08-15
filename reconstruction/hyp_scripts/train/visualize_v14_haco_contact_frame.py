@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from pathlib import Path
 
@@ -22,11 +23,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-npz", required=True)
     parser.add_argument("--contact-npz", required=True)
     parser.add_argument("--supervision-npz", required=True)
+    parser.add_argument("--gt-hand-npz")
     parser.add_argument("--object-mesh", required=True)
     parser.add_argument("--object-scale", type=float, default=1.0)
     parser.add_argument("--frame-id")
     parser.add_argument("--frame-index", type=int, default=0)
     parser.add_argument("--port", type=int, default=8098)
+    parser.add_argument("--summary-json")
     return parser.parse_args()
 
 
@@ -64,6 +67,33 @@ def physical_pose(pose: np.ndarray, normalized_left: bool) -> np.ndarray:
         result[:3, :3] = MIRROR_X @ result[:3, :3] @ MIRROR_X
         result[:3, 3] = MIRROR_X @ result[:3, 3]
     return result
+
+
+def load_gt_hand(
+    path: Path, hand_side: str, frame_index: int
+) -> tuple[np.ndarray, np.ndarray] | None:
+    data = load_npz(path)
+    side = hand_side.lower()
+    vertices_key = f"{side}_vertices"
+    faces_key = f"{side}_faces"
+    valid_key = f"{side}_valid"
+    missing = [
+        key for key in (vertices_key, faces_key, valid_key) if key not in data
+    ]
+    if missing:
+        raise KeyError(f"GT hand archive lacks {missing}")
+    if frame_index >= len(data[valid_key]):
+        raise IndexError(
+            f"GT hand has {len(data[valid_key])} frames, requested {frame_index}"
+        )
+    if not bool(data[valid_key][frame_index]):
+        print(f"GT hand is invalid for frame index {frame_index}")
+        return None
+    vertices = np.asarray(data[vertices_key][frame_index], dtype=np.float32)
+    if not np.isfinite(vertices).all():
+        print(f"GT hand contains non-finite vertices at frame index {frame_index}")
+        return None
+    return vertices, np.asarray(data[faces_key], dtype=np.int64)
 
 
 def main() -> None:
@@ -120,32 +150,64 @@ def main() -> None:
     object_camera = (
         object_vertices @ object_pose[:3, :3].T + object_pose[:3, 3]
     )
+    gt_hand = None
+    if args.gt_hand_npz:
+        gt_hand = load_gt_hand(
+            Path(args.gt_hand_npz).expanduser().resolve(),
+            str(query["hand_side"].item()),
+            query_index,
+        )
 
     threshold = float(np.asarray(contact["contact_threshold"]).item())
     selected = probability > threshold
+    distance_summary = None
     if selected.any():
         nearest = cKDTree(object_camera).query(hand_vertices[selected])[0] * 1000.0
-        print(
-            "HACO contact-to-GT-object nearest-vertex mm:",
-            {
-                "count": int(selected.sum()),
-                "median": float(np.median(nearest)),
-                "p90": float(np.percentile(nearest, 90)),
-                "min": float(nearest.min()),
-                "max": float(nearest.max()),
-            },
-        )
+        distance_summary = {
+            "count": int(selected.sum()),
+            "median": float(np.median(nearest)),
+            "p90": float(np.percentile(nearest, 90)),
+            "min": float(nearest.min()),
+            "max": float(nearest.max()),
+        }
+        print("HACO contact-to-GT-object nearest-vertex mm:", distance_summary)
     else:
         print("HACO selected no contact vertices")
-    print({
+    summary = {
         "frame": requested,
         "stream_id": str(trajectory["stream_id"].item()),
         "hand_side": str(query["hand_side"].item()),
         "v14_wrist_camera": wrist.tolist(),
         "haco_threshold": threshold,
         "haco_contact_vertices": int(selected.sum()),
+        "haco_probability": {
+            "mean": float(probability.mean()),
+            "median": float(np.median(probability)),
+            "p90": float(np.percentile(probability, 90)),
+            "max": float(probability.max()),
+        },
+        "contact_to_gt_object_nearest_vertex_mm": distance_summary,
         "normalized_left": normalized_left,
-    })
+        "trajectory_npz": str(Path(args.trajectory_npz).expanduser().resolve()),
+        "query_npz": str(Path(args.query_npz).expanduser().resolve()),
+        "contact_npz": str(Path(args.contact_npz).expanduser().resolve()),
+        "supervision_npz": str(Path(args.supervision_npz).expanduser().resolve()),
+        "object_mesh": str(Path(args.object_mesh).expanduser().resolve()),
+        "gt_hand_npz": (
+            str(Path(args.gt_hand_npz).expanduser().resolve())
+            if args.gt_hand_npz else None
+        ),
+    }
+    print(summary)
+    if args.summary_json:
+        summary_path = Path(args.summary_json).expanduser().resolve()
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = summary_path.with_suffix(summary_path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(summary, indent=2), encoding="utf-8"
+        )
+        temporary.replace(summary_path)
+        print(f"Summary: {summary_path}")
 
     server = viser.ViserServer(port=args.port)
     server.scene.set_up_direction("-y")
@@ -176,6 +238,14 @@ def main() -> None:
             color=(30, 215, 225),
             opacity=0.38,
         ))
+        if gt_hand is not None:
+            handles.append(server.scene.add_mesh_simple(
+                "/gt_dexycb_hand",
+                gt_hand[0],
+                gt_hand[1],
+                color=(55, 215, 95),
+                opacity=0.42,
+            ))
         active = probability > float(threshold_control.value)
         if active.any():
             strength = probability[active, None]
@@ -201,7 +271,10 @@ def main() -> None:
     point_size.on_update(redraw)
     redraw(None)
     print(f"Viewer: http://localhost:{args.port}")
-    print("Blue=V14 WiLoR hand, red=HACO contact, cyan=GT YCB object")
+    print(
+        "Blue=V14 WiLoR hand, red=HACO contact, "
+        "green=GT DexYCB hand, cyan=GT YCB object"
+    )
     while True:
         time.sleep(1.0)
 
