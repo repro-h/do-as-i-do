@@ -24,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-npz", required=True)
     parser.add_argument("--supervision-npz", required=True)
     parser.add_argument("--gt-hand-npz")
+    parser.add_argument("--refined-hand-npz")
     parser.add_argument("--object-mesh", required=True)
     parser.add_argument("--object-scale", type=float, default=1.0)
     parser.add_argument("--frame-id")
@@ -157,6 +158,21 @@ def main() -> None:
             str(query["hand_side"].item()),
             query_index,
         )
+    refined_hand = None
+    if args.refined_hand_npz:
+        refined_data = load_npz(
+            Path(args.refined_hand_npz).expanduser().resolve()
+        )
+        if frame_id(refined_data["frame_id"].item()) != requested:
+            raise ValueError("Refined hand frame does not match requested frame")
+        refined_hand = np.asarray(
+            refined_data["refined_hand_vertices_camera"], dtype=np.float32
+        )
+        if refined_hand.shape != hand_vertices.shape:
+            raise ValueError(
+                f"Refined hand shape mismatch: {refined_hand.shape} vs "
+                f"{hand_vertices.shape}"
+            )
 
     threshold = float(np.asarray(contact["contact_threshold"]).item())
     selected = probability > threshold
@@ -197,6 +213,10 @@ def main() -> None:
             str(Path(args.gt_hand_npz).expanduser().resolve())
             if args.gt_hand_npz else None
         ),
+        "refined_hand_npz": (
+            str(Path(args.refined_hand_npz).expanduser().resolve())
+            if args.refined_hand_npz else None
+        ),
     }
     print(summary)
     if args.summary_json:
@@ -231,6 +251,14 @@ def main() -> None:
             color=(70, 140, 245),
             opacity=0.46,
         ))
+        if refined_hand is not None:
+            handles.append(server.scene.add_mesh_simple(
+                "/chamfer_refined_hand",
+                refined_hand,
+                hand_faces,
+                color=(255, 165, 45),
+                opacity=0.52,
+            ))
         handles.append(server.scene.add_mesh_simple(
             "/gt_ycb_object",
             object_camera,
@@ -248,6 +276,9 @@ def main() -> None:
             ))
         active = probability > float(threshold_control.value)
         if active.any():
+            contact_vertices = (
+                refined_hand if refined_hand is not None else hand_vertices
+            )
             strength = probability[active, None]
             colors = np.concatenate((
                 np.full_like(strength, 255.0),
@@ -256,7 +287,7 @@ def main() -> None:
             ), axis=1).clip(0, 255).astype(np.uint8)
             handles.append(server.scene.add_point_cloud(
                 "/haco_contact",
-                points=hand_vertices[active],
+                points=contact_vertices[active],
                 colors=colors,
                 point_size=float(point_size.value),
             ))
@@ -273,7 +304,8 @@ def main() -> None:
     print(f"Viewer: http://localhost:{args.port}")
     print(
         "Blue=V14 WiLoR hand, red=HACO contact, "
-        "green=GT DexYCB hand, cyan=GT YCB object"
+        "orange=Chamfer refined hand, green=GT DexYCB hand, "
+        "cyan=GT YCB object"
     )
     while True:
         time.sleep(1.0)
