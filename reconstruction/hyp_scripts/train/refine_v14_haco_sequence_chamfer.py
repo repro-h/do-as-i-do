@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase-gated rigid sequence refinement with all HACO contact vertices."""
+"""Contact-satisfaction-gated rigid refinement with HACO contact vertices."""
 
 from __future__ import annotations
 
@@ -38,6 +38,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--softmax-sigma-mm", type=float, default=10.0)
     parser.add_argument("--contact-probability-power", type=float, default=2.0)
     parser.add_argument("--contact-weight-floor", type=float, default=0.05)
+    parser.add_argument("--contact-target-mm", type=float, default=6.0)
+    parser.add_argument("--correction-stop-mm", type=float, default=10.0)
+    parser.add_argument("--correction-full-mm", type=float, default=18.0)
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--frame-chunk", type=int, default=4)
@@ -100,6 +103,24 @@ def transform_batch(
     rotation = batched_euler_matrix(angles)
     centered = vertices - wrists[:, None]
     return torch.bmm(centered, rotation.transpose(1, 2)) + wrists[:, None] + translation[:, None]
+
+
+def correction_gate_from_contact_distance(
+    contact_median_mm: np.ndarray,
+    phase_gate: np.ndarray,
+    stop_mm: float,
+    full_mm: float,
+) -> np.ndarray:
+    if full_mm <= stop_mm:
+        raise ValueError("--correction-full-mm must exceed --correction-stop-mm")
+    normalized = np.clip(
+        (contact_median_mm - stop_mm) / (full_mm - stop_mm),
+        0.0,
+        1.0,
+    )
+    smooth = normalized * normalized * (3.0 - 2.0 * normalized)
+    smooth[~np.isfinite(smooth)] = 0.0
+    return (phase_gate * smooth).astype(np.float32)
 
 
 @torch.no_grad()
@@ -195,16 +216,13 @@ def main() -> None:
         contact["contact_mask"][contact_indices]
     ).astype(bool)
     gate_key = "oracle_contact_gate" if args.use_oracle_gate else "predicted_contact_gate"
-    gate_np = np.asarray(phase[gate_key][phase_indices], dtype=np.float32)
+    phase_gate_np = np.asarray(phase[gate_key][phase_indices], dtype=np.float32)
     valid_np = (
         np.asarray(trajectory["prediction_valid"][trajectory_indices]).astype(bool)
         & np.asarray(query["model_valid"]).astype(bool)
         & np.asarray(contact["contact_valid"][contact_indices]).astype(bool)
     )
-    gate_np *= valid_np.astype(np.float32)
-    active_indices_np = np.flatnonzero(gate_np > 0)
-    if len(active_indices_np) == 0:
-        raise RuntimeError(f"{gate_key} selected no frames")
+    phase_gate_np *= valid_np.astype(np.float32)
 
     mesh = load_mesh(Path(args.object_mesh).expanduser().resolve(), args.object_scale)
     local_points_np, local_normals_np = deterministic_surface_samples(
@@ -233,20 +251,17 @@ def main() -> None:
     object_normals = torch.from_numpy(object_normals_np).to(device)
     contact_mask = torch.from_numpy(contact_mask_np).to(device)
     probability = torch.from_numpy(probability_np).to(device)
-    gate = torch.from_numpy(gate_np).to(device)
-    active_indices = torch.from_numpy(active_indices_np).to(device)
+    phase_gate = torch.from_numpy(phase_gate_np).to(device)
     threshold = float(np.asarray(contact["contact_threshold"]).item())
     confidence = torch.clamp(
         (probability - threshold) / max(1.0 - threshold, 1e-6),
         min=0.0,
         max=1.0,
     ).pow(args.contact_probability_power)
-    contact_weight = (
+    base_contact_weight = (
         args.contact_weight_floor
         + (1.0 - args.contact_weight_floor) * confidence
     ) * contact_mask
-    contact_weight = contact_weight * gate[:, None]
-    total_contact_weight = contact_weight.sum().clamp_min(1e-6)
 
     translation = torch.zeros(
         (frame_count, 3), device=device, requires_grad=True
@@ -263,17 +278,34 @@ def main() -> None:
     history = []
 
     initial_metrics, initial_per_frame = audit_geometry(
-        vertices, contact_mask, object_points, object_normals, gate,
+        vertices, contact_mask, object_points, object_normals, phase_gate,
         args.penetration_tolerance_mm, args.penetration_trust_mm,
         args.frame_chunk,
     )
+    correction_gate_np = correction_gate_from_contact_distance(
+        initial_per_frame["contact_distance_median_mm"],
+        phase_gate_np,
+        args.correction_stop_mm,
+        args.correction_full_mm,
+    )
+    active_indices_np = np.flatnonzero(correction_gate_np > 0)
+    if len(active_indices_np) == 0:
+        raise RuntimeError("Contact-satisfaction gate selected no frames")
+    correction_gate = torch.from_numpy(correction_gate_np).to(device)
+    active_indices = torch.from_numpy(active_indices_np).to(device)
+    contact_weight = base_contact_weight * correction_gate[:, None]
+    total_contact_weight = contact_weight.sum().clamp_min(1e-6)
+    contact_target = args.contact_target_mm / 1000.0
+
     for step in range(1, args.steps + 1):
         optimizer.zero_grad(set_to_none=True)
         contact_value = 0.0
         for start in range(0, len(active_indices_np), args.frame_chunk):
             frame_indices = active_indices[start:start + args.frame_chunk]
-            effective_translation = translation[frame_indices] * gate[frame_indices, None]
-            effective_angles = angles[frame_indices] * gate[frame_indices, None]
+            effective_translation = (
+                translation[frame_indices] * correction_gate[frame_indices, None]
+            )
+            effective_angles = angles[frame_indices] * correction_gate[frame_indices, None]
             refined = transform_batch(
                 vertices[frame_indices], wrists[frame_indices],
                 effective_translation, effective_angles,
@@ -283,16 +315,21 @@ def main() -> None:
             soft_weight = torch.softmax(
                 -nearest.square() / (2.0 * sigma * sigma), dim=-1
             )
-            error = (soft_weight * nearest.square()).sum(dim=-1)
+            effective_distance = torch.sqrt(
+                (soft_weight * nearest.square()).sum(dim=-1) + 1e-12
+            )
+            error = torch.clamp(
+                effective_distance - contact_target, min=0.0
+            ).square()
             chunk_loss = (
                 error * contact_weight[frame_indices]
             ).sum() / total_contact_weight
             chunk_loss.backward()
             contact_value += float(chunk_loss.detach())
 
-        effective_translation = translation * gate[:, None]
-        effective_angles = angles * gate[:, None]
-        active = gate > 0
+        effective_translation = translation * correction_gate[:, None]
+        effective_angles = angles * correction_gate[:, None]
+        active = correction_gate > 0
         translation_anchor = effective_translation[active].square().sum(dim=-1).mean()
         rotation_anchor = effective_angles[active].square().sum(dim=-1).mean()
         translation_velocity = (
@@ -323,8 +360,8 @@ def main() -> None:
             rotation_norm = angles.norm(dim=-1, keepdim=True).clamp_min(1e-12)
             translation.mul_(torch.clamp(max_translation / translation_norm, max=1.0))
             angles.mul_(torch.clamp(max_angle / rotation_norm, max=1.0))
-            translation[gate == 0] = 0
-            angles[gate == 0] = 0
+            translation[correction_gate == 0] = 0
+            angles[correction_gate == 0] = 0
         if step == 1 or step % 25 == 0 or step == args.steps:
             row = {
                 "step": step,
@@ -344,13 +381,13 @@ def main() -> None:
             history.append(row)
             print(row)
 
-    effective_translation = best_translation * gate[:, None]
-    effective_angles = best_angles * gate[:, None]
+    effective_translation = best_translation * correction_gate[:, None]
+    effective_angles = best_angles * correction_gate[:, None]
     refined = transform_batch(
         vertices, wrists, effective_translation, effective_angles
     ).detach()
     refined_metrics, refined_per_frame = audit_geometry(
-        refined, contact_mask, object_points, object_normals, gate,
+        refined, contact_mask, object_points, object_normals, phase_gate,
         args.penetration_tolerance_mm, args.penetration_trust_mm,
         args.frame_chunk,
     )
@@ -381,21 +418,27 @@ def main() -> None:
         }
 
     summary = {
-        "method": "phase_gated_all_haco_one_way_soft_topk_chamfer_sequence_v1",
+        "method": "contact_satisfied_all_haco_one_way_soft_topk_chamfer_sequence_v2",
         "stream_id": str(query["stream_id"].item()),
         "frames": frame_count,
         "gate_source": gate_key,
-        "active_frames": int((gate_np > 0).sum()),
+        "active_frames": int((correction_gate_np > 0).sum()),
+        "phase_active_frames": int((phase_gate_np > 0).sum()),
+        "correction_active_frames": int((correction_gate_np > 0).sum()),
+        "contact_target_mm": args.contact_target_mm,
+        "correction_stop_mm": args.correction_stop_mm,
+        "correction_full_mm": args.correction_full_mm,
+        "correction_gate": distribution(correction_gate_np[phase_gate_np > 0]),
         "initial": initial_metrics,
         "refined": refined_metrics,
         "translation_norm_mm": distribution(
             np.linalg.norm(
-                effective_translation.cpu().numpy()[gate_np > 0], axis=-1
+                effective_translation.cpu().numpy()[correction_gate_np > 0], axis=-1
             ) * 1000.0
         ),
         "rotation_norm_deg": distribution(
             np.linalg.norm(
-                effective_angles.cpu().numpy()[gate_np > 0], axis=-1
+                effective_angles.cpu().numpy()[correction_gate_np > 0], axis=-1
             )
             * 180.0 / math.pi
         ),
@@ -411,7 +454,8 @@ def main() -> None:
         "mano_faces": faces,
         "contact_mask": contact_mask_np,
         "contact_probability": probability_np.astype(np.float16),
-        "contact_gate": gate_np,
+        "contact_gate": phase_gate_np,
+        "correction_gate": correction_gate_np,
         "translation_camera": effective_translation.cpu().numpy().astype(np.float32),
         "rotation_euler_xyz": effective_angles.cpu().numpy().astype(np.float32),
         "initial_contact_distance_median_mm": initial_per_frame["contact_distance_median_mm"],
