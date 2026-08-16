@@ -329,8 +329,16 @@ def main() -> None:
         total.backward()
         optimizer.step()
         with torch.no_grad():
-            translation.clamp_(-max_translation, max_translation)
-            angles.clamp_(-max_angle, max_angle)
+            translation_scale = torch.clamp(
+                max_translation / translation.norm().clamp_min(1e-12),
+                max=1.0,
+            )
+            rotation_scale = torch.clamp(
+                max_angle / angles.norm().clamp_min(1e-12),
+                max=1.0,
+            )
+            translation.mul_(translation_scale)
+            angles.mul_(rotation_scale)
         if step == 1 or step % 25 == 0 or step == args.steps:
             row = {
                 "step": step,
