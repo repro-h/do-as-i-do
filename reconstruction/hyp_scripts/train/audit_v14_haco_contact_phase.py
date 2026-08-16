@@ -165,8 +165,10 @@ def ramped_gate(mask: np.ndarray, width: int) -> np.ndarray:
         ramp = min(width, max(0, length // 2))
         for offset in range(ramp):
             value = float(offset + 1) / float(ramp + 1)
-            gate[start + offset] = min(gate[start + offset], value)
-            gate[end - offset] = min(gate[end - offset], value)
+            if start > 0:
+                gate[start + offset] = min(gate[start + offset], value)
+            if end < len(mask) - 1:
+                gate[end - offset] = min(gate[end - offset], value)
     return gate
 
 

@@ -163,11 +163,18 @@ def main() -> None:
         refined_data = load_npz(
             Path(args.refined_hand_npz).expanduser().resolve()
         )
-        if frame_id(refined_data["frame_id"].item()) != requested:
-            raise ValueError("Refined hand frame does not match requested frame")
-        refined_hand = np.asarray(
-            refined_data["refined_hand_vertices_camera"], dtype=np.float32
-        )
+        if "frame_ids" in refined_data:
+            refined_index = index_for(refined_data["frame_ids"], requested)
+            refined_hand = np.asarray(
+                refined_data["refined_hand_vertices_camera"][refined_index],
+                dtype=np.float32,
+            )
+        else:
+            if frame_id(refined_data["frame_id"].item()) != requested:
+                raise ValueError("Refined hand frame does not match requested frame")
+            refined_hand = np.asarray(
+                refined_data["refined_hand_vertices_camera"], dtype=np.float32
+            )
         if refined_hand.shape != hand_vertices.shape:
             raise ValueError(
                 f"Refined hand shape mismatch: {refined_hand.shape} vs "
