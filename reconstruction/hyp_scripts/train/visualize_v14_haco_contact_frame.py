@@ -112,8 +112,16 @@ def main() -> None:
     trajectory_index = index_for(trajectory["frame_ids"], requested)
     query_index = index_for(query["frame_ids"], requested)
     supervision_index = index_for(supervision["frame_ids"], requested)
-    if frame_id(contact["frame_id"].item()) != requested:
-        raise ValueError("HACO contact frame does not match requested frame")
+    if "frame_ids" in contact:
+        contact_index = index_for(contact["frame_ids"], requested)
+        if "contact_valid" in contact and not bool(
+            contact["contact_valid"][contact_index]
+        ):
+            raise RuntimeError(f"HACO contact is invalid for frame {requested}")
+    else:
+        contact_index = None
+        if frame_id(contact["frame_id"].item()) != requested:
+            raise ValueError("HACO contact frame does not match requested frame")
     if "vertices_3d_root_relative_original" not in query:
         raise KeyError(
             "WiLoR cache lacks root-relative vertices; re-export this stream "
@@ -131,7 +139,14 @@ def main() -> None:
         dtype=np.float32,
     ) + wrist[None]
     hand_faces = np.asarray(query["mano_faces"], dtype=np.int64)
-    probability = np.asarray(contact["contact_probability"], dtype=np.float32)
+    probability_all = np.asarray(
+        contact["contact_probability"], dtype=np.float32
+    )
+    probability = (
+        probability_all[contact_index]
+        if contact_index is not None
+        else probability_all
+    )
     if len(probability) != len(hand_vertices):
         raise ValueError(
             f"Contact/mesh mismatch: {len(probability)} vs {len(hand_vertices)}"
