@@ -315,12 +315,12 @@ def main() -> None:
         index: int, active: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
         object_distance, geodesic, seeds = filter_geometry(index)
-        normalized_probability = np.clip(
+        normalized_probability = np.square(np.clip(
             (probability[index] - float(threshold_slider.value))
             / max(1.0 - float(threshold_slider.value), 1e-6),
             0.0,
             1.0,
-        ).square()
+        ))
         object_gate = np.exp(-np.square(
             object_distance / (args.object_distance_sigma_mm / 1000.0)
         ))
