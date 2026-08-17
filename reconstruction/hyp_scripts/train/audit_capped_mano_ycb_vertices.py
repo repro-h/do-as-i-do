@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import torch
 import trimesh
 
 from refine_v14_haco_one_way_chamfer import (
@@ -49,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--point-chunk", type=int, default=256)
     parser.add_argument("--ray-count", type=int, choices=(1, 3), default=3)
     parser.add_argument("--broadphase-padding-mm", type=float, default=0.1)
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--visualize-frame")
     parser.add_argument("--port", type=int, default=8098)
     return parser.parse_args()
@@ -105,22 +107,79 @@ def ray_parity(
     return result
 
 
+def ray_parity_torch(
+    points: np.ndarray,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    direction: np.ndarray,
+    chunk_size: int,
+    device: torch.device,
+) -> np.ndarray:
+    mesh_vertices = torch.as_tensor(
+        vertices, dtype=torch.float32, device=device
+    )
+    mesh_faces = torch.as_tensor(faces, dtype=torch.long, device=device)
+    triangles = mesh_vertices[mesh_faces]
+    vertex0 = triangles[:, 0]
+    edge1 = triangles[:, 1] - vertex0
+    edge2 = triangles[:, 2] - vertex0
+    ray = torch.as_tensor(direction, dtype=torch.float32, device=device)
+    h = torch.cross(ray[None].expand_as(edge2), edge2, dim=-1)
+    determinant = torch.einsum("ti,ti->t", edge1, h)
+    usable = determinant.abs() > 1e-8
+    inverse = torch.where(
+        usable, determinant.reciprocal(), torch.zeros_like(determinant)
+    )
+    query = torch.as_tensor(points, dtype=torch.float32, device=device)
+    result = torch.zeros(len(points), dtype=torch.bool, device=device)
+    epsilon = 1e-7
+
+    for start in range(0, len(points), chunk_size):
+        end = min(start + chunk_size, len(points))
+        offset = query[start:end, None, :] - vertex0[None]
+        barycentric_u = torch.einsum("pti,ti->pt", offset, h) * inverse[None]
+        q = torch.cross(offset, edge1[None].expand_as(offset), dim=-1)
+        barycentric_v = torch.einsum("i,pti->pt", ray, q) * inverse[None]
+        distance = torch.einsum("ti,pti->pt", edge2, q) * inverse[None]
+        hit = (
+            usable[None]
+            & (barycentric_u >= -epsilon)
+            & (barycentric_v >= -epsilon)
+            & (barycentric_u + barycentric_v <= 1.0 + epsilon)
+            & (distance > epsilon)
+        )
+        result[start:end] = (hit.sum(dim=1) % 2) == 1
+    return result.cpu().numpy()
+
+
 def contains_points_vote(
     points: np.ndarray,
     vertices: np.ndarray,
     faces: np.ndarray,
     chunk_size: int,
     ray_count: int = 3,
+    device: torch.device | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    triangles = np.asarray(vertices, dtype=np.float64)[faces]
     directions = RAY_DIRECTIONS[:ray_count]
-    votes = np.stack(
-        [
-            ray_parity(points, triangles, direction, chunk_size)
-            for direction in directions
-        ],
-        axis=0,
-    )
+    if device is not None and device.type == "cuda":
+        votes = np.stack(
+            [
+                ray_parity_torch(
+                    points, vertices, faces, direction, chunk_size, device
+                )
+                for direction in directions
+            ],
+            axis=0,
+        )
+    else:
+        triangles = np.asarray(vertices, dtype=np.float64)[faces]
+        votes = np.stack(
+            [
+                ray_parity(points, triangles, direction, chunk_size)
+                for direction in directions
+            ],
+            axis=0,
+        )
     return votes.sum(axis=0) >= (ray_count // 2 + 1), votes
 
 
@@ -135,6 +194,9 @@ def main() -> None:
     args = parse_args()
     if args.point_chunk <= 0:
         raise ValueError("--point-chunk must be positive")
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--device cuda requested but CUDA is unavailable")
 
     hand = load_npz(Path(args.hand_npz).expanduser().resolve())
     supervision = load_npz(Path(args.supervision_npz).expanduser().resolve())
@@ -225,6 +287,7 @@ def main() -> None:
                 capped_faces,
                 args.point_chunk,
                 args.ray_count,
+                device,
             )
             contained[candidate_indices] = candidate_inside
             vote_count[candidate_indices] = candidate_votes.sum(
@@ -258,6 +321,7 @@ def main() -> None:
         "object_faces": int(len(object_faces)),
         "mano_boundary_vertices": int(len(boundary)),
         "ray_directions": int(args.ray_count),
+        "ray_backend": device.type,
         "broadphase_padding_mm": float(args.broadphase_padding_mm),
         "broadphase_candidates_per_frame": distribution(valid_broadphase),
         "inside_vertices_per_frame": distribution(valid_counts),
