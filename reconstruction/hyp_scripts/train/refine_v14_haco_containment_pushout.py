@@ -87,6 +87,9 @@ def parse_args() -> argparse.Namespace:
         "--adaptive-collision-max-scale", type=float, default=4.0
     )
     parser.add_argument("--adaptive-gate-ema", type=float, default=0.8)
+    parser.add_argument(
+        "--adaptive-reset-optimizer-on-refresh", action="store_true"
+    )
     parser.add_argument("--max-joint-delta-deg", type=float, default=4.0)
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--lr", type=float, default=3e-3)
@@ -655,6 +658,8 @@ def main() -> None:
                         args.frame_chunk,
                     )
                 )
+                if args.adaptive_reset_optimizer_on_refresh:
+                    optimizer.state.clear()
         optimizer.zero_grad(set_to_none=True)
         contact_value = 0.0
         collision_value = 0.0
@@ -783,11 +788,11 @@ def main() -> None:
                     frame_collision_scale[active].median().cpu()
                 ),
                 "joint_delta_median_deg": float(
-                    best_delta[active].norm(dim=-1).median().cpu()
+                    delta.detach()[active].norm(dim=-1).median().cpu()
                     * 180.0 / math.pi
                 ),
                 "joint_delta_max_deg": float(
-                    best_delta[active].norm(dim=-1).max().cpu()
+                    delta.detach()[active].norm(dim=-1).max().cpu()
                     * 180.0 / math.pi
                 ),
             }
@@ -925,6 +930,9 @@ def main() -> None:
             "collision_min_scale": args.adaptive_collision_min_scale,
             "collision_max_scale": args.adaptive_collision_max_scale,
             "gate_ema": args.adaptive_gate_ema,
+            "reset_optimizer_on_refresh": (
+                args.adaptive_reset_optimizer_on_refresh
+            ),
             "final_contact_gate": distribution(
                 adaptive_gate.cpu().numpy()[optimization_gate_np]
             ),

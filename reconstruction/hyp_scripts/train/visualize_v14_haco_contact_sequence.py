@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import heapq
 import threading
 import time
 from pathlib import Path
@@ -27,6 +28,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gt-hand-npz", required=True)
     parser.add_argument("--object-mesh", required=True)
     parser.add_argument("--object-scale", type=float, default=1.0)
+    parser.add_argument("--filtered-contact-topk", type=int, default=64)
+    parser.add_argument("--filtered-min-weight", type=float, default=0.05)
+    parser.add_argument("--object-distance-sigma-mm", type=float, default=8.0)
+    parser.add_argument("--collision-geodesic-sigma-mm", type=float, default=15.0)
+    parser.add_argument("--inside-low-fraction", type=float, default=0.01)
+    parser.add_argument("--inside-high-fraction", type=float, default=0.02)
     parser.add_argument("--initial-frame", type=int, default=0)
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--port", type=int, default=8098)
@@ -52,8 +59,76 @@ def load_mesh(path: Path, scale: float) -> tuple[np.ndarray, np.ndarray]:
     )
 
 
+def mesh_edges(faces: np.ndarray) -> np.ndarray:
+    edges = np.concatenate(
+        (faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]), axis=0
+    )
+    edges.sort(axis=1)
+    return np.unique(edges, axis=0)
+
+
+def nearest_distances(
+    query: np.ndarray, reference: np.ndarray, chunk: int = 128
+) -> tuple[np.ndarray, np.ndarray]:
+    distances = np.empty(len(query), dtype=np.float32)
+    indices = np.empty(len(query), dtype=np.int64)
+    for start in range(0, len(query), chunk):
+        end = min(start + chunk, len(query))
+        pairwise = np.linalg.norm(
+            query[start:end, None] - reference[None], axis=-1
+        )
+        selected = pairwise.argmin(axis=1)
+        indices[start:end] = selected
+        distances[start:end] = pairwise[
+            np.arange(end - start), selected
+        ]
+    return distances, indices
+
+
+def multisource_geodesic(
+    vertices: np.ndarray, edges: np.ndarray, seeds: np.ndarray
+) -> np.ndarray:
+    adjacency: list[list[tuple[int, float]]] = [
+        [] for _ in range(len(vertices))
+    ]
+    for first, second in edges:
+        weight = float(np.linalg.norm(vertices[first] - vertices[second]))
+        adjacency[int(first)].append((int(second), weight))
+        adjacency[int(second)].append((int(first), weight))
+    distance = np.full(len(vertices), np.inf, dtype=np.float32)
+    queue: list[tuple[float, int]] = []
+    for seed in np.unique(seeds):
+        distance[int(seed)] = 0.0
+        heapq.heappush(queue, (0.0, int(seed)))
+    while queue:
+        current, vertex = heapq.heappop(queue)
+        if current > float(distance[vertex]):
+            continue
+        for neighbor, edge_length in adjacency[vertex]:
+            candidate = current + edge_length
+            if candidate < float(distance[neighbor]):
+                distance[neighbor] = candidate
+                heapq.heappush(queue, (candidate, neighbor))
+    return distance
+
+
+def smooth_contact_gate(
+    inside_fraction: float, low: float, high: float
+) -> float:
+    if not 0.0 <= low < high:
+        raise ValueError("Inside thresholds must satisfy 0 <= low < high")
+    gate = np.clip((high - inside_fraction) / (high - low), 0.0, 1.0)
+    return float(gate * gate * (3.0 - 2.0 * gate))
+
+
 def main() -> None:
     args = parse_args()
+    if args.filtered_contact_topk <= 0:
+        raise ValueError("--filtered-contact-topk must be positive")
+    if args.object_distance_sigma_mm <= 0:
+        raise ValueError("--object-distance-sigma-mm must be positive")
+    if args.collision_geodesic_sigma_mm <= 0:
+        raise ValueError("--collision-geodesic-sigma-mm must be positive")
     trajectory = load_npz(Path(args.trajectory_npz).expanduser().resolve())
     query = load_npz(Path(args.query_npz).expanduser().resolve())
     contact = load_npz(Path(args.contact_sequence_npz).expanduser().resolve())
@@ -97,6 +172,11 @@ def main() -> None:
         contact["contact_probability"][contact_indices], dtype=np.float32
     )
     threshold = float(np.asarray(contact["contact_threshold"]).item())
+    haco_mask = (
+        np.asarray(contact["contact_mask"][contact_indices]).astype(bool)
+        if "contact_mask" in contact
+        else probability > threshold
+    )
 
     side = str(query["hand_side"].item()).lower()
     gt_vertices = np.asarray(gt[f"{side}_vertices"], dtype=np.float32)[:count]
@@ -135,6 +215,7 @@ def main() -> None:
         stage2_inside.sum(axis=1)
         if stage2_inside is not None else np.zeros(count, dtype=np.int32)
     )
+    hand_edges = mesh_edges(hand_faces)
     valid = (
         np.asarray(query["model_valid"]).astype(bool)
         & np.asarray(trajectory["prediction_valid"][trajectory_indices]).astype(bool)
@@ -169,7 +250,13 @@ def main() -> None:
         ),
         "gt": server.gui.add_checkbox("DexYCB GT hand", initial_value=True),
         "stage2_contact": server.gui.add_checkbox(
-            "HACO contacts on refined hand", initial_value=True
+            "Raw HACO contacts", initial_value=False
+        ),
+        "filtered_contact": server.gui.add_checkbox(
+            "Filtered Stage1 contacts", initial_value=True
+        ),
+        "collision_seeds": server.gui.add_checkbox(
+            "Collision seed MANO vertices", initial_value=True
         ),
         "gt_contact": server.gui.add_checkbox(
             "HACO vertex indices on GT", initial_value=False
@@ -186,6 +273,7 @@ def main() -> None:
     handles = []
     playing = {"value": False}
     suppress = {"value": False}
+    filter_geometry_cache: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
     def clear() -> None:
         while handles:
@@ -201,6 +289,68 @@ def main() -> None:
         handles.append(server.scene.add_mesh_simple(
             name, vertices=vertices, faces=faces, color=color, opacity=opacity
         ))
+
+    def filter_geometry(index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        cached = filter_geometry_cache.get(index)
+        if cached is not None:
+            return cached
+        object_distance, _ = nearest_distances(
+            stage1_vertices[index], object_vertices[index]
+        )
+        contained = object_vertices[index, stage1_inside[index]]
+        if len(contained):
+            _, seeds = nearest_distances(contained, stage1_vertices[index])
+            seeds = np.unique(seeds)
+            geodesic = multisource_geodesic(
+                stage1_vertices[index], hand_edges, seeds
+            )
+        else:
+            seeds = np.empty(0, dtype=np.int64)
+            geodesic = np.full(len(stage1_vertices[index]), np.inf, dtype=np.float32)
+        cached = (object_distance, geodesic, seeds)
+        filter_geometry_cache[index] = cached
+        return cached
+
+    def filtered_contacts(
+        index: int, active: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        object_distance, geodesic, seeds = filter_geometry(index)
+        normalized_probability = np.clip(
+            (probability[index] - float(threshold_slider.value))
+            / max(1.0 - float(threshold_slider.value), 1e-6),
+            0.0,
+            1.0,
+        ).square()
+        object_gate = np.exp(-np.square(
+            object_distance / (args.object_distance_sigma_mm / 1000.0)
+        ))
+        inside_fraction = float(stage1_inside_count[index]) / max(
+            len(object_vertices[index]), 1
+        )
+        contact_gate = smooth_contact_gate(
+            inside_fraction,
+            args.inside_low_fraction,
+            args.inside_high_fraction,
+        )
+        collision_priority = 1.0 - contact_gate
+        if len(seeds):
+            collision_gate = np.exp(-np.square(
+                geodesic / (args.collision_geodesic_sigma_mm / 1000.0)
+            ))
+        else:
+            collision_gate = np.ones_like(object_gate)
+        region_gate = (
+            1.0 - collision_priority
+            + collision_priority * (0.05 + 0.95 * collision_gate)
+        )
+        weight = normalized_probability * object_gate * region_gate
+        selected = np.flatnonzero(
+            active & (weight >= args.filtered_min_weight)
+        )
+        if len(selected) > args.filtered_contact_topk:
+            order = np.argsort(weight[selected])[-args.filtered_contact_topk:]
+            selected = selected[order]
+        return selected, weight, seeds, contact_gate
 
     def show_frame(value: int) -> None:
         index = max(0, min(count - 1, int(value)))
@@ -235,7 +385,13 @@ def main() -> None:
                 (50, 215, 90), 0.38,
             )
 
-        active = probability[index] > float(threshold_slider.value)
+        active = (
+            haco_mask[index]
+            & (probability[index] > float(threshold_slider.value))
+        )
+        selected, filtered_weight, collision_seeds, adaptive_gate = (
+            filtered_contacts(index, active)
+        )
         if active.any():
             strength = probability[index, active, None]
             contact_colors = np.concatenate((
@@ -265,6 +421,29 @@ def main() -> None:
                     ),
                     point_size=float(point_size.value),
                 ))
+        if controls["filtered_contact"].value and len(selected):
+            strength = filtered_weight[selected, None]
+            filtered_colors = np.concatenate((
+                70.0 * (1.0 - strength),
+                np.full_like(strength, 255.0),
+                210.0 * (1.0 - strength),
+            ), axis=1).clip(0, 255).astype(np.uint8)
+            handles.append(server.scene.add_point_cloud(
+                "/filtered_stage1_contacts",
+                points=stage1_vertices[index, selected],
+                colors=filtered_colors,
+                point_size=float(point_size.value) * 1.25,
+            ))
+        if controls["collision_seeds"].value and len(collision_seeds):
+            handles.append(server.scene.add_point_cloud(
+                "/collision_seed_mano_vertices",
+                points=stage1_vertices[index, collision_seeds],
+                colors=np.tile(
+                    np.asarray([[40, 80, 255]], dtype=np.uint8),
+                    (len(collision_seeds), 1),
+                ),
+                point_size=float(point_size.value) * 0.8,
+            ))
         if controls["stage1_inside"].value and stage1_inside[index].any():
             selected = object_vertices[index, stage1_inside[index]]
             handles.append(server.scene.add_point_cloud(
@@ -294,6 +473,8 @@ def main() -> None:
         print(
             f"frame={frame_id(ids[index])} index={index} "
             f"haco={int(active.sum())} "
+            f"filtered={len(selected)} "
+            f"contact_gate={adaptive_gate:.3f} "
             f"stage1_inside={int(stage1_inside_count[index])} "
             f"stage2_inside={int(stage2_inside_count[index])} "
             f"gt_valid={bool(gt_valid[index])}",
@@ -331,7 +512,8 @@ def main() -> None:
     print(f"Viewer: http://localhost:{args.port}")
     print(
         "Blue=V14, orange=Stage1, magenta=Stage2, green=GT hand, "
-        "cyan=GT YCB, warm=HACO contacts, red=contained YCB vertices"
+        "cyan=GT YCB, warm=raw HACO, bright green=filtered contacts, "
+        "blue points=collision seeds, red=contained YCB vertices"
     )
     print("Press Ctrl+C to stop")
     while True:
