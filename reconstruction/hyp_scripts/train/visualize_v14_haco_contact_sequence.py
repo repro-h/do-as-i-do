@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-npz", required=True)
     parser.add_argument("--contact-sequence-npz", required=True)
     parser.add_argument("--stage1-npz", required=True)
-    parser.add_argument("--stage2-npz", required=True)
+    parser.add_argument("--stage2-npz")
     parser.add_argument("--supervision-npz", required=True)
     parser.add_argument("--gt-hand-npz", required=True)
     parser.add_argument("--object-mesh", required=True)
@@ -58,7 +58,10 @@ def main() -> None:
     query = load_npz(Path(args.query_npz).expanduser().resolve())
     contact = load_npz(Path(args.contact_sequence_npz).expanduser().resolve())
     stage1 = load_npz(Path(args.stage1_npz).expanduser().resolve())
-    stage2 = load_npz(Path(args.stage2_npz).expanduser().resolve())
+    stage2 = (
+        load_npz(Path(args.stage2_npz).expanduser().resolve())
+        if args.stage2_npz else None
+    )
     supervision = load_npz(Path(args.supervision_npz).expanduser().resolve())
     gt = load_npz(Path(args.gt_hand_npz).expanduser().resolve())
 
@@ -67,7 +70,10 @@ def main() -> None:
     trajectory_indices = aligned_indices(trajectory["frame_ids"], ids)
     contact_indices = aligned_indices(contact["frame_ids"], ids)
     stage1_indices = aligned_indices(stage1["frame_ids"], ids)
-    stage2_indices = aligned_indices(stage2["frame_ids"], ids)
+    stage2_indices = (
+        aligned_indices(stage2["frame_ids"], ids)
+        if stage2 is not None else None
+    )
     supervision_indices = aligned_indices(supervision["frame_ids"], ids)
 
     wrist = np.asarray(
@@ -79,8 +85,12 @@ def main() -> None:
     stage1_vertices = np.asarray(
         stage1["refined_hand_vertices_camera"][stage1_indices], dtype=np.float32
     )
-    stage2_vertices = np.asarray(
-        stage2["refined_hand_vertices_camera"][stage2_indices], dtype=np.float32
+    stage2_vertices = (
+        np.asarray(
+            stage2["refined_hand_vertices_camera"][stage2_indices],
+            dtype=np.float32,
+        )
+        if stage2 is not None and stage2_indices is not None else None
     )
     hand_faces = np.asarray(query["mano_faces"], dtype=np.int64)
     probability = np.asarray(
@@ -114,11 +124,17 @@ def main() -> None:
     stage1_inside = np.asarray(
         stage1["refined_object_vertex_inside_capped_mano"][stage1_indices]
     ).astype(bool)
-    stage2_inside = np.asarray(
-        stage2["refined_object_vertex_inside_capped_mano"][stage2_indices]
-    ).astype(bool)
+    stage2_inside = (
+        np.asarray(
+            stage2["refined_object_vertex_inside_capped_mano"][stage2_indices]
+        ).astype(bool)
+        if stage2 is not None and stage2_indices is not None else None
+    )
     stage1_inside_count = stage1_inside.sum(axis=1)
-    stage2_inside_count = stage2_inside.sum(axis=1)
+    stage2_inside_count = (
+        stage2_inside.sum(axis=1)
+        if stage2_inside is not None else np.zeros(count, dtype=np.int32)
+    )
     valid = (
         np.asarray(query["model_valid"]).astype(bool)
         & np.asarray(trajectory["prediction_valid"][trajectory_indices]).astype(bool)
@@ -145,20 +161,26 @@ def main() -> None:
     controls = {
         "object": server.gui.add_checkbox("GT YCB object", initial_value=True),
         "v14": server.gui.add_checkbox("V14 WiLoR hand", initial_value=False),
-        "stage1": server.gui.add_checkbox("Stage1 rigid hand", initial_value=False),
-        "stage2": server.gui.add_checkbox("Stage2 local hand", initial_value=True),
+        "stage1": server.gui.add_checkbox(
+            "Stage1 rigid hand", initial_value=stage2_vertices is None
+        ),
+        "stage2": server.gui.add_checkbox(
+            "Stage2 local hand", initial_value=stage2_vertices is not None
+        ),
         "gt": server.gui.add_checkbox("DexYCB GT hand", initial_value=True),
         "stage2_contact": server.gui.add_checkbox(
-            "HACO contacts on Stage2", initial_value=True
+            "HACO contacts on refined hand", initial_value=True
         ),
         "gt_contact": server.gui.add_checkbox(
             "HACO vertex indices on GT", initial_value=False
         ),
         "stage1_inside": server.gui.add_checkbox(
-            "Stage1 contained YCB vertices", initial_value=False
+            "Stage1 contained YCB vertices",
+            initial_value=stage2_inside is None,
         ),
         "stage2_inside": server.gui.add_checkbox(
-            "Stage2 contained YCB vertices", initial_value=True
+            "Stage2 contained YCB vertices",
+            initial_value=stage2_inside is not None,
         ),
     }
     handles = []
@@ -198,7 +220,11 @@ def main() -> None:
                 "/stage1_rigid_hand", stage1_vertices[index], hand_faces,
                 (245, 155, 35), 0.40,
             )
-        if controls["stage2"].value and valid[index]:
+        if (
+            controls["stage2"].value
+            and stage2_vertices is not None
+            and valid[index]
+        ):
             add_hand(
                 "/stage2_local_hand", stage2_vertices[index], hand_faces,
                 (220, 65, 190), 0.48,
@@ -218,9 +244,14 @@ def main() -> None:
                 30.0 * (1.0 - strength),
             ), axis=1).clip(0, 255).astype(np.uint8)
             if controls["stage2_contact"].value:
+                contact_vertices = (
+                    stage2_vertices[index]
+                    if stage2_vertices is not None
+                    else stage1_vertices[index]
+                )
                 handles.append(server.scene.add_point_cloud(
-                    "/stage2_haco_contacts",
-                    points=stage2_vertices[index, active],
+                    "/refined_haco_contacts",
+                    points=contact_vertices[active],
                     colors=contact_colors,
                     point_size=float(point_size.value),
                 ))
@@ -245,7 +276,11 @@ def main() -> None:
                 ),
                 point_size=float(point_size.value) * 0.8,
             ))
-        if controls["stage2_inside"].value and stage2_inside[index].any():
+        if (
+            controls["stage2_inside"].value
+            and stage2_inside is not None
+            and stage2_inside[index].any()
+        ):
             selected = object_vertices[index, stage2_inside[index]]
             handles.append(server.scene.add_point_cloud(
                 "/stage2_contained_object_vertices",
