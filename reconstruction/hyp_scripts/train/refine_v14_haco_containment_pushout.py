@@ -71,6 +71,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-pose-anchor", type=float, default=5e-4)
     parser.add_argument("--w-pose-velocity", type=float, default=1e-3)
     parser.add_argument("--w-pose-acceleration", type=float, default=2e-3)
+    parser.add_argument("--adaptive-balance", action="store_true")
+    parser.add_argument("--adaptive-refresh-steps", type=int, default=10)
+    parser.add_argument(
+        "--adaptive-inside-low-fraction", type=float, default=0.0025
+    )
+    parser.add_argument(
+        "--adaptive-inside-high-fraction", type=float, default=0.01
+    )
+    parser.add_argument("--adaptive-contact-floor", type=float, default=0.2)
+    parser.add_argument(
+        "--adaptive-collision-min-scale", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--adaptive-collision-max-scale", type=float, default=4.0
+    )
+    parser.add_argument("--adaptive-gate-ema", type=float, default=0.8)
     parser.add_argument("--max-joint-delta-deg", type=float, default=4.0)
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--lr", type=float, default=3e-3)
@@ -232,8 +248,40 @@ def containment_metrics(before: np.ndarray, after: np.ndarray) -> dict[str, obje
     }
 
 
+def adaptive_contact_gate(
+    inside_count: np.ndarray,
+    object_vertex_count: int,
+    low_fraction: float,
+    high_fraction: float,
+) -> np.ndarray:
+    if not 0 <= low_fraction < high_fraction:
+        raise ValueError(
+            "Adaptive inside thresholds must satisfy "
+            "0 <= low < high"
+        )
+    fraction = inside_count.astype(np.float32) / max(object_vertex_count, 1)
+    gate = np.clip(
+        (high_fraction - fraction) / (high_fraction - low_fraction),
+        0.0,
+        1.0,
+    )
+    return gate * gate * (3.0 - 2.0 * gate)
+
+
 def main() -> None:
     args = parse_args()
+    if args.adaptive_refresh_steps <= 0:
+        raise ValueError("--adaptive-refresh-steps must be positive")
+    if not 0.0 <= args.adaptive_gate_ema < 1.0:
+        raise ValueError("--adaptive-gate-ema must be in [0, 1)")
+    if not 0.0 <= args.adaptive_contact_floor <= 1.0:
+        raise ValueError("--adaptive-contact-floor must be in [0, 1]")
+    if (
+        args.adaptive_collision_min_scale <= 0
+        or args.adaptive_collision_max_scale
+        < args.adaptive_collision_min_scale
+    ):
+        raise ValueError("Invalid adaptive collision scale range")
     trajectory = load_npz(Path(args.trajectory_npz).expanduser().resolve())
     query = load_npz(Path(args.query_npz).expanduser().resolve())
     stage1 = load_npz(Path(args.stage1_npz).expanduser().resolve())
@@ -461,24 +509,66 @@ def main() -> None:
         1, int(optimization_gate_np.sum()) * reconstructed.shape[1]
     )
 
-    correspondence_points: list[torch.Tensor | None] = [None] * frame_count
-    correspondence_faces: list[torch.Tensor | None] = [None] * frame_count
-    correspondence_barycentric: list[torch.Tensor | None] = [None] * frame_count
-    with torch.no_grad():
-        for index in np.flatnonzero(inside_count_np > 0):
+    boundary = directed_boundary_loop(mano_faces_np)
+
+    def build_collision_correspondences(
+        hand: torch.Tensor,
+        inside_mask: np.ndarray,
+    ) -> tuple[
+        list[torch.Tensor | None],
+        list[torch.Tensor | None],
+        list[torch.Tensor | None],
+    ]:
+        points_by_frame: list[torch.Tensor | None] = [None] * frame_count
+        faces_by_frame: list[torch.Tensor | None] = [None] * frame_count
+        barycentric_by_frame: list[torch.Tensor | None] = [None] * frame_count
+        for index in np.flatnonzero(inside_mask.sum(axis=1) > 0):
             points = torch.from_numpy(
-                object_vertices_np[index, inside_mask_np[index]]
+                object_vertices_np[index, inside_mask[index]]
             ).to(device)
             face_index, barycentric = closest_face_correspondences(
                 points,
-                reconstructed[index],
+                hand[index],
                 mano_faces,
                 args.correspondence_topk,
             )
-            correspondence_points[index] = points
-            correspondence_faces[index] = face_index
-            correspondence_barycentric[index] = barycentric
-    total_collision_points = max(1, int(inside_count_np.sum()))
+            points_by_frame[index] = points
+            faces_by_frame[index] = face_index
+            barycentric_by_frame[index] = barycentric
+        return points_by_frame, faces_by_frame, barycentric_by_frame
+
+    with torch.no_grad():
+        (
+            correspondence_points,
+            correspondence_faces,
+            correspondence_barycentric,
+        ) = build_collision_correspondences(reconstructed, inside_mask_np)
+    current_inside_mask_np = inside_mask_np.copy()
+    current_inside_count_np = inside_count_np.copy()
+    total_collision_points = max(1, int(current_inside_count_np.sum()))
+
+    if args.adaptive_balance:
+        adaptive_gate_np = adaptive_contact_gate(
+            current_inside_count_np,
+            object_vertices_np.shape[1],
+            args.adaptive_inside_low_fraction,
+            args.adaptive_inside_high_fraction,
+        )
+    else:
+        adaptive_gate_np = np.ones(frame_count, dtype=np.float32)
+    adaptive_gate = torch.from_numpy(adaptive_gate_np).to(device)
+
+    def adaptive_scales() -> tuple[torch.Tensor, torch.Tensor]:
+        contact_scale = args.adaptive_contact_floor + (
+            1.0 - args.adaptive_contact_floor
+        ) * adaptive_gate
+        collision_scale = args.adaptive_collision_min_scale + (
+            args.adaptive_collision_max_scale
+            - args.adaptive_collision_min_scale
+        ) * (1.0 - adaptive_gate)
+        return contact_scale, collision_scale
+
+    frame_contact_scale, frame_collision_scale = adaptive_scales()
 
     delta = torch.zeros(
         (frame_count, 15, 3), device=device, requires_grad=True
@@ -493,6 +583,78 @@ def main() -> None:
     history = []
 
     for step in range(1, args.steps + 1):
+        if (
+            args.adaptive_balance
+            and step > 1
+            and (step - 1) % args.adaptive_refresh_steps == 0
+        ):
+            with torch.no_grad():
+                current_parts = []
+                for frame_start in range(0, frame_count, args.frame_chunk):
+                    frame_end = min(
+                        frame_start + args.frame_chunk, frame_count
+                    )
+                    current_delta = delta[frame_start:frame_end] * (
+                        optimization_gate[
+                            frame_start:frame_end, None, None
+                        ]
+                    )
+                    current_pose = (
+                        axis_angle_to_matrix(current_delta)
+                        @ base_pose[frame_start:frame_end]
+                    )
+                    current_parts.append(mano_camera_vertices(
+                        mano,
+                        global_orient[frame_start:frame_end],
+                        current_pose,
+                        betas[frame_start:frame_end],
+                        wrist[frame_start:frame_end],
+                        stage1_translation[frame_start:frame_end],
+                        stage1_rotation[frame_start:frame_end],
+                        mirror_left,
+                    ))
+                current_hand = torch.cat(current_parts)
+                current_inside_mask_np, current_inside_count_np = (
+                    exact_inside_counts(
+                        current_hand.cpu().numpy().astype(np.float32),
+                        mano_faces_np,
+                        object_vertices_np,
+                        boundary,
+                        device,
+                        args.point_chunk,
+                    )
+                )
+                (
+                    correspondence_points,
+                    correspondence_faces,
+                    correspondence_barycentric,
+                ) = build_collision_correspondences(
+                    current_hand, current_inside_mask_np
+                )
+                total_collision_points = max(
+                    1, int(current_inside_count_np.sum())
+                )
+                refreshed_gate = torch.from_numpy(adaptive_contact_gate(
+                    current_inside_count_np,
+                    object_vertices_np.shape[1],
+                    args.adaptive_inside_low_fraction,
+                    args.adaptive_inside_high_fraction,
+                )).to(device)
+                adaptive_gate = (
+                    args.adaptive_gate_ema * adaptive_gate
+                    + (1.0 - args.adaptive_gate_ema) * refreshed_gate
+                )
+                frame_contact_scale, frame_collision_scale = (
+                    adaptive_scales()
+                )
+                _, fixed_contact_point, fixed_contact_normal = (
+                    nearest_object_correspondences(
+                        current_hand,
+                        object_points,
+                        object_normals,
+                        args.frame_chunk,
+                    )
+                )
         optimizer.zero_grad(set_to_none=True)
         contact_value = 0.0
         collision_value = 0.0
@@ -521,7 +683,9 @@ def main() -> None:
                 fixed_distance - contact_target, min=0.0
             ).square()
             chunk_contact = (
-                contact_error * contact_weight[indices]
+                contact_error
+                * contact_weight[indices]
+                * frame_contact_scale[indices, None]
             ).sum() / total_contact_weight
             displacement = refined - reconstructed[indices]
             normal_component = (
@@ -529,7 +693,9 @@ def main() -> None:
             ).sum(dim=-1, keepdim=True) * fixed_contact_normal[indices]
             tangent = displacement - normal_component
             chunk_tangential = (
-                tangent.square().sum(dim=-1) * contact_weight[indices]
+                tangent.square().sum(dim=-1)
+                * contact_weight[indices]
+                * frame_contact_scale[indices, None]
             ).sum() / total_contact_weight
             chunk_vertex_anchor = displacement.square().sum() / total_active_vertices
 
@@ -557,7 +723,7 @@ def main() -> None:
                 signed_clearance = ((points - surface) * normal).sum(dim=-1)
                 chunk_collision_sum = chunk_collision_sum + torch.clamp(
                     collision_margin - signed_clearance, min=0.0
-                ).square().sum()
+                ).square().sum() * frame_collision_scale[global_index]
             chunk_collision = chunk_collision_sum / total_collision_points
             chunk_loss = (
                 args.w_contact * chunk_contact
@@ -606,6 +772,16 @@ def main() -> None:
                 "tangential": tangential_value,
                 "vertex_anchor": vertex_anchor_value,
                 "regularization": float(regularization.detach()),
+                "inside_vertices": int(current_inside_count_np.sum()),
+                "adaptive_contact_gate_median": float(
+                    adaptive_gate[active].median().cpu()
+                ),
+                "contact_scale_median": float(
+                    frame_contact_scale[active].median().cpu()
+                ),
+                "collision_scale_median": float(
+                    frame_collision_scale[active].median().cpu()
+                ),
                 "joint_delta_median_deg": float(
                     best_delta[active].norm(dim=-1).median().cpu()
                     * 180.0 / math.pi
@@ -617,6 +793,9 @@ def main() -> None:
             }
             history.append(row)
             print(row)
+
+    if args.adaptive_balance:
+        best_delta = delta.detach().clone()
 
     refined_parts = []
     refined_pose_parts = []
@@ -644,7 +823,6 @@ def main() -> None:
     refined_distance, refined_normal_inside = nearest_geometry(
         refined, object_points, object_normals, args.frame_chunk
     )
-    boundary = directed_boundary_loop(mano_faces_np)
     refined_inside_mask, refined_inside_count = exact_inside_counts(
         refined_np,
         mano_faces_np,
@@ -712,9 +890,13 @@ def main() -> None:
     delta_deg = effective_delta.norm(dim=-1).cpu().numpy() * 180.0 / math.pi
     summary = {
         "method": (
-            "stage1_constrained_local_mano_containment_pushout_v1"
-            if args.base_mode == "stage1"
-            else "local_mano_fixed_correspondence_containment_pushout_v1"
+            "adaptive_collision_contact_local_mano_pushout_v1"
+            if args.adaptive_balance
+            else (
+                "stage1_constrained_local_mano_containment_pushout_v1"
+                if args.base_mode == "stage1"
+                else "local_mano_fixed_correspondence_containment_pushout_v1"
+            )
         ),
         "base_mode": args.base_mode,
         "stream_id": str(query["stream_id"].item()),
@@ -734,6 +916,19 @@ def main() -> None:
             "pose_acceleration": args.w_pose_acceleration,
         },
         "max_joint_delta_deg": args.max_joint_delta_deg,
+        "adaptive_balance": {
+            "enabled": args.adaptive_balance,
+            "refresh_steps": args.adaptive_refresh_steps,
+            "inside_low_fraction": args.adaptive_inside_low_fraction,
+            "inside_high_fraction": args.adaptive_inside_high_fraction,
+            "contact_floor": args.adaptive_contact_floor,
+            "collision_min_scale": args.adaptive_collision_min_scale,
+            "collision_max_scale": args.adaptive_collision_max_scale,
+            "gate_ema": args.adaptive_gate_ema,
+            "final_contact_gate": distribution(
+                adaptive_gate.cpu().numpy()[optimization_gate_np]
+            ),
+        },
         "input_roundtrip_frame_rmse_mm": distribution(
             roundtrip_rmse.cpu().numpy()
         ),
@@ -744,8 +939,13 @@ def main() -> None:
         "gt_audit": gt_audit,
         "history": history,
         "warning": (
-            "Containment active set and closest-face correspondences are fixed "
-            f"from the input {args.base_mode} hand for this test."
+            "Containment and closest-face correspondences are refreshed "
+            f"every {args.adaptive_refresh_steps} steps."
+            if args.adaptive_balance
+            else (
+                "Containment active set and closest-face correspondences are "
+                f"fixed from the input {args.base_mode} hand for this test."
+            )
         ),
     }
     output_path = Path(args.out_npz).expanduser().resolve()
@@ -764,6 +964,7 @@ def main() -> None:
         "contact_mask": contact_mask_np,
         "contact_probability": probability_np.astype(np.float16),
         "contact_gate": contact_gate_np,
+        "adaptive_contact_gate": adaptive_gate.cpu().numpy().astype(np.float32),
         "initial_gt_vertex_error_median_mm": initial_gt_frame,
         "refined_gt_vertex_error_median_mm": refined_gt_frame,
         "stream_id": np.asarray(str(query["stream_id"].item())),
