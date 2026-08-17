@@ -202,10 +202,12 @@ def main() -> None:
     confidence = torch.clamp(
         (probability - threshold) / max(1.0 - threshold, 1e-6), 0.0, 1.0
     ).pow(args.contact_probability_power)
+    # Keep every phase-active HACO contact as a one-sided safety tether.  The
+    # correction gate decides whether contact alone may move a frame, but it
+    # must not disable contact preservation when collision push-out is active.
     contact_weight = (
         args.contact_weight_floor + (1.0 - args.contact_weight_floor) * confidence
-    ) * contact_mask * contact_gate[:, None]
-    total_contact_weight = contact_weight.sum().clamp_min(1e-6)
+    ) * contact_mask * phase_gate[:, None]
 
     translation = torch.zeros((frame_count, 3), device=device, requires_grad=True)
     angles = torch.zeros((frame_count, 3), device=device, requires_grad=True)
@@ -260,6 +262,7 @@ def main() -> None:
         active_indices_np = np.flatnonzero(optimization_active_np)
         active_indices = torch.from_numpy(active_indices_np).to(device)
         optimization_active = torch.from_numpy(optimization_active_np).to(device)
+        total_contact_weight = contact_weight[optimization_active].sum().clamp_min(1e-6)
         total_collision_points = max(
             1, int(inside_count[collision_active_np].sum())
         )
@@ -397,6 +400,7 @@ def main() -> None:
         "frames": frame_count,
         "gate_source": gate_key,
         "contact_active_frames": int((contact_gate_np > 0).sum()),
+        "contact_preservation_frames": int((phase_gate_np > 0).sum()),
         "initial_collision_active_frames": int(
             (initial_inside_count > args.collision_stop_count).sum()
         ),
