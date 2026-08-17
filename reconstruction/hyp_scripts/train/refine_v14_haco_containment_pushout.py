@@ -674,9 +674,10 @@ def main() -> None:
             score = confidence * object_gate * region_gate * dynamic_plausible
             weights = torch.zeros_like(score)
             for frame_index in range(frame_count):
-                candidates = torch.flatnonzero(
-                    score[frame_index] >= args.filtered_min_weight
-                )
+                candidates = torch.nonzero(
+                    score[frame_index] >= args.filtered_min_weight,
+                    as_tuple=False,
+                ).flatten()
                 if len(candidates) > args.filtered_contact_topk:
                     keep = torch.topk(
                         score[frame_index, candidates],
