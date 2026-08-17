@@ -173,6 +173,7 @@ def main() -> None:
             str(query["hand_side"].item()),
             query_index,
         )
+    stage1_hand = None
     refined_hand = None
     if args.refined_hand_npz:
         refined_data = load_npz(
@@ -180,6 +181,11 @@ def main() -> None:
         )
         if "frame_ids" in refined_data:
             refined_index = index_for(refined_data["frame_ids"], requested)
+            if "stage1_hand_vertices_camera" in refined_data:
+                stage1_hand = np.asarray(
+                    refined_data["stage1_hand_vertices_camera"][refined_index],
+                    dtype=np.float32,
+                )
             refined_hand = np.asarray(
                 refined_data["refined_hand_vertices_camera"][refined_index],
                 dtype=np.float32,
@@ -193,6 +199,11 @@ def main() -> None:
         if refined_hand.shape != hand_vertices.shape:
             raise ValueError(
                 f"Refined hand shape mismatch: {refined_hand.shape} vs "
+                f"{hand_vertices.shape}"
+            )
+        if stage1_hand is not None and stage1_hand.shape != hand_vertices.shape:
+            raise ValueError(
+                f"Stage-1 hand shape mismatch: {stage1_hand.shape} vs "
                 f"{hand_vertices.shape}"
             )
 
@@ -273,13 +284,22 @@ def main() -> None:
             color=(70, 140, 245),
             opacity=0.46,
         ))
-        if refined_hand is not None:
+        displayed_stage1 = stage1_hand if stage1_hand is not None else refined_hand
+        if displayed_stage1 is not None:
             handles.append(server.scene.add_mesh_simple(
-                "/chamfer_refined_hand",
-                refined_hand,
+                "/stage1_rigid_refined_hand",
+                displayed_stage1,
                 hand_faces,
                 color=(255, 165, 45),
                 opacity=0.52,
+            ))
+        if stage1_hand is not None and refined_hand is not None:
+            handles.append(server.scene.add_mesh_simple(
+                "/stage2_local_refined_hand",
+                refined_hand,
+                hand_faces,
+                color=(220, 65, 190),
+                opacity=0.56,
             ))
         handles.append(server.scene.add_mesh_simple(
             "/gt_ycb_object",
@@ -326,7 +346,8 @@ def main() -> None:
     print(f"Viewer: http://localhost:{args.port}")
     print(
         "Blue=V14 WiLoR hand, red=HACO contact, "
-        "orange=Chamfer refined hand, green=GT DexYCB hand, "
+        "orange=Stage-1 rigid hand, magenta=Stage-2 local hand, "
+        "green=GT DexYCB hand, "
         "cyan=GT YCB object"
     )
     while True:
