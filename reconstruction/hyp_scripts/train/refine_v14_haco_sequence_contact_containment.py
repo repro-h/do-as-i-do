@@ -226,6 +226,7 @@ def main() -> None:
     collision_points: list[torch.Tensor | None] = [None] * frame_count
     collision_faces: list[torch.Tensor | None] = [None] * frame_count
     collision_barycentric: list[torch.Tensor | None] = [None] * frame_count
+    correction_support_np = np.zeros(frame_count, dtype=bool)
 
     for step in range(1, args.steps + 1):
         if (step - 1) % args.containment_refresh == 0:
@@ -259,9 +260,15 @@ def main() -> None:
         optimization_active_np = (contact_gate_np > 0) | collision_active_np
         if not optimization_active_np.any():
             raise RuntimeError("Joint contact/containment gate selected no frames")
+        # Once a constrained frame has received a correction, retain it in the
+        # support even after its collision is resolved. Frames that never had
+        # contact or collision must remain exact no-ops instead of being moved
+        # indirectly by temporal regularization.
+        correction_support_np |= optimization_active_np
         active_indices_np = np.flatnonzero(optimization_active_np)
         active_indices = torch.from_numpy(active_indices_np).to(device)
         optimization_active = torch.from_numpy(optimization_active_np).to(device)
+        correction_support = torch.from_numpy(correction_support_np).to(device)
         total_contact_weight = contact_weight[optimization_active].sum().clamp_min(1e-6)
         total_collision_points = max(
             1, int(inside_count[collision_active_np].sum())
@@ -322,7 +329,7 @@ def main() -> None:
             contact_value += float(chunk_contact.detach())
             collision_value += float(chunk_collision.detach())
 
-        active = optimization_active
+        active = correction_support
         translation_anchor = translation[active].square().sum(dim=-1).mean()
         rotation_anchor = angles[active].square().sum(dim=-1).mean()
         translation_velocity = translation[1:] - translation[:-1]
@@ -346,8 +353,8 @@ def main() -> None:
             angle_norm = angles.norm(dim=-1, keepdim=True).clamp_min(1e-12)
             translation.mul_(torch.clamp(max_translation / translation_norm, max=1.0))
             angles.mul_(torch.clamp(max_angle / angle_norm, max=1.0))
-            translation[~torch.from_numpy(valid_np).to(device)] = 0
-            angles[~torch.from_numpy(valid_np).to(device)] = 0
+            translation[~correction_support] = 0
+            angles[~correction_support] = 0
 
         if step == 1 or step % 25 == 0 or step == args.steps:
             row = {
@@ -404,6 +411,7 @@ def main() -> None:
         "initial_collision_active_frames": int(
             (initial_inside_count > args.collision_stop_count).sum()
         ),
+        "correction_support_frames": int(correction_support_np.sum()),
         "contact": {"initial": initial_metrics, "refined": refined_metrics},
         "containment": collision_summary,
         "translation_norm_mm": distribution(
