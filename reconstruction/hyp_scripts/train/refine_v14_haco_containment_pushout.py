@@ -333,8 +333,23 @@ def main() -> None:
         contact_threshold = float(np.asarray(
             contact_source["contact_threshold"]
         ).item())
+    containment_key = next(
+        (
+            key for key in (
+                "object_vertex_inside_capped_mano",
+                "refined_object_vertex_inside_capped_mano",
+                "initial_object_vertex_inside_capped_mano",
+            )
+            if key in containment
+        ),
+        None,
+    )
+    if containment_key is None:
+        raise KeyError(
+            "Containment archive lacks an object-inside-MANO mask"
+        )
     inside_mask_np = np.asarray(
-        containment["object_vertex_inside_capped_mano"][containment_indices]
+        containment[containment_key][containment_indices]
     ).astype(bool)
     valid_np = (
         np.asarray(query["model_valid"]).astype(bool)
@@ -707,6 +722,7 @@ def main() -> None:
         "frames": frame_count,
         "active_frames": int(optimization_gate_np.sum()),
         "collision_points": int(inside_count_np.sum()),
+        "containment_key": containment_key,
         "collision_margin_mm": args.collision_margin_mm,
         "weights": {
             "contact": args.w_contact,
