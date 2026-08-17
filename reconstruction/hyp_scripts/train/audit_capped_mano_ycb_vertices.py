@@ -47,6 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vertices-key")
     parser.add_argument("--object-scale", type=float, default=1.0)
     parser.add_argument("--point-chunk", type=int, default=256)
+    parser.add_argument("--ray-count", type=int, choices=(1, 3), default=3)
+    parser.add_argument("--broadphase-padding-mm", type=float, default=0.1)
     parser.add_argument("--visualize-frame")
     parser.add_argument("--port", type=int, default=8098)
     return parser.parse_args()
@@ -108,16 +110,18 @@ def contains_points_vote(
     vertices: np.ndarray,
     faces: np.ndarray,
     chunk_size: int,
+    ray_count: int = 3,
 ) -> tuple[np.ndarray, np.ndarray]:
     triangles = np.asarray(vertices, dtype=np.float64)[faces]
+    directions = RAY_DIRECTIONS[:ray_count]
     votes = np.stack(
         [
             ray_parity(points, triangles, direction, chunk_size)
-            for direction in RAY_DIRECTIONS
+            for direction in directions
         ],
         axis=0,
     )
-    return votes.sum(axis=0) >= 2, votes
+    return votes.sum(axis=0) >= (ray_count // 2 + 1), votes
 
 
 def transformed_object_vertices(
@@ -174,6 +178,7 @@ def main() -> None:
     )
     inside_count = np.zeros(len(ids), dtype=np.int32)
     disagreement_count = np.zeros(len(ids), dtype=np.int32)
+    broadphase_count = np.zeros(len(ids), dtype=np.int32)
     watertight = np.zeros(len(ids), dtype=bool)
     winding_consistent = np.zeros(len(ids), dtype=bool)
     signed_volume = np.full(len(ids), np.nan, dtype=np.float32)
@@ -203,27 +208,44 @@ def main() -> None:
             normalized_left,
         )
         object_camera = transformed_object_vertices(object_vertices, pose)
-        contained, votes = contains_points_vote(
-            object_camera,
-            capped_vertices,
-            capped_faces,
-            args.point_chunk,
+        padding = args.broadphase_padding_mm / 1000.0
+        lower = capped_vertices.min(axis=0) - padding
+        upper = capped_vertices.max(axis=0) + padding
+        broadphase = np.all(
+            (object_camera >= lower) & (object_camera <= upper), axis=-1
         )
-        vote_count = votes.sum(axis=0).astype(np.uint8)
+        candidate_indices = np.flatnonzero(broadphase)
+        broadphase_count[output_index] = len(candidate_indices)
+        contained = np.zeros(len(object_vertices), dtype=bool)
+        vote_count = np.zeros(len(object_vertices), dtype=np.uint8)
+        if len(candidate_indices):
+            candidate_inside, candidate_votes = contains_points_vote(
+                object_camera[candidate_indices],
+                capped_vertices,
+                capped_faces,
+                args.point_chunk,
+                args.ray_count,
+            )
+            contained[candidate_indices] = candidate_inside
+            vote_count[candidate_indices] = candidate_votes.sum(
+                axis=0
+            ).astype(np.uint8)
         inside_mask[output_index] = contained
         ray_votes[output_index] = vote_count
         inside_count[output_index] = int(contained.sum())
         disagreement_count[output_index] = int(
-            ((vote_count > 0) & (vote_count < len(RAY_DIRECTIONS))).sum()
+            ((vote_count > 0) & (vote_count < args.ray_count)).sum()
         )
         print(
             f"[{output_index + 1}/{len(ids)}] {frame_id(ids[output_index])} "
+            f"candidates={broadphase_count[output_index]}/{len(object_vertices)} "
             f"inside={inside_count[output_index]}/{len(object_vertices)} "
             f"ray_disagreement={disagreement_count[output_index]}"
         )
 
     valid_counts = inside_count[valid]
     valid_disagreement = disagreement_count[valid]
+    valid_broadphase = broadphase_count[valid]
     top_indices = np.flatnonzero(valid)[
         np.argsort(valid_counts)[-10:][::-1]
     ]
@@ -235,7 +257,9 @@ def main() -> None:
         "object_vertices": int(len(object_vertices)),
         "object_faces": int(len(object_faces)),
         "mano_boundary_vertices": int(len(boundary)),
-        "ray_directions": int(len(RAY_DIRECTIONS)),
+        "ray_directions": int(args.ray_count),
+        "broadphase_padding_mm": float(args.broadphase_padding_mm),
+        "broadphase_candidates_per_frame": distribution(valid_broadphase),
         "inside_vertices_per_frame": distribution(valid_counts),
         "inside_fraction_per_frame": distribution(
             valid_counts.astype(np.float64) / max(len(object_vertices), 1)
@@ -271,6 +295,7 @@ def main() -> None:
         "object_vertex_inside_capped_mano": inside_mask,
         "object_vertex_inside_ray_votes": ray_votes,
         "inside_object_vertices": inside_count,
+        "broadphase_candidate_vertices": broadphase_count,
         "ray_disagreement_vertices": disagreement_count,
         "capped_mano_watertight": watertight,
         "capped_mano_winding_consistent": winding_consistent,
