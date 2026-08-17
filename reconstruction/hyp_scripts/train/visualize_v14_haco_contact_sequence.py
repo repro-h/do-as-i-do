@@ -167,6 +167,27 @@ def main() -> None:
         )
         if stage2 is not None and stage2_indices is not None else None
     )
+    stage2_filtered_mask = (
+        np.asarray(stage2["filtered_contact_mask"][stage2_indices]).astype(bool)
+        if (
+            stage2 is not None
+            and stage2_indices is not None
+            and "filtered_contact_mask" in stage2
+        )
+        else None
+    )
+    stage2_filtered_weight = (
+        np.asarray(
+            stage2["filtered_contact_weight"][stage2_indices],
+            dtype=np.float32,
+        )
+        if (
+            stage2 is not None
+            and stage2_indices is not None
+            and "filtered_contact_weight" in stage2
+        )
+        else None
+    )
     hand_faces = np.asarray(query["mano_faces"], dtype=np.int64)
     probability = np.asarray(
         contact["contact_probability"][contact_indices], dtype=np.float32
@@ -254,6 +275,10 @@ def main() -> None:
         ),
         "filtered_contact": server.gui.add_checkbox(
             "Filtered Stage1 contacts", initial_value=True
+        ),
+        "stage2_filtered_contact": server.gui.add_checkbox(
+            "Stage2 optimization contacts",
+            initial_value=stage2_filtered_mask is not None,
         ),
         "collision_seeds": server.gui.add_checkbox(
             "Collision seed MANO vertices", initial_value=True
@@ -434,6 +459,28 @@ def main() -> None:
                 colors=filtered_colors,
                 point_size=float(point_size.value) * 1.25,
             ))
+        if (
+            controls["stage2_filtered_contact"].value
+            and stage2_vertices is not None
+            and stage2_filtered_mask is not None
+            and stage2_filtered_weight is not None
+        ):
+            stage2_selected = stage2_filtered_mask[index]
+            if stage2_selected.any():
+                strength = stage2_filtered_weight[
+                    index, stage2_selected, None
+                ]
+                colors = np.concatenate((
+                    np.full_like(strength, 255.0),
+                    40.0 + 180.0 * strength,
+                    np.full_like(strength, 255.0),
+                ), axis=1).clip(0, 255).astype(np.uint8)
+                handles.append(server.scene.add_point_cloud(
+                    "/stage2_optimization_contacts",
+                    points=stage2_vertices[index, stage2_selected],
+                    colors=colors,
+                    point_size=float(point_size.value) * 1.4,
+                ))
         if controls["collision_seeds"].value and len(collision_seeds):
             handles.append(server.scene.add_point_cloud(
                 "/collision_seed_mano_vertices",
@@ -474,6 +521,7 @@ def main() -> None:
             f"frame={frame_id(ids[index])} index={index} "
             f"haco={int(active.sum())} "
             f"filtered={len(selected)} "
+            f"stage2_filtered={int(stage2_filtered_mask[index].sum()) if stage2_filtered_mask is not None else 0} "
             f"contact_gate={adaptive_gate:.3f} "
             f"stage1_inside={int(stage1_inside_count[index])} "
             f"stage2_inside={int(stage2_inside_count[index])} "
@@ -513,7 +561,8 @@ def main() -> None:
     print(
         "Blue=V14, orange=Stage1, magenta=Stage2, green=GT hand, "
         "cyan=GT YCB, warm=raw HACO, bright green=filtered contacts, "
-        "blue points=collision seeds, red=contained YCB vertices"
+        "magenta points=Stage2 optimization contacts, blue points=collision "
+        "seeds, red=contained YCB vertices"
     )
     print("Press Ctrl+C to stop")
     while True:
