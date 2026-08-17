@@ -66,8 +66,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-probability-power", type=float, default=2.0)
     parser.add_argument("--contact-weight-floor", type=float, default=0.05)
     parser.add_argument("--filter-contact-points", action="store_true")
-    parser.add_argument("--filtered-contact-topk", type=int, default=64)
+    parser.add_argument("--filtered-contact-topk", type=int, default=48)
+    parser.add_argument("--filtered-component-topk", type=int, default=8)
+    parser.add_argument("--filtered-maximum-total", type=int, default=96)
     parser.add_argument("--filtered-min-weight", type=float, default=0.05)
+    parser.add_argument(
+        "--filtered-keeper-confidence", type=float, default=0.6
+    )
+    parser.add_argument(
+        "--filtered-keeper-distance-mm", type=float, default=8.0
+    )
     parser.add_argument("--object-distance-sigma-mm", type=float, default=8.0)
     parser.add_argument(
         "--collision-geodesic-sigma-mm", type=float, default=15.0
@@ -317,6 +325,36 @@ def multisource_geodesic(
     return distance
 
 
+def collision_face_components(
+    face_indices: np.ndarray,
+    faces: np.ndarray,
+) -> list[np.ndarray]:
+    selected_faces = np.unique(face_indices.astype(np.int64))
+    if not len(selected_faces):
+        return []
+    vertex_to_faces: dict[int, list[int]] = {}
+    for face_index in selected_faces:
+        for vertex in faces[face_index]:
+            vertex_to_faces.setdefault(int(vertex), []).append(int(face_index))
+    remaining = set(int(index) for index in selected_faces)
+    components = []
+    while remaining:
+        seed = remaining.pop()
+        queue = [seed]
+        component = [seed]
+        while queue:
+            current = queue.pop()
+            neighbors = set()
+            for vertex in faces[current]:
+                neighbors.update(vertex_to_faces[int(vertex)])
+            for neighbor in neighbors & remaining:
+                remaining.remove(neighbor)
+                queue.append(neighbor)
+                component.append(neighbor)
+        components.append(np.asarray(component, dtype=np.int64))
+    return components
+
+
 def main() -> None:
     args = parse_args()
     if args.adaptive_refresh_steps <= 0:
@@ -327,6 +365,16 @@ def main() -> None:
         raise ValueError("--adaptive-contact-floor must be in [0, 1]")
     if args.filtered_contact_topk <= 0:
         raise ValueError("--filtered-contact-topk must be positive")
+    if args.filtered_component_topk <= 0:
+        raise ValueError("--filtered-component-topk must be positive")
+    if args.filtered_maximum_total < args.filtered_contact_topk:
+        raise ValueError(
+            "--filtered-maximum-total must be at least the global top-k"
+        )
+    if not 0.0 <= args.filtered_keeper_confidence <= 1.0:
+        raise ValueError("--filtered-keeper-confidence must be in [0, 1]")
+    if args.filtered_keeper_distance_mm <= 0:
+        raise ValueError("--filtered-keeper-distance-mm must be positive")
     if args.object_distance_sigma_mm <= 0:
         raise ValueError("--object-distance-sigma-mm must be positive")
     if args.collision_geodesic_sigma_mm <= 0:
@@ -546,12 +594,13 @@ def main() -> None:
     initial_normal_inside = (
         (fixed_contact_point - reconstructed) * fixed_contact_normal
     ).sum(dim=-1)
-    confidence = torch.clamp(
+    normalized_confidence = torch.clamp(
         (probability - contact_threshold)
         / max(1.0 - contact_threshold, 1e-6),
         min=0.0,
         max=1.0,
-    ).pow(args.contact_probability_power)
+    )
+    confidence = normalized_confidence.pow(args.contact_probability_power)
     initial_plausible_contact = (
         contact_mask
         & (initial_distance <= args.contact_activation_mm / 1000.0)
@@ -638,20 +687,35 @@ def main() -> None:
             geodesic_gate_np = np.ones(
                 (frame_count, hand.shape[1]), dtype=np.float32
             )
+            component_geodesics: list[list[np.ndarray]] = [
+                [] for _ in range(frame_count)
+            ]
             hand_np = hand.cpu().numpy().astype(np.float32)
             sigma = args.collision_geodesic_sigma_mm / 1000.0
             for frame_index, face_index in enumerate(collision_faces):
                 if face_index is None or not len(face_index):
                     continue
-                seed_vertices = np.unique(
-                    mano_faces_np[face_index.cpu().numpy()].reshape(-1)
+                components = collision_face_components(
+                    face_index.cpu().numpy(), mano_faces_np
                 )
-                geodesic = multisource_geodesic(
-                    hand_np[frame_index], hand_edges_np, seed_vertices
-                )
-                geodesic_gate_np[frame_index] = np.exp(
-                    -np.square(geodesic / sigma)
-                )
+                for component in components:
+                    seed_vertices = np.unique(
+                        mano_faces_np[component].reshape(-1)
+                    )
+                    component_geodesics[frame_index].append(
+                        multisource_geodesic(
+                            hand_np[frame_index],
+                            hand_edges_np,
+                            seed_vertices,
+                        )
+                    )
+                if component_geodesics[frame_index]:
+                    nearest_component = np.min(
+                        np.stack(component_geodesics[frame_index]), axis=0
+                    )
+                    geodesic_gate_np[frame_index] = np.exp(
+                        -np.square(nearest_component / sigma)
+                    )
             geodesic_gate = torch.from_numpy(geodesic_gate_np).to(device)
             collision_priority = 1.0 - adaptive_gate[:, None]
             region_gate = (
@@ -674,19 +738,86 @@ def main() -> None:
             score = confidence * object_gate * region_gate * dynamic_plausible
             weights = torch.zeros_like(score)
             for frame_index in range(frame_count):
+                selected = torch.zeros(
+                    hand.shape[1], dtype=torch.bool, device=device
+                )
+                selection_score = score[frame_index].clone()
+
+                for geodesic_np in component_geodesics[frame_index]:
+                    component_gate = torch.from_numpy(
+                        np.exp(-np.square(geodesic_np / sigma))
+                    ).to(device)
+                    component_score = (
+                        confidence[frame_index]
+                        * object_gate[frame_index]
+                        * (
+                            args.collision_region_floor
+                            + (1.0 - args.collision_region_floor)
+                            * component_gate
+                        )
+                        * dynamic_plausible[frame_index]
+                    )
+                    candidates = torch.nonzero(
+                        component_score >= args.filtered_min_weight,
+                        as_tuple=False,
+                    ).flatten()
+                    if len(candidates) > args.filtered_component_topk:
+                        keep = torch.topk(
+                            component_score[candidates],
+                            args.filtered_component_topk,
+                        ).indices
+                        candidates = candidates[keep]
+                    selected[candidates] = True
+                    selection_score[candidates] = torch.maximum(
+                        selection_score[candidates],
+                        component_score[candidates],
+                    )
+
+                remaining = args.filtered_maximum_total - int(selected.sum())
+                keeper_score = confidence[frame_index] * object_gate[frame_index]
+                keepers = torch.nonzero(
+                    dynamic_plausible[frame_index]
+                    & (
+                        normalized_confidence[frame_index]
+                        >= args.filtered_keeper_confidence
+                    )
+                    & (
+                        distance[frame_index]
+                        <= args.filtered_keeper_distance_mm / 1000.0
+                    )
+                    & ~selected,
+                    as_tuple=False,
+                ).flatten()
+                if remaining > 0 and len(keepers):
+                    if len(keepers) > remaining:
+                        keep = torch.topk(
+                            keeper_score[keepers], remaining
+                        ).indices
+                        keepers = keepers[keep]
+                    selected[keepers] = True
+                    selection_score[keepers] = torch.maximum(
+                        selection_score[keepers], keeper_score[keepers]
+                    )
+
+                remaining = args.filtered_maximum_total - int(selected.sum())
                 candidates = torch.nonzero(
                     score[frame_index] >= args.filtered_min_weight,
                     as_tuple=False,
                 ).flatten()
-                if len(candidates) > args.filtered_contact_topk:
+                candidates = candidates[~selected[candidates]]
+                global_count = min(
+                    args.filtered_contact_topk, max(remaining, 0)
+                )
+                if global_count <= 0:
+                    candidates = candidates[:0]
+                elif len(candidates) > global_count:
                     keep = torch.topk(
                         score[frame_index, candidates],
-                        args.filtered_contact_topk,
+                        global_count,
                     ).indices
                     candidates = candidates[keep]
-                weights[frame_index, candidates] = score[
-                    frame_index, candidates
-                ]
+                selected[candidates] = True
+                weights[frame_index, selected] = selection_score[selected]
         selected_count = int((weights > 0).sum().cpu())
         weight_sum = weights.sum()
         effective_count = float(
@@ -1090,7 +1221,7 @@ def main() -> None:
     delta_deg = effective_delta.norm(dim=-1).cpu().numpy() * 180.0 / math.pi
     summary = {
         "method": (
-            "filtered_adaptive_collision_contact_local_mano_pushout_v1"
+            "filtered_adaptive_collision_contact_local_mano_pushout_v2"
             if args.adaptive_balance and args.filter_contact_points
             else "adaptive_collision_contact_local_mano_pushout_v1"
             if args.adaptive_balance
@@ -1120,8 +1251,12 @@ def main() -> None:
         "max_joint_delta_deg": args.max_joint_delta_deg,
         "contact_filter": {
             "enabled": args.filter_contact_points,
-            "topk": args.filtered_contact_topk,
+            "global_topk": args.filtered_contact_topk,
+            "component_topk": args.filtered_component_topk,
+            "maximum_total": args.filtered_maximum_total,
             "minimum_weight": args.filtered_min_weight,
+            "keeper_confidence": args.filtered_keeper_confidence,
+            "keeper_distance_mm": args.filtered_keeper_distance_mm,
             "object_distance_sigma_mm": args.object_distance_sigma_mm,
             "collision_geodesic_sigma_mm": (
                 args.collision_geodesic_sigma_mm
