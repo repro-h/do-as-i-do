@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
 import math
 from pathlib import Path
@@ -64,6 +65,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-activation-mm", type=float, default=12.0)
     parser.add_argument("--contact-probability-power", type=float, default=2.0)
     parser.add_argument("--contact-weight-floor", type=float, default=0.05)
+    parser.add_argument("--filter-contact-points", action="store_true")
+    parser.add_argument("--filtered-contact-topk", type=int, default=64)
+    parser.add_argument("--filtered-min-weight", type=float, default=0.05)
+    parser.add_argument("--object-distance-sigma-mm", type=float, default=8.0)
+    parser.add_argument(
+        "--collision-geodesic-sigma-mm", type=float, default=15.0
+    )
+    parser.add_argument("--collision-region-floor", type=float, default=0.05)
     parser.add_argument("--w-contact", type=float, default=1.0)
     parser.add_argument("--w-collision", type=float, default=5.0)
     parser.add_argument("--w-tangential", type=float, default=2.0)
@@ -271,6 +280,43 @@ def adaptive_contact_gate(
     return gate * gate * (3.0 - 2.0 * gate)
 
 
+def mesh_edges(faces: np.ndarray) -> np.ndarray:
+    edges = np.concatenate(
+        (faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]), axis=0
+    )
+    edges.sort(axis=1)
+    return np.unique(edges, axis=0)
+
+
+def multisource_geodesic(
+    vertices: np.ndarray,
+    edges: np.ndarray,
+    seeds: np.ndarray,
+) -> np.ndarray:
+    adjacency: list[list[tuple[int, float]]] = [
+        [] for _ in range(len(vertices))
+    ]
+    for first, second in edges:
+        weight = float(np.linalg.norm(vertices[first] - vertices[second]))
+        adjacency[int(first)].append((int(second), weight))
+        adjacency[int(second)].append((int(first), weight))
+    distance = np.full(len(vertices), np.inf, dtype=np.float32)
+    queue: list[tuple[float, int]] = []
+    for seed in np.unique(seeds):
+        distance[int(seed)] = 0.0
+        heapq.heappush(queue, (0.0, int(seed)))
+    while queue:
+        current, vertex = heapq.heappop(queue)
+        if current > float(distance[vertex]):
+            continue
+        for neighbor, edge_length in adjacency[vertex]:
+            candidate = current + edge_length
+            if candidate < float(distance[neighbor]):
+                distance[neighbor] = candidate
+                heapq.heappush(queue, (candidate, neighbor))
+    return distance
+
+
 def main() -> None:
     args = parse_args()
     if args.adaptive_refresh_steps <= 0:
@@ -279,6 +325,14 @@ def main() -> None:
         raise ValueError("--adaptive-gate-ema must be in [0, 1)")
     if not 0.0 <= args.adaptive_contact_floor <= 1.0:
         raise ValueError("--adaptive-contact-floor must be in [0, 1]")
+    if args.filtered_contact_topk <= 0:
+        raise ValueError("--filtered-contact-topk must be positive")
+    if args.object_distance_sigma_mm <= 0:
+        raise ValueError("--object-distance-sigma-mm must be positive")
+    if args.collision_geodesic_sigma_mm <= 0:
+        raise ValueError("--collision-geodesic-sigma-mm must be positive")
+    if not 0.0 <= args.collision_region_floor <= 1.0:
+        raise ValueError("--collision-region-floor must be in [0, 1]")
     if (
         args.adaptive_collision_min_scale <= 0
         or args.adaptive_collision_max_scale
@@ -498,16 +552,15 @@ def main() -> None:
         min=0.0,
         max=1.0,
     ).pow(args.contact_probability_power)
-    plausible_contact = (
+    initial_plausible_contact = (
         contact_mask
         & (initial_distance <= args.contact_activation_mm / 1000.0)
         & (contact_gate[:, None] > 0)
     )
-    contact_weight = (
+    unfiltered_contact_weight = (
         args.contact_weight_floor
         + (1.0 - args.contact_weight_floor) * confidence
-    ) * plausible_contact
-    total_contact_weight = contact_weight.sum().clamp_min(1e-6)
+    ) * initial_plausible_contact
     total_active_vertices = max(
         1, int(optimization_gate_np.sum()) * reconstructed.shape[1]
     )
@@ -572,6 +625,84 @@ def main() -> None:
         return contact_scale, collision_scale
 
     frame_contact_scale, frame_collision_scale = adaptive_scales()
+    hand_edges_np = mesh_edges(mano_faces_np)
+
+    def build_contact_weights(
+        hand: torch.Tensor,
+        distance: torch.Tensor,
+        collision_faces: list[torch.Tensor | None],
+    ) -> tuple[torch.Tensor, int, float]:
+        if not args.filter_contact_points:
+            weights = unfiltered_contact_weight
+        else:
+            geodesic_gate_np = np.ones(
+                (frame_count, hand.shape[1]), dtype=np.float32
+            )
+            hand_np = hand.cpu().numpy().astype(np.float32)
+            sigma = args.collision_geodesic_sigma_mm / 1000.0
+            for frame_index, face_index in enumerate(collision_faces):
+                if face_index is None or not len(face_index):
+                    continue
+                seed_vertices = np.unique(
+                    mano_faces_np[face_index.cpu().numpy()].reshape(-1)
+                )
+                geodesic = multisource_geodesic(
+                    hand_np[frame_index], hand_edges_np, seed_vertices
+                )
+                geodesic_gate_np[frame_index] = np.exp(
+                    -np.square(geodesic / sigma)
+                )
+            geodesic_gate = torch.from_numpy(geodesic_gate_np).to(device)
+            collision_priority = 1.0 - adaptive_gate[:, None]
+            region_gate = (
+                1.0 - collision_priority
+                + collision_priority
+                * (
+                    args.collision_region_floor
+                    + (1.0 - args.collision_region_floor)
+                    * geodesic_gate
+                )
+            )
+            object_gate = torch.exp(-torch.square(
+                distance / (args.object_distance_sigma_mm / 1000.0)
+            ))
+            dynamic_plausible = (
+                contact_mask
+                & (distance <= args.contact_activation_mm / 1000.0)
+                & (contact_gate[:, None] > 0)
+            )
+            score = confidence * object_gate * region_gate * dynamic_plausible
+            weights = torch.zeros_like(score)
+            for frame_index in range(frame_count):
+                candidates = torch.flatnonzero(
+                    score[frame_index] >= args.filtered_min_weight
+                )
+                if len(candidates) > args.filtered_contact_topk:
+                    keep = torch.topk(
+                        score[frame_index, candidates],
+                        args.filtered_contact_topk,
+                    ).indices
+                    candidates = candidates[keep]
+                weights[frame_index, candidates] = score[
+                    frame_index, candidates
+                ]
+        selected_count = int((weights > 0).sum().cpu())
+        weight_sum = weights.sum()
+        effective_count = float(
+            (weight_sum.square() / weights.square().sum().clamp_min(1e-12))
+            .cpu()
+        )
+        return weights, selected_count, effective_count
+
+    current_contact_distance = initial_distance
+    contact_weight, selected_contact_count, contact_effective_count = (
+        build_contact_weights(
+            reconstructed,
+            current_contact_distance,
+            correspondence_faces,
+        )
+    )
+    total_contact_weight = contact_weight.sum().clamp_min(1e-6)
 
     delta = torch.zeros(
         (frame_count, 15, 3), device=device, requires_grad=True
@@ -650,7 +781,11 @@ def main() -> None:
                 frame_contact_scale, frame_collision_scale = (
                     adaptive_scales()
                 )
-                _, fixed_contact_point, fixed_contact_normal = (
+                (
+                    current_contact_distance,
+                    fixed_contact_point,
+                    fixed_contact_normal,
+                ) = (
                     nearest_object_correspondences(
                         current_hand,
                         object_points,
@@ -658,6 +793,16 @@ def main() -> None:
                         args.frame_chunk,
                     )
                 )
+                (
+                    contact_weight,
+                    selected_contact_count,
+                    contact_effective_count,
+                ) = build_contact_weights(
+                    current_hand,
+                    current_contact_distance,
+                    correspondence_faces,
+                )
+                total_contact_weight = contact_weight.sum().clamp_min(1e-6)
                 if args.adaptive_reset_optimizer_on_refresh:
                     optimizer.state.clear()
         optimizer.zero_grad(set_to_none=True)
@@ -787,6 +932,8 @@ def main() -> None:
                 "collision_scale_median": float(
                     frame_collision_scale[active].median().cpu()
                 ),
+                "selected_contact_vertices": selected_contact_count,
+                "contact_effective_vertices": contact_effective_count,
                 "joint_delta_median_deg": float(
                     delta.detach()[active].norm(dim=-1).median().cpu()
                     * 180.0 / math.pi
@@ -836,6 +983,53 @@ def main() -> None:
         device,
         args.point_chunk,
     )
+    if args.filter_contact_points:
+        with torch.no_grad():
+            (
+                _,
+                final_collision_faces,
+                _,
+            ) = build_collision_correspondences(
+                refined, refined_inside_mask
+            )
+            if args.adaptive_balance:
+                adaptive_gate = torch.from_numpy(adaptive_contact_gate(
+                    refined_inside_count,
+                    object_vertices_np.shape[1],
+                    args.adaptive_inside_low_fraction,
+                    args.adaptive_inside_high_fraction,
+                )).to(device)
+            (
+                contact_weight,
+                selected_contact_count,
+                contact_effective_count,
+            ) = build_contact_weights(
+                refined,
+                refined_distance,
+                final_collision_faces,
+            )
+    filtered_contact_mask_np = (
+        contact_weight > 0
+    ).cpu().numpy()
+    filtered_contact_weight_np = contact_weight.cpu().numpy().astype(np.float32)
+    selected_initial_mm = (
+        initial_distance.cpu().numpy()[filtered_contact_mask_np] * 1000.0
+    )
+    selected_refined_mm = (
+        refined_distance.cpu().numpy()[filtered_contact_mask_np] * 1000.0
+    )
+    filtered_contact_metrics = {
+        "selected_vertices": int(filtered_contact_mask_np.sum()),
+        "effective_vertices": contact_effective_count,
+        "initial_distance_mm": distribution(selected_initial_mm),
+        "refined_distance_mm": distribution(selected_refined_mm),
+        "refined_within_2mm_fraction": float(
+            np.mean(selected_refined_mm <= 2.0)
+        ) if len(selected_refined_mm) else None,
+        "refined_within_5mm_fraction": float(
+            np.mean(selected_refined_mm <= 5.0)
+        ) if len(selected_refined_mm) else None,
+    }
 
     initial_geometry, _ = geometry_summary(
         initial_distance.cpu().numpy(),
@@ -895,7 +1089,9 @@ def main() -> None:
     delta_deg = effective_delta.norm(dim=-1).cpu().numpy() * 180.0 / math.pi
     summary = {
         "method": (
-            "adaptive_collision_contact_local_mano_pushout_v1"
+            "filtered_adaptive_collision_contact_local_mano_pushout_v1"
+            if args.adaptive_balance and args.filter_contact_points
+            else "adaptive_collision_contact_local_mano_pushout_v1"
             if args.adaptive_balance
             else (
                 "stage1_constrained_local_mano_containment_pushout_v1"
@@ -921,6 +1117,17 @@ def main() -> None:
             "pose_acceleration": args.w_pose_acceleration,
         },
         "max_joint_delta_deg": args.max_joint_delta_deg,
+        "contact_filter": {
+            "enabled": args.filter_contact_points,
+            "topk": args.filtered_contact_topk,
+            "minimum_weight": args.filtered_min_weight,
+            "object_distance_sigma_mm": args.object_distance_sigma_mm,
+            "collision_geodesic_sigma_mm": (
+                args.collision_geodesic_sigma_mm
+            ),
+            "collision_region_floor": args.collision_region_floor,
+            "metrics": filtered_contact_metrics,
+        },
         "adaptive_balance": {
             "enabled": args.adaptive_balance,
             "refresh_steps": args.adaptive_refresh_steps,
@@ -973,6 +1180,8 @@ def main() -> None:
         "contact_probability": probability_np.astype(np.float16),
         "contact_gate": contact_gate_np,
         "adaptive_contact_gate": adaptive_gate.cpu().numpy().astype(np.float32),
+        "filtered_contact_mask": filtered_contact_mask_np,
+        "filtered_contact_weight": filtered_contact_weight_np.astype(np.float16),
         "initial_gt_vertex_error_median_mm": initial_gt_frame,
         "refined_gt_vertex_error_median_mm": refined_gt_frame,
         "stream_id": np.asarray(str(query["stream_id"].item())),
