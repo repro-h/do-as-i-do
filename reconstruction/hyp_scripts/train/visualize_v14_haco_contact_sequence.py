@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--collision-geodesic-sigma-mm", type=float, default=15.0)
     parser.add_argument("--inside-low-fraction", type=float, default=0.01)
     parser.add_argument("--inside-high-fraction", type=float, default=0.02)
+    parser.add_argument("--lightweight-single-frame", action="store_true")
     parser.add_argument("--initial-frame", type=int, default=0)
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--port", type=int, default=8098)
@@ -245,13 +246,17 @@ def main() -> None:
     server = viser.ViserServer(port=args.port)
     server.scene.set_up_direction("-y")
     initial = max(0, min(count - 1, int(args.initial_frame)))
-    frame_slider = server.gui.add_slider(
-        "Frame", min=0, max=count - 1, step=1, initial_value=initial
-    )
-    play_button = server.gui.add_button("Play / Pause")
-    fps_slider = server.gui.add_slider(
-        "FPS", min=1, max=30, step=1, initial_value=int(args.fps)
-    )
+    frame_slider = None
+    play_button = None
+    fps_slider = None
+    if not args.lightweight_single_frame:
+        frame_slider = server.gui.add_slider(
+            "Frame", min=0, max=count - 1, step=1, initial_value=initial
+        )
+        play_button = server.gui.add_button("Play / Pause")
+        fps_slider = server.gui.add_slider(
+            "FPS", min=1, max=30, step=1, initial_value=int(args.fps)
+        )
     threshold_slider = server.gui.add_slider(
         "HACO threshold", min=0.0, max=1.0, step=0.01,
         initial_value=threshold,
@@ -274,14 +279,16 @@ def main() -> None:
             "Raw HACO contacts", initial_value=False
         ),
         "filtered_contact": server.gui.add_checkbox(
-            "Filtered Stage1 contacts", initial_value=True
+            "Filtered Stage1 contacts",
+            initial_value=not args.lightweight_single_frame,
         ),
         "stage2_filtered_contact": server.gui.add_checkbox(
             "Stage2 optimization contacts",
             initial_value=stage2_filtered_mask is not None,
         ),
         "collision_seeds": server.gui.add_checkbox(
-            "Collision seed MANO vertices", initial_value=True
+            "Collision seed MANO vertices",
+            initial_value=not args.lightweight_single_frame,
         ),
         "gt_contact": server.gui.add_checkbox(
             "HACO vertex indices on GT", initial_value=False
@@ -414,9 +421,15 @@ def main() -> None:
             haco_mask[index]
             & (probability[index] > float(threshold_slider.value))
         )
-        selected, filtered_weight, collision_seeds, adaptive_gate = (
-            filtered_contacts(index, active)
-        )
+        if args.lightweight_single_frame:
+            selected = np.empty(0, dtype=np.int64)
+            filtered_weight = np.zeros_like(probability[index])
+            collision_seeds = np.empty(0, dtype=np.int64)
+            adaptive_gate = float("nan")
+        else:
+            selected, filtered_weight, collision_seeds, adaptive_gate = (
+                filtered_contacts(index, active)
+            )
         if active.any():
             strength = probability[index, active, None]
             contact_colors = np.concatenate((
@@ -529,23 +542,28 @@ def main() -> None:
             flush=True,
         )
 
-    @frame_slider.on_update
-    def _(_) -> None:
-        if not suppress["value"]:
-            show_frame(int(frame_slider.value))
+    if frame_slider is not None:
+        @frame_slider.on_update
+        def _(_) -> None:
+            if not suppress["value"]:
+                show_frame(int(frame_slider.value))
 
-    @play_button.on_click
-    def _(_) -> None:
-        playing["value"] = not playing["value"]
+    if play_button is not None:
+        @play_button.on_click
+        def _(_) -> None:
+            playing["value"] = not playing["value"]
+
+    def current_frame() -> int:
+        return int(frame_slider.value) if frame_slider is not None else initial
 
     for control in controls.values():
-        control.on_update(lambda _: show_frame(int(frame_slider.value)))
-    threshold_slider.on_update(lambda _: show_frame(int(frame_slider.value)))
-    point_size.on_update(lambda _: show_frame(int(frame_slider.value)))
+        control.on_update(lambda _: show_frame(current_frame()))
+    threshold_slider.on_update(lambda _: show_frame(current_frame()))
+    point_size.on_update(lambda _: show_frame(current_frame()))
 
     def playback() -> None:
         while True:
-            if playing["value"]:
+            if playing["value"] and frame_slider is not None and fps_slider is not None:
                 next_frame = (int(frame_slider.value) + 1) % count
                 suppress["value"] = True
                 frame_slider.value = next_frame
@@ -555,7 +573,8 @@ def main() -> None:
             else:
                 time.sleep(0.05)
 
-    threading.Thread(target=playback, daemon=True).start()
+    if not args.lightweight_single_frame:
+        threading.Thread(target=playback, daemon=True).start()
     show_frame(initial)
     print(f"Viewer: http://localhost:{args.port}")
     print(
