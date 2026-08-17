@@ -186,6 +186,11 @@ def main() -> None:
                     refined_data["stage1_hand_vertices_camera"][refined_index],
                     dtype=np.float32,
                 )
+            elif "initial_hand_vertices_camera" in refined_data:
+                stage1_hand = np.asarray(
+                    refined_data["initial_hand_vertices_camera"][refined_index],
+                    dtype=np.float32,
+                )
             refined_hand = np.asarray(
                 refined_data["refined_hand_vertices_camera"][refined_index],
                 dtype=np.float32,
