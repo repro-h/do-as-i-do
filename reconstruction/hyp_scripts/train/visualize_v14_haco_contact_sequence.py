@@ -130,14 +130,20 @@ def main() -> None:
         raise ValueError("--object-distance-sigma-mm must be positive")
     if args.collision_geodesic_sigma_mm <= 0:
         raise ValueError("--collision-geodesic-sigma-mm must be positive")
+    print("[viser] loading trajectory", flush=True)
     trajectory = load_npz(Path(args.trajectory_npz).expanduser().resolve())
+    print("[viser] loading WiLoR query", flush=True)
     query = load_npz(Path(args.query_npz).expanduser().resolve())
+    print("[viser] loading HACO contacts", flush=True)
     contact = load_npz(Path(args.contact_sequence_npz).expanduser().resolve())
+    print("[viser] loading Stage1", flush=True)
     stage1 = load_npz(Path(args.stage1_npz).expanduser().resolve())
+    print("[viser] loading Stage2", flush=True)
     stage2 = (
         load_npz(Path(args.stage2_npz).expanduser().resolve())
         if args.stage2_npz else None
     )
+    print("[viser] loading supervision and GT hand", flush=True)
     supervision = load_npz(Path(args.supervision_npz).expanduser().resolve())
     gt = load_npz(Path(args.gt_hand_npz).expanduser().resolve())
 
@@ -205,6 +211,7 @@ def main() -> None:
     gt_faces = np.asarray(gt[f"{side}_faces"], dtype=np.int64)
     gt_valid = np.asarray(gt[f"{side}_valid"]).astype(bool)[:count]
 
+    print("[viser] loading YCB mesh", flush=True)
     object_local, object_faces = load_mesh(
         Path(args.object_mesh).expanduser().resolve(), args.object_scale
     )
@@ -214,7 +221,12 @@ def main() -> None:
     object_vertices = np.empty(
         (count, len(object_local), 3), dtype=np.float32
     )
-    for output_index, supervision_index in enumerate(supervision_indices):
+    object_frames = (
+        [max(0, min(count - 1, int(args.initial_frame)))]
+        if args.lightweight_single_frame else range(count)
+    )
+    for output_index in object_frames:
+        supervision_index = supervision_indices[output_index]
         pose = physical_pose(
             supervision["gt_ycb_object_pose"][supervision_index],
             normalized_left,
@@ -243,6 +255,7 @@ def main() -> None:
         & np.asarray(trajectory["prediction_valid"][trajectory_indices]).astype(bool)
     )
 
+    print(f"[viser] starting server on port {args.port}", flush=True)
     server = viser.ViserServer(port=args.port)
     server.scene.set_up_direction("-y")
     initial = max(0, min(count - 1, int(args.initial_frame)))
