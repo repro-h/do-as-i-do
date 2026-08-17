@@ -200,7 +200,12 @@ def main() -> None:
                     dtype=np.float32,
                 )
                 method = str(refined_data.get("method", np.asarray("")).item())
-                if "containment_pushout" in method:
+                if "stage1_constrained" in method:
+                    baseline_scene_name = "/stage1_rigid_refined_hand"
+                    baseline_description = "Stage-1 rigid hand"
+                    refined_scene_name = "/stage2_constrained_local_hand"
+                    refined_description = "constrained Stage-2 local hand"
+                elif "containment_pushout" in method:
                     baseline_scene_name = "/local_v1_input_hand"
                     baseline_description = "local-v1 input hand"
                     refined_scene_name = "/containment_pushout_hand"

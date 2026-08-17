@@ -40,7 +40,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trajectory-npz", required=True)
     parser.add_argument("--query-npz", required=True)
     parser.add_argument("--stage1-npz", required=True)
-    parser.add_argument("--local-refinement-npz", required=True)
+    parser.add_argument("--local-refinement-npz")
+    parser.add_argument("--contact-sequence-npz")
+    parser.add_argument("--phase-npz")
+    parser.add_argument(
+        "--base-mode", choices=("local", "stage1"), default="local"
+    )
     parser.add_argument("--containment-npz", required=True)
     parser.add_argument("--supervision-npz", required=True)
     parser.add_argument("--object-mesh", required=True)
@@ -61,6 +66,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-weight-floor", type=float, default=0.05)
     parser.add_argument("--w-contact", type=float, default=1.0)
     parser.add_argument("--w-collision", type=float, default=5.0)
+    parser.add_argument("--w-tangential", type=float, default=2.0)
+    parser.add_argument("--w-vertex-anchor", type=float, default=1.0)
     parser.add_argument("--w-pose-anchor", type=float, default=5e-4)
     parser.add_argument("--w-pose-velocity", type=float, default=1e-3)
     parser.add_argument("--w-pose-acceleration", type=float, default=2e-3)
@@ -72,6 +79,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--roundtrip-max-rmse-mm", type=float, default=0.1)
     parser.add_argument("--device", default="cuda")
     return parser.parse_args()
+
+
+@torch.no_grad()
+def nearest_object_correspondences(
+    hand: torch.Tensor,
+    object_points: torch.Tensor,
+    object_normals: torch.Tensor,
+    frame_chunk: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    distances = []
+    points = []
+    normals = []
+    for start in range(0, len(hand), frame_chunk):
+        end = min(start + frame_chunk, len(hand))
+        pairwise = torch.cdist(hand[start:end], object_points[start:end])
+        distance, nearest_index = pairwise.min(dim=-1)
+        nearest_point = torch.gather(
+            object_points[start:end],
+            1,
+            nearest_index[..., None].expand(-1, -1, 3),
+        )
+        nearest_normal = torch.gather(
+            object_normals[start:end],
+            1,
+            nearest_index[..., None].expand(-1, -1, 3),
+        )
+        distances.append(distance)
+        points.append(nearest_point)
+        normals.append(nearest_normal)
+    return torch.cat(distances), torch.cat(points), torch.cat(normals)
 
 
 @torch.no_grad()
@@ -200,15 +237,41 @@ def main() -> None:
     trajectory = load_npz(Path(args.trajectory_npz).expanduser().resolve())
     query = load_npz(Path(args.query_npz).expanduser().resolve())
     stage1 = load_npz(Path(args.stage1_npz).expanduser().resolve())
-    local = load_npz(Path(args.local_refinement_npz).expanduser().resolve())
     containment = load_npz(Path(args.containment_npz).expanduser().resolve())
     supervision = load_npz(Path(args.supervision_npz).expanduser().resolve())
+    local = None
+    contact_source = None
+    phase = None
+    if args.base_mode == "local":
+        if not args.local_refinement_npz:
+            raise ValueError("--base-mode local requires --local-refinement-npz")
+        local = load_npz(
+            Path(args.local_refinement_npz).expanduser().resolve()
+        )
+    else:
+        if not args.contact_sequence_npz or not args.phase_npz:
+            raise ValueError(
+                "--base-mode stage1 requires --contact-sequence-npz and "
+                "--phase-npz"
+            )
+        contact_source = load_npz(
+            Path(args.contact_sequence_npz).expanduser().resolve()
+        )
+        phase = load_npz(Path(args.phase_npz).expanduser().resolve())
     ids = np.asarray(query["frame_ids"])
     trajectory_indices = aligned_indices(trajectory["frame_ids"], ids)
     stage1_indices = aligned_indices(stage1["frame_ids"], ids)
-    local_indices = aligned_indices(local["frame_ids"], ids)
     containment_indices = aligned_indices(containment["frame_ids"], ids)
     supervision_indices = aligned_indices(supervision["frame_ids"], ids)
+    local_indices = None
+    contact_indices = None
+    phase_indices = None
+    if local is not None:
+        local_indices = aligned_indices(local["frame_ids"], ids)
+    else:
+        assert contact_source is not None and phase is not None
+        contact_indices = aligned_indices(contact_source["frame_ids"], ids)
+        phase_indices = aligned_indices(phase["frame_ids"], ids)
     frame_count = len(ids)
 
     wrist_np = np.asarray(
@@ -220,24 +283,56 @@ def main() -> None:
     stage1_angles_np = np.asarray(
         stage1["rotation_euler_xyz"][stage1_indices], dtype=np.float32
     )
-    base_vertices_np = np.asarray(
-        local["refined_hand_vertices_camera"][local_indices], dtype=np.float32
-    )
-    base_pose_np = np.asarray(
-        local["refined_hand_pose_canonical_right"][local_indices], dtype=np.float32
-    )
     global_orient_np = np.asarray(
         query["mano_global_orient_canonical_right"], dtype=np.float32
     )
     betas_np = np.asarray(query["mano_betas"], dtype=np.float32)
     mano_faces_np = np.asarray(query["mano_faces"], dtype=np.int64)
-    contact_mask_np = np.asarray(local["contact_mask"][local_indices]).astype(bool)
-    probability_np = np.asarray(
-        local["contact_probability"][local_indices], dtype=np.float32
-    )
-    contact_gate_np = np.asarray(
-        local["contact_gate"][local_indices], dtype=np.float32
-    )
+    if local is not None:
+        assert local_indices is not None
+        base_vertices_np = np.asarray(
+            local["refined_hand_vertices_camera"][local_indices],
+            dtype=np.float32,
+        )
+        base_pose_np = np.asarray(
+            local["refined_hand_pose_canonical_right"][local_indices],
+            dtype=np.float32,
+        )
+        contact_mask_np = np.asarray(
+            local["contact_mask"][local_indices]
+        ).astype(bool)
+        probability_np = np.asarray(
+            local["contact_probability"][local_indices], dtype=np.float32
+        )
+        contact_gate_np = np.asarray(
+            local["contact_gate"][local_indices], dtype=np.float32
+        )
+        contact_threshold = float(np.asarray(
+            local.get("contact_threshold", np.asarray(0.5))
+        ).item())
+    else:
+        assert contact_source is not None and contact_indices is not None
+        assert phase is not None and phase_indices is not None
+        base_vertices_np = np.asarray(
+            stage1["refined_hand_vertices_camera"][stage1_indices],
+            dtype=np.float32,
+        )
+        base_pose_np = np.asarray(
+            query["mano_hand_pose_canonical_right"], dtype=np.float32
+        )
+        contact_mask_np = np.asarray(
+            contact_source["contact_mask"][contact_indices]
+        ).astype(bool)
+        probability_np = np.asarray(
+            contact_source["contact_probability"][contact_indices],
+            dtype=np.float32,
+        )
+        contact_gate_np = np.asarray(
+            phase["predicted_contact_gate"][phase_indices], dtype=np.float32
+        )
+        contact_threshold = float(np.asarray(
+            contact_source["contact_threshold"]
+        ).item())
     inside_mask_np = np.asarray(
         containment["object_vertex_inside_capped_mano"][containment_indices]
     ).astype(bool)
@@ -319,18 +414,21 @@ def main() -> None:
         )
     if float(roundtrip_rmse.max().cpu()) > args.roundtrip_max_rmse_mm:
         raise RuntimeError(
-            "Local MANO roundtrip exceeded threshold: "
+            f"{args.base_mode} MANO roundtrip exceeded threshold: "
             f"{float(roundtrip_rmse.max().cpu()):.6f} mm"
         )
 
-    initial_distance, initial_normal_inside = nearest_geometry(
-        reconstructed, object_points, object_normals, args.frame_chunk
+    initial_distance, fixed_contact_point, fixed_contact_normal = (
+        nearest_object_correspondences(
+            reconstructed, object_points, object_normals, args.frame_chunk
+        )
     )
-    threshold = float(np.asarray(
-        local.get("contact_threshold", np.asarray(0.5))
-    ).item())
+    initial_normal_inside = (
+        (fixed_contact_point - reconstructed) * fixed_contact_normal
+    ).sum(dim=-1)
     confidence = torch.clamp(
-        (probability - threshold) / max(1.0 - threshold, 1e-6),
+        (probability - contact_threshold)
+        / max(1.0 - contact_threshold, 1e-6),
         min=0.0,
         max=1.0,
     ).pow(args.contact_probability_power)
@@ -344,6 +442,9 @@ def main() -> None:
         + (1.0 - args.contact_weight_floor) * confidence
     ) * plausible_contact
     total_contact_weight = contact_weight.sum().clamp_min(1e-6)
+    total_active_vertices = max(
+        1, int(optimization_gate_np.sum()) * reconstructed.shape[1]
+    )
 
     correspondence_points: list[torch.Tensor | None] = [None] * frame_count
     correspondence_faces: list[torch.Tensor | None] = [None] * frame_count
@@ -380,6 +481,8 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         contact_value = 0.0
         collision_value = 0.0
+        tangential_value = 0.0
+        vertex_anchor_value = 0.0
         for start in range(0, len(active_indices_np), args.frame_chunk):
             indices = active_indices[start:start + args.frame_chunk]
             effective_delta = delta[indices] * optimization_gate[
@@ -396,14 +499,24 @@ def main() -> None:
                 stage1_rotation[indices],
                 mirror_left,
             )
-            pairwise = torch.cdist(refined, object_points[indices])
-            nearest_distance = pairwise.min(dim=-1).values
+            fixed_distance = torch.linalg.norm(
+                refined - fixed_contact_point[indices], dim=-1
+            )
             contact_error = torch.clamp(
-                nearest_distance - contact_target, min=0.0
+                fixed_distance - contact_target, min=0.0
             ).square()
             chunk_contact = (
                 contact_error * contact_weight[indices]
             ).sum() / total_contact_weight
+            displacement = refined - reconstructed[indices]
+            normal_component = (
+                displacement * fixed_contact_normal[indices]
+            ).sum(dim=-1, keepdim=True) * fixed_contact_normal[indices]
+            tangent = displacement - normal_component
+            chunk_tangential = (
+                tangent.square().sum(dim=-1) * contact_weight[indices]
+            ).sum() / total_contact_weight
+            chunk_vertex_anchor = displacement.square().sum() / total_active_vertices
 
             chunk_collision_sum = torch.zeros((), device=device)
             for local_index, global_index_tensor in enumerate(indices):
@@ -434,10 +547,14 @@ def main() -> None:
             chunk_loss = (
                 args.w_contact * chunk_contact
                 + args.w_collision * chunk_collision
+                + args.w_tangential * chunk_tangential
+                + args.w_vertex_anchor * chunk_vertex_anchor
             )
             chunk_loss.backward()
             contact_value += float(chunk_contact.detach())
             collision_value += float(chunk_collision.detach())
+            tangential_value += float(chunk_tangential.detach())
+            vertex_anchor_value += float(chunk_vertex_anchor.detach())
 
         effective_delta = delta * optimization_gate[:, None, None]
         active = optimization_gate
@@ -453,6 +570,8 @@ def main() -> None:
         total_value = (
             args.w_contact * contact_value
             + args.w_collision * collision_value
+            + args.w_tangential * tangential_value
+            + args.w_vertex_anchor * vertex_anchor_value
             + float(regularization.detach())
         )
         if total_value < best_total:
@@ -469,6 +588,8 @@ def main() -> None:
                 "total": total_value,
                 "contact": contact_value,
                 "collision": collision_value,
+                "tangential": tangential_value,
+                "vertex_anchor": vertex_anchor_value,
                 "regularization": float(regularization.detach()),
                 "joint_delta_median_deg": float(
                     best_delta[active].norm(dim=-1).median().cpu()
@@ -575,13 +696,31 @@ def main() -> None:
     effective_delta = best_delta * optimization_gate[:, None, None]
     delta_deg = effective_delta.norm(dim=-1).cpu().numpy() * 180.0 / math.pi
     summary = {
-        "method": "local_mano_fixed_correspondence_containment_pushout_v1",
+        "method": (
+            "stage1_constrained_local_mano_containment_pushout_v1"
+            if args.base_mode == "stage1"
+            else "local_mano_fixed_correspondence_containment_pushout_v1"
+        ),
+        "base_mode": args.base_mode,
         "stream_id": str(query["stream_id"].item()),
         "hand_side": str(query["hand_side"].item()),
         "frames": frame_count,
         "active_frames": int(optimization_gate_np.sum()),
         "collision_points": int(inside_count_np.sum()),
         "collision_margin_mm": args.collision_margin_mm,
+        "weights": {
+            "contact": args.w_contact,
+            "collision": args.w_collision,
+            "tangential": args.w_tangential,
+            "vertex_anchor": args.w_vertex_anchor,
+            "pose_anchor": args.w_pose_anchor,
+            "pose_velocity": args.w_pose_velocity,
+            "pose_acceleration": args.w_pose_acceleration,
+        },
+        "max_joint_delta_deg": args.max_joint_delta_deg,
+        "input_roundtrip_frame_rmse_mm": distribution(
+            roundtrip_rmse.cpu().numpy()
+        ),
         "initial_geometry": initial_geometry,
         "refined_geometry": refined_geometry,
         "containment": collision_metrics,
@@ -590,7 +729,7 @@ def main() -> None:
         "history": history,
         "warning": (
             "Containment active set and closest-face correspondences are fixed "
-            "from the input local refinement for this first test."
+            f"from the input {args.base_mode} hand for this test."
         ),
     }
     output_path = Path(args.out_npz).expanduser().resolve()
