@@ -48,6 +48,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-mp4", required=True)
     parser.add_argument("--out-json")
     parser.add_argument("--object-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--intrinsics",
+        type=float,
+        nargs=4,
+        metavar=("FX", "FY", "CX", "CY"),
+        help=(
+            "Camera intrinsics used when neither supervision nor query NPZ "
+            "contains an intrinsics matrix."
+        ),
+    )
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--force", action="store_true")
@@ -262,7 +272,29 @@ def main() -> None:
     width, height = (int(value) for value in image_wh[0])
     if not np.all(image_wh == image_wh[0]):
         raise ValueError("Image dimensions change inside the sequence")
-    intrinsics = np.asarray(supervision["intrinsics"], dtype=np.float32).reshape(3, 3)
+    if "intrinsics" in supervision:
+        intrinsics = np.asarray(
+            supervision["intrinsics"], dtype=np.float32
+        ).reshape(3, 3)
+        intrinsics_source = "supervision_npz"
+    elif "intrinsics" in query:
+        intrinsics = np.asarray(query["intrinsics"], dtype=np.float32)
+        if intrinsics.ndim == 3:
+            intrinsics = intrinsics[0]
+        intrinsics = intrinsics.reshape(3, 3)
+        intrinsics_source = "query_npz"
+    elif args.intrinsics is not None:
+        fx, fy, cx, cy = args.intrinsics
+        intrinsics = np.asarray(
+            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
+        intrinsics_source = "command_line"
+    else:
+        raise KeyError(
+            "Neither supervision nor query NPZ contains 'intrinsics'; "
+            "pass --intrinsics FX FY CX CY"
+        )
     if normalized_left:
         intrinsics = intrinsics.copy()
         intrinsics[0, 2] = (width - 1) - intrinsics[0, 2]
@@ -333,6 +365,8 @@ def main() -> None:
         "object": "GT YCB mesh with per-frame gt_ycb_object_pose in every panel",
         "hand_side": hand_side,
         "normalized_left_restored_to_physical_camera": normalized_left,
+        "intrinsics_source": intrinsics_source,
+        "intrinsics": intrinsics.tolist(),
         "scene_center": center.tolist(),
         "scene_extent": extent,
     }
