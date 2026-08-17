@@ -175,6 +175,10 @@ def main() -> None:
         )
     stage1_hand = None
     refined_hand = None
+    baseline_scene_name = "/refinement_input_hand"
+    baseline_description = "refinement input hand"
+    refined_scene_name = "/refined_hand"
+    refined_description = "refined hand"
     if args.refined_hand_npz:
         refined_data = load_npz(
             Path(args.refined_hand_npz).expanduser().resolve()
@@ -186,11 +190,26 @@ def main() -> None:
                     refined_data["stage1_hand_vertices_camera"][refined_index],
                     dtype=np.float32,
                 )
+                baseline_scene_name = "/stage1_rigid_refined_hand"
+                baseline_description = "Stage-1 rigid hand"
+                refined_scene_name = "/stage2_local_refined_hand"
+                refined_description = "Stage-2 local hand"
             elif "initial_hand_vertices_camera" in refined_data:
                 stage1_hand = np.asarray(
                     refined_data["initial_hand_vertices_camera"][refined_index],
                     dtype=np.float32,
                 )
+                method = str(refined_data.get("method", np.asarray("")).item())
+                if "containment_pushout" in method:
+                    baseline_scene_name = "/local_v1_input_hand"
+                    baseline_description = "local-v1 input hand"
+                    refined_scene_name = "/containment_pushout_hand"
+                    refined_description = "containment push-out hand"
+                elif "phase_gated" in method:
+                    baseline_scene_name = "/pre_stage1_hand"
+                    baseline_description = "pre-Stage-1 hand"
+                    refined_scene_name = "/stage1_rigid_refined_hand"
+                    refined_description = "Stage-1 rigid hand"
             refined_hand = np.asarray(
                 refined_data["refined_hand_vertices_camera"][refined_index],
                 dtype=np.float32,
@@ -292,7 +311,7 @@ def main() -> None:
         displayed_stage1 = stage1_hand if stage1_hand is not None else refined_hand
         if displayed_stage1 is not None:
             handles.append(server.scene.add_mesh_simple(
-                "/stage1_rigid_refined_hand",
+                baseline_scene_name,
                 displayed_stage1,
                 hand_faces,
                 color=(255, 165, 45),
@@ -300,7 +319,7 @@ def main() -> None:
             ))
         if stage1_hand is not None and refined_hand is not None:
             handles.append(server.scene.add_mesh_simple(
-                "/stage2_local_refined_hand",
+                refined_scene_name,
                 refined_hand,
                 hand_faces,
                 color=(220, 65, 190),
@@ -351,7 +370,7 @@ def main() -> None:
     print(f"Viewer: http://localhost:{args.port}")
     print(
         "Blue=V14 WiLoR hand, red=HACO contact, "
-        "orange=Stage-1 rigid hand, magenta=Stage-2 local hand, "
+        f"orange={baseline_description}, magenta={refined_description}, "
         "green=GT DexYCB hand, "
         "cyan=GT YCB object"
     )
