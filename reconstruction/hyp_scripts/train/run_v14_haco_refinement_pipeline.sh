@@ -105,6 +105,7 @@ PHASE_SCRIPT=$DO_AS_I_DO/reconstruction/hyp_scripts/train/audit_v14_haco_contact
 STAGE1_SCRIPT=$DO_AS_I_DO/reconstruction/hyp_scripts/train/refine_v14_haco_sequence_contact_containment.py
 STAGE2_SCRIPT=$DO_AS_I_DO/reconstruction/hyp_scripts/train/refine_v14_haco_containment_pushout.py
 HACO_VIS_SCRIPT=$DO_AS_I_DO/reconstruction/hyp_scripts/train/visualize_haco_contact_cache.py
+GT_EXPORT_SCRIPT=$DO_AS_I_DO/reconstruction/hyp_scripts/prepare_dexycb_gt_visualization.py
 
 WILOR_ROOT=${WILOR_ROOT:-$DO_AS_I_DO/reconstruction/hyp_modules/WiLoR}
 WILOR_EXPORT=$WILOR_ROOT/scripts/export_dexycb_wilor_queries.py
@@ -118,7 +119,9 @@ HACO_EXPORT=$HACO_ROOT/export_dexycb_contact_sequence.py
 HACO_CKPT=${HACO_CKPT:-$HACO_ROOT/release_checkpoint/haco_neurips_hamer_checkpoint.ckpt}
 
 DEXYCB_MODELS=${DEXYCB_MODELS:-/mnt/nas/wuke/HumanData/DexYCB/models}
-GT_HAND_NPZ=$GLOBAL_V2_ROOT/visualization/phase_a_full_v1_${SPLIT}/$STREAM_ID/gt/dexycb_gt_hand_meshes.npz
+FRAME_MAP_JSON=$DENSE_ROOT/$STREAM_ID/dexycb_frame_map.json
+GT_DIR=$OUT_DIR/gt
+GT_HAND_NPZ=$GT_DIR/dexycb_gt_hand_meshes.npz
 
 QUERY_NPZ=$QUERY_ROOT/$STREAM_ID/wilor_query_cache.npz
 TRAJECTORY_NPZ=$OUT_DIR/v14_trajectory.npz
@@ -215,6 +218,7 @@ for path in \
   "$PI3_PYTHON" "$HACO_PYTHON" "$MANIFEST" "$WINDOWS" \
   "$SUPERVISION_NPZ" "$V14_CKPT" "$V14_SCRIPT" "$PHASE_SCRIPT" \
   "$STAGE1_SCRIPT" "$STAGE2_SCRIPT" "$HACO_VIS_SCRIPT" \
+  "$GT_EXPORT_SCRIPT" "$FRAME_MAP_JSON" \
   "$WILOR_EXPORT" "$WILOR_CKPT" \
   "$WILOR_CONFIG" "$WILOR_DETECTOR" "$HACO_EXPORT" "$HACO_CKPT"
 do
@@ -251,6 +255,13 @@ if [[ -z "$OBJECT_NAME" ]]; then
 fi
 OBJECT_MESH=$DEXYCB_MODELS/$OBJECT_NAME/textured_simple.obj
 require_file "$OBJECT_MESH"
+
+run_stage "DexYCB GT hand/object export" "$GT_HAND_NPZ" \
+  "$PI3_PYTHON" -u "$GT_EXPORT_SCRIPT" \
+    --frame-map-json "$FRAME_MAP_JSON" \
+    --mano-data-dir "$MANO_DATA_DIR" \
+    --object-model-root "$DEXYCB_MODELS" \
+    --out-dir "$GT_DIR"
 
 query_valid=0
 if [[ -s "$QUERY_NPZ" ]]; then
@@ -342,14 +353,8 @@ run_stage "HACO contact visualization" "$HACO_VIS_SUMMARY" \
       --stride 1 \
       --overwrite
 
-gt_phase_args=()
-gt_stage_args=()
-if [[ -s "$GT_HAND_NPZ" ]]; then
-  gt_phase_args=(--gt-hand-npz "$GT_HAND_NPZ")
-  gt_stage_args=(--gt-hand-npz "$GT_HAND_NPZ")
-else
-  echo "[$(timestamp)] optional GT hand not found; GT-only audit metrics disabled"
-fi
+gt_phase_args=(--gt-hand-npz "$GT_HAND_NPZ")
+gt_stage_args=(--gt-hand-npz "$GT_HAND_NPZ")
 
 run_stage "contact phase" "$PHASE_NPZ" \
   env CUDA_VISIBLE_DEVICES="$GPU" "$PI3_PYTHON" -u "$PHASE_SCRIPT" \
@@ -452,6 +457,7 @@ query:       $QUERY_NPZ
 trajectory:  $TRAJECTORY_NPZ
 contact:     $CONTACT_NPZ
 contact vis: $HACO_VIS_DIR
+GT hand:     $GT_HAND_NPZ
 phase:       $PHASE_NPZ
 stage1:      $STAGE1_NPZ
 stage2:      $STAGE2_NPZ

@@ -43,8 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-npz", required=True)
     parser.add_argument("--stage2-npz", required=True)
     parser.add_argument("--supervision-npz", required=True)
-    parser.add_argument("--gt-hand-npz", required=True)
+    parser.add_argument("--gt-hand-npz")
     parser.add_argument("--object-mesh", required=True)
+    parser.add_argument(
+        "--dense-root",
+        help="Pi3X split root used to recover original-camera intrinsics.",
+    )
     parser.add_argument("--out-mp4", required=True)
     parser.add_argument("--out-json")
     parser.add_argument("--object-scale", type=float, default=1.0)
@@ -213,7 +217,10 @@ def main() -> None:
     query = load_npz(Path(args.query_npz).expanduser().resolve())
     stage2 = load_npz(Path(args.stage2_npz).expanduser().resolve())
     supervision = load_npz(Path(args.supervision_npz).expanduser().resolve())
-    gt = load_npz(Path(args.gt_hand_npz).expanduser().resolve())
+    gt = (
+        load_npz(Path(args.gt_hand_npz).expanduser().resolve())
+        if args.gt_hand_npz else None
+    )
     object_canonical, object_faces = load_mesh(
         Path(args.object_mesh).expanduser().resolve(), args.object_scale
     )
@@ -238,12 +245,19 @@ def main() -> None:
     )
     hand_faces = np.asarray(query["mano_faces"], dtype=np.int64)
 
-    gt_vertices = np.asarray(gt[f"{hand_side}_vertices"], dtype=np.float32)
-    gt_faces = np.asarray(gt[f"{hand_side}_faces"], dtype=np.int64)
-    gt_valid = np.asarray(gt[f"{hand_side}_valid"]).astype(bool)[:frame_count]
-    if len(gt_vertices) < frame_count:
-        raise ValueError(f"GT hand has {len(gt_vertices)} frames, expected {frame_count}")
-    gt_vertices = gt_vertices[:frame_count]
+    if gt is not None:
+        gt_vertices = np.asarray(
+            gt[f"{hand_side}_vertices"], dtype=np.float32
+        )
+        gt_faces = np.asarray(gt[f"{hand_side}_faces"], dtype=np.int64)
+        gt_valid = np.asarray(
+            gt[f"{hand_side}_valid"]
+        ).astype(bool)[:frame_count]
+        if len(gt_vertices) < frame_count:
+            raise ValueError(
+                f"GT hand has {len(gt_vertices)} frames, expected {frame_count}"
+            )
+        gt_vertices = gt_vertices[:frame_count]
 
     query_valid = np.asarray(query["model_valid"]).astype(bool)
     prediction_valid = np.asarray(
@@ -283,6 +297,33 @@ def main() -> None:
             intrinsics = intrinsics[0]
         intrinsics = intrinsics.reshape(3, 3)
         intrinsics_source = "query_npz"
+    elif args.dense_root is not None:
+        dense_stream = (
+            Path(args.dense_root).expanduser().resolve()
+            / str(query["stream_id"].item())
+            / "windows"
+        )
+        candidates = sorted(dense_stream.glob("*.npz"))
+        if not candidates:
+            raise FileNotFoundError(
+                f"No Pi3X windows available under {dense_stream}"
+            )
+        dense = load_npz(candidates[0])
+        intrinsics = np.asarray(
+            dense["intrinsics_resized"], dtype=np.float32
+        )
+        if intrinsics.ndim == 3:
+            intrinsics = intrinsics[0]
+        intrinsics = intrinsics.reshape(3, 3).copy()
+        resized_wh = np.asarray(dense["resized_wh"], dtype=np.float32).reshape(2)
+        original_wh = np.asarray([width, height], dtype=np.float32)
+        scale_x = float(original_wh[0] / resized_wh[0])
+        scale_y = float(original_wh[1] / resized_wh[1])
+        intrinsics[0, 0] *= scale_x
+        intrinsics[0, 2] *= scale_x
+        intrinsics[1, 1] *= scale_y
+        intrinsics[1, 2] *= scale_y
+        intrinsics_source = f"pi3x_dense_cache:{candidates[0]}"
     elif args.intrinsics is not None:
         fx, fy, cx, cy = args.intrinsics
         intrinsics = np.asarray(
@@ -299,12 +340,22 @@ def main() -> None:
         intrinsics = intrinsics.copy()
         intrinsics[0, 2] = (width - 1) - intrinsics[0, 2]
 
+    if gt is not None:
+        columns = COLUMNS
+        hands = (v14_vertices, gt_vertices, stage2_vertices)
+        faces = (hand_faces, gt_faces, hand_faces)
+        validity = (v14_valid, gt_valid, stage2_valid)
+    else:
+        columns = (COLUMNS[0], COLUMNS[2])
+        hands = (v14_vertices, stage2_vertices)
+        faces = (hand_faces, hand_faces)
+        validity = (v14_valid, stage2_valid)
+
     center, extent = robust_scene_bounds(
-        [object_vertices, v14_vertices, gt_vertices, stage2_vertices],
-        [object_valid, v14_valid, gt_valid, stage2_valid],
+        [object_vertices, *hands], [object_valid, *validity]
     )
     distance = extent * 1.35
-    total_faces = len(object_faces) + max(len(hand_faces), len(gt_faces))
+    total_faces = len(object_faces) + max(len(value) for value in faces)
     camera_renderer = make_renderer(
         width, height,
         float(intrinsics[0, 0]), float(intrinsics[1, 1]),
@@ -317,11 +368,10 @@ def main() -> None:
         width * 0.5, height * 0.5,
         torch.device(args.device), max(200000, total_faces),
     )
-    writer = make_writer(output, args.fps, (width * 3, height * 4))
+    writer = make_writer(
+        output, args.fps, (width * len(columns), height * len(VIEWS))
+    )
     device = torch.device(args.device)
-    hands = (v14_vertices, gt_vertices, stage2_vertices)
-    faces = (hand_faces, gt_faces, hand_faces)
-    validity = (v14_valid, gt_valid, stage2_valid)
 
     try:
         for index, raw_id in enumerate(ids):
@@ -331,7 +381,7 @@ def main() -> None:
                 view_spec = None if forward is None else (center, forward, distance)
                 renderer = camera_renderer if forward is None else synthetic_renderer
                 panels = []
-                for column_index, (column_name, hand_color) in enumerate(COLUMNS):
+                for column_index, (column_name, hand_color) in enumerate(columns):
                     panel = render_scene(
                         object_vertices[index],
                         object_faces,
@@ -355,13 +405,16 @@ def main() -> None:
         writer.release()
 
     summary = {
-        "method": "v14_gt_stage2_four_view_grid_v1",
+        "method": (
+            "v14_gt_stage2_four_view_grid_v1"
+            if gt is not None else "v14_stage2_four_view_grid_v1"
+        ),
         "output": str(output),
         "frames": frame_count,
         "fps": args.fps,
-        "resolution": [width * 3, height * 4],
+        "resolution": [width * len(columns), height * len(VIEWS)],
         "rows": [name for name, _ in VIEWS],
-        "columns": [name for name, _ in COLUMNS],
+        "columns": [name for name, _ in columns],
         "object": "GT YCB mesh with per-frame gt_ycb_object_pose in every panel",
         "hand_side": hand_side,
         "normalized_left_restored_to_physical_camera": normalized_left,
