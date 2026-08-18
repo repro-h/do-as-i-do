@@ -108,6 +108,18 @@ def parse_args() -> argparse.Namespace:
         "--adaptive-reset-optimizer-on-refresh", action="store_true"
     )
     parser.add_argument("--max-joint-delta-deg", type=float, default=4.0)
+    parser.add_argument("--mcp-max-joint-delta-deg", type=float)
+    parser.add_argument("--pip-max-joint-delta-deg", type=float)
+    parser.add_argument("--dip-max-joint-delta-deg", type=float)
+    parser.add_argument(
+        "--mcp-regularization-scale", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--pip-regularization-scale", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--dip-regularization-scale", type=float, default=1.0
+    )
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--lr", type=float, default=3e-3)
     parser.add_argument("--frame-chunk", type=int, default=4)
@@ -387,6 +399,20 @@ def main() -> None:
         < args.adaptive_collision_min_scale
     ):
         raise ValueError("Invalid adaptive collision scale range")
+    joint_limits = [
+        args.mcp_max_joint_delta_deg,
+        args.pip_max_joint_delta_deg,
+        args.dip_max_joint_delta_deg,
+    ]
+    if any(value is not None and value <= 0 for value in joint_limits):
+        raise ValueError("Joint-group delta limits must be positive")
+    regularization_scales = [
+        args.mcp_regularization_scale,
+        args.pip_regularization_scale,
+        args.dip_regularization_scale,
+    ]
+    if any(value <= 0 for value in regularization_scales):
+        raise ValueError("Joint-group regularization scales must be positive")
     trajectory = load_npz(Path(args.trajectory_npz).expanduser().resolve())
     query = load_npz(Path(args.query_npz).expanduser().resolve())
     stage1 = load_npz(Path(args.stage1_npz).expanduser().resolve())
@@ -843,7 +869,22 @@ def main() -> None:
     active_indices = torch.from_numpy(active_indices_np).to(device)
     contact_target = args.contact_target_mm / 1000.0
     collision_margin = args.collision_margin_mm / 1000.0
-    max_delta = math.radians(args.max_joint_delta_deg)
+    group_limit_deg = [
+        args.max_joint_delta_deg if value is None else value
+        for value in joint_limits
+    ]
+    max_delta = torch.tensor(
+        group_limit_deg * 5, device=device, dtype=delta.dtype
+    ).view(1, 15, 1) * (math.pi / 180.0)
+    joint_regularization_scale = torch.tensor(
+        regularization_scales * 5, device=device, dtype=delta.dtype
+    ).view(1, 15, 1)
+
+    def weighted_joint_mean(value: torch.Tensor) -> torch.Tensor:
+        if not value.numel():
+            return torch.zeros((), device=device, dtype=delta.dtype)
+        weights = joint_regularization_scale.expand(value.shape[0], -1, 3)
+        return (value.square() * weights).sum() / weights.sum()
     best_total = float("inf")
     best_delta = torch.zeros_like(delta)
     history = []
@@ -1021,13 +1062,13 @@ def main() -> None:
 
         effective_delta = delta * optimization_gate[:, None, None]
         active = optimization_gate
-        pose_anchor = effective_delta[active].square().mean()
+        pose_anchor = weighted_joint_mean(effective_delta[active])
         velocity = effective_delta[1:] - effective_delta[:-1]
         acceleration = velocity[1:] - velocity[:-1]
         regularization = (
             args.w_pose_anchor * pose_anchor
-            + args.w_pose_velocity * velocity.square().mean()
-            + args.w_pose_acceleration * acceleration.square().mean()
+            + args.w_pose_velocity * weighted_joint_mean(velocity)
+            + args.w_pose_acceleration * weighted_joint_mean(acceleration)
         )
         regularization.backward()
         total_value = (
@@ -1249,6 +1290,19 @@ def main() -> None:
             "pose_acceleration": args.w_pose_acceleration,
         },
         "max_joint_delta_deg": args.max_joint_delta_deg,
+        "joint_group_constraints": {
+            "order": ["mcp", "pip", "dip"],
+            "max_delta_deg": {
+                "mcp": group_limit_deg[0],
+                "pip": group_limit_deg[1],
+                "dip": group_limit_deg[2],
+            },
+            "regularization_scale": {
+                "mcp": args.mcp_regularization_scale,
+                "pip": args.pip_regularization_scale,
+                "dip": args.dip_regularization_scale,
+            },
+        },
         "contact_filter": {
             "enabled": args.filter_contact_points,
             "global_topk": args.filtered_contact_topk,
