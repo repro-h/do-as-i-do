@@ -54,6 +54,12 @@ def expanded_xywh(box: np.ndarray, ratio: float) -> np.ndarray:
 
 
 def write_image(path: Path, image: np.ndarray) -> None:
+    image = np.asarray(image)
+    if image.dtype != np.uint8:
+        finite = np.nan_to_num(image, nan=0.0, posinf=255.0, neginf=0.0)
+        if finite.size and float(finite.max()) <= 1.0:
+            finite = finite * 255.0
+        image = np.clip(finite, 0.0, 255.0).astype(np.uint8)
     path.parent.mkdir(parents=True, exist_ok=True)
     if not cv2.imwrite(str(path), image):
         raise RuntimeError(f"Failed to write {path}")
@@ -182,7 +188,9 @@ def main() -> None:
         write_image(output_path, rendered_image)
 
         detection = image[..., ::-1].copy()
-        x1, y1, x2, y2 = np.rint(box).astype(int)
+        x1, y1, x2, y2 = (
+            int(value) for value in np.rint(box).tolist()
+        )
         color = (0, 255, 0) if valid else (0, 0, 255)
         cv2.rectangle(detection, (x1, y1), (x2, y2), color, 2)
         cv2.putText(
