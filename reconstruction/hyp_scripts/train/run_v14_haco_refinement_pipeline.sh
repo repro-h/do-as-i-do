@@ -29,11 +29,15 @@ HYBRID_ROOT=${HYBRID_ROOT:-$DO_AS_I_DO/reconstruction/data/dexycb/hybrid_trainin
 GLOBAL_V2_ROOT=${GLOBAL_V2_ROOT:-$HYBRID_ROOT/stage1_global_hand_v2}
 FEATURE_ROOT=${FEATURE_ROOT:-/data2/hyp/unihand-pi3x-feature/v13_pi3x_full_ws16_s8_fp16}
 
-if [[ -d "$INPUT_SEQUENCE" ]]; then
+if [[ -d "$INPUT_SEQUENCE" || "$INPUT_SEQUENCE" == */* ]]; then
   SEQUENCE_DIR=${INPUT_SEQUENCE%/}
   CAMERA_ID=$(basename "$SEQUENCE_DIR")
   SEQUENCE_ID=$(basename "$(dirname "$SEQUENCE_DIR")")
   SUBJECT_ID=$(basename "$(dirname "$(dirname "$SEQUENCE_DIR")")")
+  if [[ -z "$SUBJECT_ID" || -z "$SEQUENCE_ID" || -z "$CAMERA_ID" ]]; then
+    echo "Cannot derive subject/sequence/camera from '$INPUT_SEQUENCE'" >&2
+    exit 2
+  fi
   STREAM_ID=${SUBJECT_ID}__${SEQUENCE_ID}__${CAMERA_ID}
 else
   SEQUENCE_DIR=
