@@ -123,6 +123,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--lr", type=float, default=3e-3)
+    parser.add_argument("--max-grad-norm", type=float, default=10.0)
     parser.add_argument("--frame-chunk", type=int, default=4)
     parser.add_argument("--point-chunk", type=int, default=1024)
     parser.add_argument("--roundtrip-max-rmse-mm", type=float, default=0.1)
@@ -421,6 +422,8 @@ def main() -> None:
         raise ValueError("Invalid adaptive collision scale range")
     if args.w_object_normal_pushout < 0:
         raise ValueError("--w-object-normal-pushout must be non-negative")
+    if args.max_grad_norm <= 0:
+        raise ValueError("--max-grad-norm must be positive")
     joint_limits = [
         args.mcp_max_joint_delta_deg,
         args.pip_max_joint_delta_deg,
@@ -511,6 +514,11 @@ def main() -> None:
         contact_threshold = float(np.asarray(
             local.get("contact_threshold", np.asarray(0.5))
         ).item())
+        contact_valid_np = (
+            np.asarray(local["contact_valid"][local_indices]).astype(bool)
+            if "contact_valid" in local
+            else np.ones(frame_count, dtype=bool)
+        )
     else:
         assert contact_source is not None and contact_indices is not None
         assert phase is not None and phase_indices is not None
@@ -534,6 +542,32 @@ def main() -> None:
         contact_threshold = float(np.asarray(
             contact_source["contact_threshold"]
         ).item())
+        contact_valid_np = (
+            np.asarray(
+                contact_source["contact_valid"][contact_indices]
+            ).astype(bool)
+            if "contact_valid" in contact_source
+            else np.ones(frame_count, dtype=bool)
+        )
+
+    finite_probability_np = np.isfinite(probability_np)
+    invalid_probability_count = int((~finite_probability_np).sum())
+    if invalid_probability_count:
+        print(
+            "Ignoring "
+            f"{invalid_probability_count} non-finite HACO contact probabilities"
+        )
+    contact_mask_np &= finite_probability_np
+    contact_mask_np &= contact_valid_np[:, None]
+    probability_np = np.nan_to_num(
+        probability_np, nan=0.0, posinf=1.0, neginf=0.0
+    )
+    finite_contact_gate_np = np.isfinite(contact_gate_np)
+    contact_valid_np &= finite_contact_gate_np
+    contact_gate_np = np.nan_to_num(
+        contact_gate_np, nan=0.0, posinf=0.0, neginf=0.0
+    )
+    contact_gate_np[~contact_valid_np] = 0.0
     containment_key = next(
         (
             key for key in (
@@ -1144,11 +1178,26 @@ def main() -> None:
             + args.w_vertex_anchor * vertex_anchor_value
             + float(regularization.detach())
         )
+        if not math.isfinite(total_value):
+            raise FloatingPointError(
+                f"Non-finite Stage2 loss at optimization step {step}"
+            )
+        if delta.grad is None or not torch.isfinite(delta.grad).all():
+            raise FloatingPointError(
+                f"Non-finite Stage2 gradient at optimization step {step}"
+            )
+        gradient_norm = torch.linalg.vector_norm(delta.grad)
+        if gradient_norm > args.max_grad_norm:
+            delta.grad.mul_(args.max_grad_norm / gradient_norm)
         if total_value < best_total:
             best_total = total_value
             best_delta = delta.detach().clone()
         optimizer.step()
         with torch.no_grad():
+            if not torch.isfinite(delta).all():
+                raise FloatingPointError(
+                    f"Non-finite Stage2 parameters after optimization step {step}"
+                )
             norm = delta.norm(dim=-1, keepdim=True).clamp_min(1e-12)
             delta.mul_(torch.clamp(max_delta / norm, max=1.0))
             delta[~optimization_gate] = 0

@@ -154,6 +154,24 @@ run_stage() {
   echo "[$(timestamp)] $name: done $output"
 }
 
+stage2_is_finite() {
+  [[ -s "$STAGE2_NPZ" ]] || return 1
+  "$PI3_PYTHON" -c '
+import numpy as np
+import sys
+
+required = (
+    "refined_hand_vertices_camera",
+    "refined_hand_pose_canonical_right",
+    "joint_rotation_delta_rotvec",
+)
+with np.load(sys.argv[1], allow_pickle=False) as data:
+    for key in required:
+        if key not in data.files or not np.isfinite(data[key]).all():
+            raise SystemExit(1)
+' "$STAGE2_NPZ"
+}
+
 for path in \
   "$PI3_PYTHON" "$HACO_PYTHON" "$MANIFEST" "$WINDOWS" \
   "$SUPERVISION_NPZ" "$V14_CKPT" "$V14_SCRIPT" "$PHASE_SCRIPT" \
@@ -315,6 +333,12 @@ run_stage "Stage1 rigid contact/containment" "$STAGE1_NPZ" \
     --steps 300 \
     --device cuda
 
+stage2_force=$FORCE
+if [[ -s "$STAGE2_NPZ" ]] && ! stage2_is_finite; then
+  echo "[$(timestamp)] Stage2 cache is non-finite; recomputing $STAGE2_NPZ"
+  FORCE=1
+fi
+
 run_stage "Stage2 object-normal local pose" "$STAGE2_NPZ" \
   env CUDA_VISIBLE_DEVICES="$GPU" "$PI3_PYTHON" -u "$STAGE2_SCRIPT" \
     --trajectory-npz "$TRAJECTORY_NPZ" \
@@ -361,6 +385,12 @@ run_stage "Stage2 object-normal local pose" "$STAGE2_NPZ" \
     --steps 500 \
     --lr 0.001 \
     --device cuda
+
+FORCE=$stage2_force
+if ! stage2_is_finite; then
+  echo "[$(timestamp)] Stage2 output failed finite-value validation" >&2
+  exit 1
+fi
 
 cat <<EOF
 
