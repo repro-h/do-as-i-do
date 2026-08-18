@@ -8,14 +8,16 @@ DO_AS_I_DO=${DO_AS_I_DO:-/home/mengxiangting/nas/mengxt/Projects/do-as-i-do}
 PI3_PYTHON=${PI3_PYTHON:-/home/mengxiangting/nas/mengxt/anaconda3/envs/pi3/bin/python}
 HACO_PYTHON=${HACO_PYTHON:-/home/mengxiangting/nas/mengxt/miniconda3/envs/haco/bin/python}
 GPU=${GPU:-7}
-SPLIT=${SPLIT:-${2:-val}}
-STREAM_ID=${STREAM_ID:-${1:-}}
 FORCE=${FORCE:-0}
+INPUT_SEQUENCE=${STREAM_ID:-${1:-}}
+SPLIT=${SPLIT:-${2:-}}
 
-if [[ -z "$STREAM_ID" || ( "$SPLIT" != train && "$SPLIT" != val ) ]]; then
+if [[ -z "$INPUT_SEQUENCE" ]]; then
   cat >&2 <<'EOF'
 Usage:
-  run_v14_haco_refinement_pipeline.sh STREAM_ID [train|val]
+  run_v14_haco_refinement_pipeline.sh STREAM_ID_OR_SEQUENCE_DIR [train|val]
+
+The train/val split is detected from the V13 manifests when omitted.
 
 Optional environment variables:
   GPU=7 FORCE=1 V14_CKPT=/path/to/best.pt OBJECT_MESH=/path/to/model.obj
@@ -26,6 +28,61 @@ fi
 HYBRID_ROOT=${HYBRID_ROOT:-$DO_AS_I_DO/reconstruction/data/dexycb/hybrid_training_v1}
 GLOBAL_V2_ROOT=${GLOBAL_V2_ROOT:-$HYBRID_ROOT/stage1_global_hand_v2}
 FEATURE_ROOT=${FEATURE_ROOT:-/data2/hyp/unihand-pi3x-feature/v13_pi3x_full_ws16_s8_fp16}
+
+if [[ -d "$INPUT_SEQUENCE" ]]; then
+  SEQUENCE_DIR=${INPUT_SEQUENCE%/}
+  CAMERA_ID=$(basename "$SEQUENCE_DIR")
+  SEQUENCE_ID=$(basename "$(dirname "$SEQUENCE_DIR")")
+  SUBJECT_ID=$(basename "$(dirname "$(dirname "$SEQUENCE_DIR")")")
+  STREAM_ID=${SUBJECT_ID}__${SEQUENCE_ID}__${CAMERA_ID}
+else
+  SEQUENCE_DIR=
+  STREAM_ID=$INPUT_SEQUENCE
+fi
+
+if [[ -z "$SPLIT" ]]; then
+  SPLIT=$(
+    "$PI3_PYTHON" -c '
+import json
+import sys
+from pathlib import Path
+
+stream_id = sys.argv[1]
+matches = []
+for split, raw_path in zip(("train", "val"), sys.argv[2:]):
+    path = Path(raw_path)
+    if not path.is_file():
+        continue
+    with path.open() as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            if str(json.loads(line).get("stream_id")) == stream_id:
+                matches.append(split)
+                break
+
+if len(matches) == 1:
+    print(matches[0])
+elif not matches:
+    raise SystemExit(
+        f"Stream {stream_id} is absent from both V13 manifests. "
+        "Export its Pi3X cache first or set FEATURE_ROOT correctly."
+    )
+else:
+    raise SystemExit(
+        f"Stream {stream_id} occurs in both train and val manifests: {matches}"
+    )
+' "$STREAM_ID" \
+      "$FEATURE_ROOT/manifests/train.jsonl" \
+      "$FEATURE_ROOT/manifests/val.jsonl"
+  )
+fi
+
+if [[ "$SPLIT" != train && "$SPLIT" != val ]]; then
+  echo "Invalid split '$SPLIT'; expected train or val" >&2
+  exit 2
+fi
+
 TEST_ROOT=${TEST_ROOT:-$DO_AS_I_DO/reconstruction/test_contact}
 OUT_DIR=${OUT_DIR:-$TEST_ROOT/$STREAM_ID}
 QUERY_ROOT=${QUERY_ROOT:-$OUT_DIR/wilor_query_v2}
