@@ -104,6 +104,7 @@ V14_SCRIPT=$DO_AS_I_DO/reconstruction/hyp_scripts/train/apply_v14_wilor_pi3x_abs
 PHASE_SCRIPT=$DO_AS_I_DO/reconstruction/hyp_scripts/train/audit_v14_haco_contact_phase.py
 STAGE1_SCRIPT=$DO_AS_I_DO/reconstruction/hyp_scripts/train/refine_v14_haco_sequence_contact_containment.py
 STAGE2_SCRIPT=$DO_AS_I_DO/reconstruction/hyp_scripts/train/refine_v14_haco_containment_pushout.py
+HACO_VIS_SCRIPT=$DO_AS_I_DO/reconstruction/hyp_scripts/train/visualize_haco_contact_cache.py
 
 WILOR_ROOT=${WILOR_ROOT:-$DO_AS_I_DO/reconstruction/hyp_modules/WiLoR}
 WILOR_EXPORT=$WILOR_ROOT/scripts/export_dexycb_wilor_queries.py
@@ -122,6 +123,8 @@ GT_HAND_NPZ=$GLOBAL_V2_ROOT/visualization/phase_a_full_v1_${SPLIT}/$STREAM_ID/gt
 QUERY_NPZ=$QUERY_ROOT/$STREAM_ID/wilor_query_cache.npz
 TRAJECTORY_NPZ=$OUT_DIR/v14_trajectory.npz
 CONTACT_NPZ=$OUT_DIR/haco_contact_sequence.npz
+HACO_VIS_DIR=$OUT_DIR/haco_contact_visualization
+HACO_VIS_SUMMARY=$HACO_VIS_DIR/summary.json
 PHASE_NPZ=$OUT_DIR/haco_contact_phase.npz
 PHASE_JSON=$OUT_DIR/haco_contact_phase.json
 STAGE1_NPZ=$OUT_DIR/haco_contact_containment_stage1_v3_t30.npz
@@ -175,7 +178,8 @@ with np.load(sys.argv[1], allow_pickle=False) as data:
 for path in \
   "$PI3_PYTHON" "$HACO_PYTHON" "$MANIFEST" "$WINDOWS" \
   "$SUPERVISION_NPZ" "$V14_CKPT" "$V14_SCRIPT" "$PHASE_SCRIPT" \
-  "$STAGE1_SCRIPT" "$STAGE2_SCRIPT" "$WILOR_EXPORT" "$WILOR_CKPT" \
+  "$STAGE1_SCRIPT" "$STAGE2_SCRIPT" "$HACO_VIS_SCRIPT" \
+  "$WILOR_EXPORT" "$WILOR_CKPT" \
   "$WILOR_CONFIG" "$WILOR_DETECTOR" "$HACO_EXPORT" "$HACO_CKPT"
 do
   require_file "$path"
@@ -291,6 +295,17 @@ else
   echo "[$(timestamp)] HACO contact: done $CONTACT_NPZ"
 fi
 
+run_stage "HACO contact visualization" "$HACO_VIS_SUMMARY" \
+  env CUDA_VISIBLE_DEVICES="$GPU" PYOPENGL_PLATFORM=egl \
+    "$HACO_PYTHON" -u "$HACO_VIS_SCRIPT" \
+      --haco-root "$HACO_ROOT" \
+      --query-npz "$QUERY_NPZ" \
+      --contact-npz "$CONTACT_NPZ" \
+      --out-dir "$HACO_VIS_DIR" \
+      --backbone hamer \
+      --stride 1 \
+      --overwrite
+
 gt_phase_args=()
 gt_stage_args=()
 if [[ -s "$GT_HAND_NPZ" ]]; then
@@ -400,6 +415,7 @@ object:      $OBJECT_NAME
 query:       $QUERY_NPZ
 trajectory:  $TRAJECTORY_NPZ
 contact:     $CONTACT_NPZ
+contact vis: $HACO_VIS_DIR
 phase:       $PHASE_NPZ
 stage1:      $STAGE1_NPZ
 stage2:      $STAGE2_NPZ
