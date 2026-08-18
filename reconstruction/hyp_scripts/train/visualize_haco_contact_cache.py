@@ -117,11 +117,21 @@ def main() -> None:
 
     rendered = 0
     invalid = 0
+    missing_bbox = 0
+    skipped_no_hand = 0
     skipped = 0
     for index in range(0, len(query_ids), args.stride):
         current_id = query_ids[index]
         output_path = output_dir / "contact" / f"{current_id}.png"
         detection_path = output_dir / "detection" / f"{current_id}.png"
+        box = np.asarray(query[box_key][index], dtype=np.float32)
+        box_is_finite = bool(np.isfinite(box).all())
+        if not model_valid[index] or not box_is_finite:
+            output_path.unlink(missing_ok=True)
+            detection_path.unlink(missing_ok=True)
+            missing_bbox += int(not box_is_finite)
+            skipped_no_hand += 1
+            continue
         if (
             not args.overwrite
             and output_path.is_file()
@@ -138,7 +148,6 @@ def main() -> None:
         if mirrored:
             image = np.ascontiguousarray(image[:, ::-1])
 
-        box = np.asarray(query[box_key][index], dtype=np.float32)
         crop_box = expanded_xywh(
             box, cfg.DATASET.ho_big_bbox_expand_ratio
         )
@@ -148,7 +157,7 @@ def main() -> None:
         contact_index = contact_lookup[current_id]
         finite = bool(np.isfinite(probabilities[contact_index]).all())
         valid = bool(
-            model_valid[index] and contact_valid[contact_index] and finite
+            contact_valid[contact_index] and finite
         )
 
         if valid:
@@ -172,7 +181,9 @@ def main() -> None:
             rendered += 1
         else:
             rendered_image = cv2.resize(
-                crop[..., ::-1], cfg.MODEL.input_img_shape, interpolation=cv2.INTER_CUBIC
+                crop[..., ::-1],
+                cfg.MODEL.input_img_shape,
+                interpolation=cv2.INTER_CUBIC,
             )
             cv2.putText(
                 rendered_image,
@@ -188,15 +199,16 @@ def main() -> None:
         write_image(output_path, rendered_image)
 
         detection = image[..., ::-1].copy()
+        color = (0, 255, 0) if valid else (0, 0, 255)
         x1, y1, x2, y2 = (
             int(value) for value in np.rint(box).tolist()
         )
-        color = (0, 255, 0) if valid else (0, 0, 255)
         cv2.rectangle(detection, (x1, y1), (x2, y2), color, 2)
+        text_origin = (max(0, x1), max(22, y1 - 8))
         cv2.putText(
             detection,
             f"HACO input {current_id} valid={int(valid)}",
-            (max(0, x1), max(22, y1 - 8)),
+            text_origin,
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
             color,
@@ -214,6 +226,8 @@ def main() -> None:
         "stride": args.stride,
         "rendered_valid_frames": rendered,
         "rendered_invalid_frames": invalid,
+        "frames_without_finite_bbox": missing_bbox,
+        "skipped_no_hand_or_wilor_invalid": skipped_no_hand,
         "cached_frames": skipped,
         "mirrored_to_canonical_right": mirrored,
         "contact_dir": str(output_dir / "contact"),
