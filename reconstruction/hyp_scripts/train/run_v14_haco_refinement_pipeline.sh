@@ -452,6 +452,7 @@ cat <<EOF
 
 [$(timestamp)] pipeline complete
 stream:      $STREAM_ID
+split:       $SPLIT
 object:      $OBJECT_NAME
 query:       $QUERY_NPZ
 trajectory:  $TRAJECTORY_NPZ
