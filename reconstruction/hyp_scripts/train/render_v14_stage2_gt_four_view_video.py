@@ -42,6 +42,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trajectory-npz", required=True)
     parser.add_argument("--query-npz", required=True)
     parser.add_argument("--stage2-npz", required=True)
+    parser.add_argument("--refined-label", default="Stage2 refined")
+    parser.add_argument("--omit-v14", action="store_true")
     parser.add_argument("--supervision-npz", required=True)
     parser.add_argument("--gt-hand-npz")
     parser.add_argument("--object-mesh", required=True)
@@ -341,15 +343,27 @@ def main() -> None:
         intrinsics[0, 2] = (width - 1) - intrinsics[0, 2]
 
     if gt is not None:
-        columns = COLUMNS
-        hands = (v14_vertices, gt_vertices, stage2_vertices)
-        faces = (hand_faces, gt_faces, hand_faces)
-        validity = (v14_valid, gt_valid, stage2_valid)
+        if args.omit_v14:
+            columns = (COLUMNS[1], (args.refined_label, COLUMNS[2][1]))
+            hands = (gt_vertices, stage2_vertices)
+            faces = (gt_faces, hand_faces)
+            validity = (gt_valid, stage2_valid)
+        else:
+            columns = (COLUMNS[0], COLUMNS[1], (args.refined_label, COLUMNS[2][1]))
+            hands = (v14_vertices, gt_vertices, stage2_vertices)
+            faces = (hand_faces, gt_faces, hand_faces)
+            validity = (v14_valid, gt_valid, stage2_valid)
     else:
-        columns = (COLUMNS[0], COLUMNS[2])
-        hands = (v14_vertices, stage2_vertices)
-        faces = (hand_faces, hand_faces)
-        validity = (v14_valid, stage2_valid)
+        if args.omit_v14:
+            columns = ((args.refined_label, COLUMNS[2][1]),)
+            hands = (stage2_vertices,)
+            faces = (hand_faces,)
+            validity = (stage2_valid,)
+        else:
+            columns = (COLUMNS[0], (args.refined_label, COLUMNS[2][1]))
+            hands = (v14_vertices, stage2_vertices)
+            faces = (hand_faces, hand_faces)
+            validity = (v14_valid, stage2_valid)
 
     center, extent = robust_scene_bounds(
         [object_vertices, *hands], [object_valid, *validity]
