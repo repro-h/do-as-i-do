@@ -83,6 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--collision-region-floor", type=float, default=0.05)
     parser.add_argument("--w-contact", type=float, default=1.0)
     parser.add_argument("--w-collision", type=float, default=5.0)
+    parser.add_argument("--w-object-normal-pushout", type=float, default=0.0)
     parser.add_argument("--w-tangential", type=float, default=2.0)
     parser.add_argument("--w-vertex-anchor", type=float, default=1.0)
     parser.add_argument("--w-pose-anchor", type=float, default=5e-4)
@@ -206,12 +207,23 @@ def build_object_geometry(
     indices: np.ndarray,
     normalized_left: bool,
     sample_count: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     canonical_vertices = np.asarray(mesh.vertices, dtype=np.float32)
+    canonical_vertex_normals = np.asarray(
+        mesh.vertex_normals, dtype=np.float32
+    )
+    if canonical_vertex_normals.shape != canonical_vertices.shape:
+        raise ValueError(
+            "Object vertex-normal shape mismatch: "
+            f"{canonical_vertex_normals.shape} != {canonical_vertices.shape}"
+        )
+    if not np.isfinite(canonical_vertex_normals).all():
+        raise ValueError("Object vertex normals contain non-finite values")
     sampled, sampled_normals = deterministic_surface_samples(mesh, sample_count)
     object_vertices = np.empty(
         (len(indices), len(canonical_vertices), 3), dtype=np.float32
     )
+    object_vertex_normals = np.empty_like(object_vertices)
     object_points = np.empty((len(indices), sample_count, 3), dtype=np.float32)
     object_normals = np.empty_like(object_points)
     for output_index, supervision_index in enumerate(indices):
@@ -222,9 +234,17 @@ def build_object_geometry(
         object_vertices[output_index] = (
             canonical_vertices @ pose[:3, :3].T + pose[:3, 3]
         )
+        object_vertex_normals[output_index] = (
+            canonical_vertex_normals @ pose[:3, :3].T
+        )
         object_points[output_index] = sampled @ pose[:3, :3].T + pose[:3, 3]
         object_normals[output_index] = sampled_normals @ pose[:3, :3].T
-    return object_vertices, object_points, object_normals
+    return (
+        object_vertices,
+        object_vertex_normals,
+        object_points,
+        object_normals,
+    )
 
 
 @torch.no_grad()
@@ -399,6 +419,8 @@ def main() -> None:
         < args.adaptive_collision_min_scale
     ):
         raise ValueError("Invalid adaptive collision scale range")
+    if args.w_object_normal_pushout < 0:
+        raise ValueError("--w-object-normal-pushout must be non-negative")
     joint_limits = [
         args.mcp_max_joint_delta_deg,
         args.pip_max_joint_delta_deg,
@@ -547,7 +569,12 @@ def main() -> None:
     normalized_left = bool(np.asarray(
         supervision.get("normalized_left", False)
     ).item())
-    object_vertices_np, object_points_np, object_normals_np = build_object_geometry(
+    (
+        object_vertices_np,
+        object_vertex_normals_np,
+        object_points_np,
+        object_normals_np,
+    ) = build_object_geometry(
         mesh,
         supervision,
         supervision_indices,
@@ -649,13 +676,18 @@ def main() -> None:
         list[torch.Tensor | None],
         list[torch.Tensor | None],
         list[torch.Tensor | None],
+        list[torch.Tensor | None],
     ]:
         points_by_frame: list[torch.Tensor | None] = [None] * frame_count
+        normals_by_frame: list[torch.Tensor | None] = [None] * frame_count
         faces_by_frame: list[torch.Tensor | None] = [None] * frame_count
         barycentric_by_frame: list[torch.Tensor | None] = [None] * frame_count
         for index in np.flatnonzero(inside_mask.sum(axis=1) > 0):
             points = torch.from_numpy(
                 object_vertices_np[index, inside_mask[index]]
+            ).to(device)
+            normals = torch.from_numpy(
+                object_vertex_normals_np[index, inside_mask[index]]
             ).to(device)
             face_index, barycentric = closest_face_correspondences(
                 points,
@@ -664,13 +696,20 @@ def main() -> None:
                 args.correspondence_topk,
             )
             points_by_frame[index] = points
+            normals_by_frame[index] = normals
             faces_by_frame[index] = face_index
             barycentric_by_frame[index] = barycentric
-        return points_by_frame, faces_by_frame, barycentric_by_frame
+        return (
+            points_by_frame,
+            normals_by_frame,
+            faces_by_frame,
+            barycentric_by_frame,
+        )
 
     with torch.no_grad():
         (
             correspondence_points,
+            correspondence_object_normals,
             correspondence_faces,
             correspondence_barycentric,
         ) = build_collision_correspondences(reconstructed, inside_mask_np)
@@ -933,6 +972,7 @@ def main() -> None:
                 )
                 (
                     correspondence_points,
+                    correspondence_object_normals,
                     correspondence_faces,
                     correspondence_barycentric,
                 ) = build_collision_correspondences(
@@ -981,6 +1021,7 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         contact_value = 0.0
         collision_value = 0.0
+        object_normal_pushout_value = 0.0
         tangential_value = 0.0
         vertex_anchor_value = 0.0
         for start in range(0, len(active_indices_np), args.frame_chunk):
@@ -1023,12 +1064,19 @@ def main() -> None:
             chunk_vertex_anchor = displacement.square().sum() / total_active_vertices
 
             chunk_collision_sum = torch.zeros((), device=device)
+            chunk_object_normal_pushout_sum = torch.zeros((), device=device)
             for local_index, global_index_tensor in enumerate(indices):
                 global_index = int(global_index_tensor.item())
                 points = correspondence_points[global_index]
+                point_normals = correspondence_object_normals[global_index]
                 face_index = correspondence_faces[global_index]
                 barycentric = correspondence_barycentric[global_index]
-                if points is None or face_index is None or barycentric is None:
+                if (
+                    points is None
+                    or point_normals is None
+                    or face_index is None
+                    or barycentric is None
+                ):
                     continue
                 selected_faces = mano_faces[face_index]
                 triangles = refined[local_index, selected_faces]
@@ -1047,16 +1095,33 @@ def main() -> None:
                 chunk_collision_sum = chunk_collision_sum + torch.clamp(
                     collision_margin - signed_clearance, min=0.0
                 ).square().sum() * frame_collision_scale[global_index]
+                object_clearance = (
+                    (surface - points) * point_normals
+                ).sum(dim=-1)
+                chunk_object_normal_pushout_sum = (
+                    chunk_object_normal_pushout_sum
+                    + torch.clamp(
+                        collision_margin - object_clearance, min=0.0
+                    ).square().sum() * frame_collision_scale[global_index]
+                )
             chunk_collision = chunk_collision_sum / total_collision_points
+            chunk_object_normal_pushout = (
+                chunk_object_normal_pushout_sum / total_collision_points
+            )
             chunk_loss = (
                 args.w_contact * chunk_contact
                 + args.w_collision * chunk_collision
+                + args.w_object_normal_pushout
+                * chunk_object_normal_pushout
                 + args.w_tangential * chunk_tangential
                 + args.w_vertex_anchor * chunk_vertex_anchor
             )
             chunk_loss.backward()
             contact_value += float(chunk_contact.detach())
             collision_value += float(chunk_collision.detach())
+            object_normal_pushout_value += float(
+                chunk_object_normal_pushout.detach()
+            )
             tangential_value += float(chunk_tangential.detach())
             vertex_anchor_value += float(chunk_vertex_anchor.detach())
 
@@ -1074,6 +1139,7 @@ def main() -> None:
         total_value = (
             args.w_contact * contact_value
             + args.w_collision * collision_value
+            + args.w_object_normal_pushout * object_normal_pushout_value
             + args.w_tangential * tangential_value
             + args.w_vertex_anchor * vertex_anchor_value
             + float(regularization.detach())
@@ -1092,6 +1158,7 @@ def main() -> None:
                 "total": total_value,
                 "contact": contact_value,
                 "collision": collision_value,
+                "object_normal_pushout": object_normal_pushout_value,
                 "tangential": tangential_value,
                 "vertex_anchor": vertex_anchor_value,
                 "regularization": float(regularization.detach()),
@@ -1159,6 +1226,7 @@ def main() -> None:
     if args.filter_contact_points:
         with torch.no_grad():
             (
+                _,
                 _,
                 final_collision_faces,
                 _,
@@ -1262,7 +1330,9 @@ def main() -> None:
     delta_deg = effective_delta.norm(dim=-1).cpu().numpy() * 180.0 / math.pi
     summary = {
         "method": (
-            "filtered_adaptive_collision_contact_local_mano_pushout_v2"
+            "object_normal_adaptive_collision_contact_local_mano_pushout_v1"
+            if args.adaptive_balance and args.w_object_normal_pushout > 0
+            else "filtered_adaptive_collision_contact_local_mano_pushout_v2"
             if args.adaptive_balance and args.filter_contact_points
             else "adaptive_collision_contact_local_mano_pushout_v1"
             if args.adaptive_balance
@@ -1283,6 +1353,7 @@ def main() -> None:
         "weights": {
             "contact": args.w_contact,
             "collision": args.w_collision,
+            "object_normal_pushout": args.w_object_normal_pushout,
             "tangential": args.w_tangential,
             "vertex_anchor": args.w_vertex_anchor,
             "pose_anchor": args.w_pose_anchor,
