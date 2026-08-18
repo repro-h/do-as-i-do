@@ -9,6 +9,11 @@ PI3_PYTHON=${PI3_PYTHON:-/home/mengxiangting/nas/mengxt/anaconda3/envs/pi3/bin/p
 HACO_PYTHON=${HACO_PYTHON:-/home/mengxiangting/nas/mengxt/miniconda3/envs/haco/bin/python}
 GPU=${GPU:-7}
 FORCE=${FORCE:-0}
+REFINEMENT_VARIANT=${REFINEMENT_VARIANT:-grasp_balanced_v1}
+STAGE1_CONTACT_TARGET_MM=${STAGE1_CONTACT_TARGET_MM:-2}
+STAGE1_CORRECTION_STOP_MM=${STAGE1_CORRECTION_STOP_MM:-4}
+STAGE1_CORRECTION_FULL_MM=${STAGE1_CORRECTION_FULL_MM:-12}
+STAGE1_MAX_TRANSLATION_MM=${STAGE1_MAX_TRANSLATION_MM:-40}
 INPUT_SEQUENCE=${1:-}
 SPLIT=${2:-}
 
@@ -21,6 +26,7 @@ The train/val split is detected from the V13 manifests when omitted.
 
 Optional environment variables:
   GPU=7 FORCE=1 V14_CKPT=/path/to/best.pt
+  REFINEMENT_VARIANT=grasp_balanced_v1
 EOF
   exit 2
 fi
@@ -130,10 +136,10 @@ HACO_VIS_DIR=$OUT_DIR/haco_contact_visualization
 HACO_VIS_SUMMARY=$HACO_VIS_DIR/summary.json
 PHASE_NPZ=$OUT_DIR/haco_contact_phase.npz
 PHASE_JSON=$OUT_DIR/haco_contact_phase.json
-STAGE1_NPZ=$OUT_DIR/haco_contact_containment_stage1_v3_t30.npz
-STAGE1_JSON=$OUT_DIR/haco_contact_containment_stage1_v3_t30.json
-STAGE2_NPZ=$OUT_DIR/haco_stage2_object_normal_pushout_joint16_v1.npz
-STAGE2_JSON=$OUT_DIR/haco_stage2_object_normal_pushout_joint16_v1.json
+STAGE1_NPZ=$OUT_DIR/haco_contact_containment_stage1_${REFINEMENT_VARIANT}.npz
+STAGE1_JSON=$OUT_DIR/haco_contact_containment_stage1_${REFINEMENT_VARIANT}.json
+STAGE2_NPZ=$OUT_DIR/haco_stage2_object_normal_pushout_joint16_${REFINEMENT_VARIANT}.npz
+STAGE2_JSON=$OUT_DIR/haco_stage2_object_normal_pushout_joint16_${REFINEMENT_VARIANT}.json
 
 timestamp() {
   /bin/date '+%Y-%m-%d %H:%M:%S'
@@ -376,15 +382,18 @@ run_stage "Stage1 rigid contact/containment" "$STAGE1_NPZ" \
     --phase-npz "$PHASE_NPZ" \
     --supervision-npz "$SUPERVISION_NPZ" \
     --object-mesh "$OBJECT_MESH" \
+    --mano-data-dir "$MANO_DATA_DIR" \
+    --region-balanced-contact \
+    --contact-region-min-vertices 3 \
     "${gt_stage_args[@]}" \
     --out-npz "$STAGE1_NPZ" \
     --out-json "$STAGE1_JSON" \
-    --contact-target-mm 6 \
-    --correction-stop-mm 10 \
-    --correction-full-mm 18 \
+    --contact-target-mm "$STAGE1_CONTACT_TARGET_MM" \
+    --correction-stop-mm "$STAGE1_CORRECTION_STOP_MM" \
+    --correction-full-mm "$STAGE1_CORRECTION_FULL_MM" \
     --collision-margin-mm 0.5 \
     --containment-refresh 25 \
-    --max-translation-mm 30 \
+    --max-translation-mm "$STAGE1_MAX_TRANSLATION_MM" \
     --max-rotation-deg 5 \
     --steps 300 \
     --device cuda

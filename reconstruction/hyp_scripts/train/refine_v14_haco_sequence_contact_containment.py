@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import pickle
 from pathlib import Path
 
 import numpy as np
@@ -33,6 +34,16 @@ from refine_v14_haco_sequence_chamfer import (
 from visualize_capped_mano_wrist import directed_boundary_loop
 
 
+MANO_CONTACT_REGIONS = {
+    "palm": (0,),
+    "index": (1, 2, 3),
+    "middle": (4, 5, 6),
+    "pinky": (7, 8, 9),
+    "ring": (10, 11, 12),
+    "thumb": (13, 14, 15),
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--trajectory-npz", required=True)
@@ -50,6 +61,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--softmax-sigma-mm", type=float, default=10.0)
     parser.add_argument("--contact-probability-power", type=float, default=2.0)
     parser.add_argument("--contact-weight-floor", type=float, default=0.05)
+    parser.add_argument("--mano-data-dir")
+    parser.add_argument("--region-balanced-contact", action="store_true")
+    parser.add_argument("--contact-region-min-vertices", type=int, default=3)
     parser.add_argument("--contact-target-mm", type=float, default=6.0)
     parser.add_argument("--correction-stop-mm", type=float, default=10.0)
     parser.add_argument("--correction-full-mm", type=float, default=18.0)
@@ -76,6 +90,53 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-oracle-gate", action="store_true")
     parser.add_argument("--device", default="cuda")
     return parser.parse_args()
+
+
+def mano_contact_region_ids(
+    mano_data_dir: str, hand_side: str
+) -> tuple[np.ndarray, list[str]]:
+    model_name = "MANO_LEFT.pkl" if hand_side == "left" else "MANO_RIGHT.pkl"
+    model_path = Path(mano_data_dir).expanduser().resolve() / model_name
+    with model_path.open("rb") as handle:
+        raw = pickle.load(handle, encoding="latin1")
+    weights = raw.get("weights", raw.get("lbs_weights"))
+    if weights is None:
+        raise KeyError(f"No MANO skinning weights in {model_path}")
+    if hasattr(weights, "toarray"):
+        weights = weights.toarray()
+    weights = np.asarray(weights, dtype=np.float32)
+    if weights.shape[0] != 778 or weights.shape[1] < 16:
+        raise ValueError(f"Unexpected MANO weights shape: {weights.shape}")
+
+    names = list(MANO_CONTACT_REGIONS)
+    scores = np.stack(
+        [weights[:, joints].sum(axis=1) for joints in MANO_CONTACT_REGIONS.values()],
+        axis=-1,
+    )
+    return np.argmax(scores, axis=-1).astype(np.int64), names
+
+
+@torch.no_grad()
+def contact_region_distance_median_mm(
+    hand: torch.Tensor,
+    object_points: torch.Tensor,
+    contact_mask: np.ndarray,
+    region_ids: np.ndarray,
+    region_count: int,
+    frame_chunk: int,
+) -> np.ndarray:
+    output = np.full((len(hand), region_count), np.nan, dtype=np.float32)
+    for start in range(0, len(hand), frame_chunk):
+        stop = min(start + frame_chunk, len(hand))
+        distance = torch.cdist(hand[start:stop], object_points[start:stop]).min(
+            dim=-1
+        ).values.cpu().numpy()
+        for local, frame in enumerate(range(start, stop)):
+            for region in range(region_count):
+                selected = contact_mask[frame] & (region_ids == region)
+                if selected.any():
+                    output[frame, region] = np.median(distance[local, selected]) * 1000.0
+    return output
 
 
 @torch.no_grad()
@@ -198,8 +259,50 @@ def main() -> None:
         vertices, contact_mask, object_points, object_normals, phase_gate,
         args.penetration_tolerance_mm, args.penetration_trust_mm, args.frame_chunk,
     )
+
+    contact_region_names: list[str] = []
+    contact_region_ids_np = np.full(vertices_np.shape[1], -1, dtype=np.int64)
+    contact_region_count_np = np.zeros((frame_count, 0), dtype=np.int32)
+    contact_region_active_np = np.zeros((frame_count, 0), dtype=bool)
+    initial_region_distance = np.empty((frame_count, 0), dtype=np.float32)
+    correction_distance_np = initial_per_frame["contact_distance_median_mm"].copy()
+    contact_region_mask_np = None
+    if args.region_balanced_contact:
+        if not args.mano_data_dir:
+            raise ValueError("--region-balanced-contact requires --mano-data-dir")
+        contact_region_ids_np, contact_region_names = mano_contact_region_ids(
+            args.mano_data_dir, str(query["hand_side"].item()).lower()
+        )
+        contact_region_mask_np = np.stack(
+            [contact_region_ids_np == index for index in range(len(contact_region_names))]
+        )
+        contact_region_count_np = np.stack(
+            [
+                (contact_mask_np & contact_region_mask_np[index][None]).sum(axis=1)
+                for index in range(len(contact_region_names))
+            ],
+            axis=-1,
+        ).astype(np.int32)
+        contact_region_active_np = (
+            (contact_region_count_np >= args.contact_region_min_vertices)
+            & (phase_gate_np[:, None] > 0)
+        )
+        if not contact_region_active_np.any():
+            raise RuntimeError("No HACO contact region passed the minimum vertex count")
+        initial_region_distance = contact_region_distance_median_mm(
+            vertices, object_points, contact_mask_np, contact_region_ids_np,
+            len(contact_region_names), args.frame_chunk,
+        )
+        # A well-aligned palm must not hide a missed thumb or index pinch.
+        # Contact-only correction is gated by the worst HACO-active region.
+        for frame in range(frame_count):
+            selected = initial_region_distance[frame, contact_region_active_np[frame]]
+            selected = selected[np.isfinite(selected)]
+            if len(selected):
+                correction_distance_np[frame] = selected.max()
+
     contact_gate_np = correction_gate_from_contact_distance(
-        initial_per_frame["contact_distance_median_mm"], phase_gate_np,
+        correction_distance_np, phase_gate_np,
         args.correction_stop_mm, args.correction_full_mm,
     )
     contact_gate = torch.from_numpy(contact_gate_np).to(device)
@@ -210,9 +313,17 @@ def main() -> None:
     # Keep every phase-active HACO contact as a one-sided safety tether.  The
     # correction gate decides whether contact alone may move a frame, but it
     # must not disable contact preservation when collision push-out is active.
-    contact_weight = (
+    contact_base_weight = (
         args.contact_weight_floor + (1.0 - args.contact_weight_floor) * confidence
-    ) * contact_mask * phase_gate[:, None]
+    ) * contact_mask
+    contact_weight = contact_base_weight * phase_gate[:, None]
+
+    contact_region_mask = None
+    contact_region_active = None
+    total_contact_region_scale = None
+    if args.region_balanced_contact:
+        contact_region_mask = torch.from_numpy(contact_region_mask_np).to(device)
+        contact_region_active = torch.from_numpy(contact_region_active_np).to(device)
 
     translation = torch.zeros((frame_count, 3), device=device, requires_grad=True)
     angles = torch.zeros((frame_count, 3), device=device, requires_grad=True)
@@ -275,6 +386,11 @@ def main() -> None:
         optimization_active = torch.from_numpy(optimization_active_np).to(device)
         correction_support = torch.from_numpy(correction_support_np).to(device)
         total_contact_weight = contact_weight[optimization_active].sum().clamp_min(1e-6)
+        if args.region_balanced_contact:
+            total_contact_region_scale = (
+                contact_region_active[optimization_active]
+                * phase_gate[optimization_active, None]
+            ).sum().clamp_min(1e-6)
         total_collision_points = max(
             1, int(inside_count[collision_active_np].sum())
         )
@@ -298,9 +414,25 @@ def main() -> None:
             contact_error = torch.clamp(
                 effective_distance - contact_target, min=0.0
             ).square()
-            chunk_contact = (
-                contact_error * contact_weight[indices]
-            ).sum() / total_contact_weight
+            if args.region_balanced_contact:
+                region_weight = (
+                    contact_base_weight[indices, None]
+                    * contact_region_mask[None]
+                )
+                region_denominator = region_weight.sum(dim=-1).clamp_min(1e-6)
+                region_error = (
+                    contact_error[:, None] * region_weight
+                ).sum(dim=-1) / region_denominator
+                region_scale = (
+                    contact_region_active[indices] * phase_gate[indices, None]
+                )
+                chunk_contact = (
+                    region_error * region_scale
+                ).sum() / total_contact_region_scale
+            else:
+                chunk_contact = (
+                    contact_error * contact_weight[indices]
+                ).sum() / total_contact_weight
 
             collision_sum = torch.zeros((), device=device)
             for local_index, global_tensor in enumerate(indices):
@@ -405,9 +537,26 @@ def main() -> None:
     gt_summary, initial_gt_frame, refined_gt_frame = gt_audit(
         args.gt_hand_npz, query, valid_np, vertices_np, refined_np
     )
+    refined_region_distance = np.empty((frame_count, 0), dtype=np.float32)
+    region_distance_summary: dict[str, object] = {}
+    if args.region_balanced_contact:
+        refined_region_distance = contact_region_distance_median_mm(
+            refined, object_points, contact_mask_np, contact_region_ids_np,
+            len(contact_region_names), args.frame_chunk,
+        )
+        for index, name in enumerate(contact_region_names):
+            evaluated = contact_region_active_np[:, index]
+            region_distance_summary[name] = {
+                "initial": distribution(initial_region_distance[evaluated, index]),
+                "refined": distribution(refined_region_distance[evaluated, index]),
+            }
 
     summary = {
-        "method": "joint_haco_contact_capped_mano_containment_rigid_stage1_v3",
+        "method": (
+            "region_balanced_haco_contact_capped_mano_containment_rigid_stage1_v4"
+            if args.region_balanced_contact
+            else "joint_haco_contact_capped_mano_containment_rigid_stage1_v3"
+        ),
         "stream_id": str(query["stream_id"].item()),
         "frames": frame_count,
         "gate_source": gate_key,
@@ -431,6 +580,19 @@ def main() -> None:
             "translation_anchor": args.w_translation_anchor,
             "rotation_anchor": args.w_rotation_anchor,
         },
+        "contact_aggregation": (
+            "mano_region_balanced" if args.region_balanced_contact else "global_vertex"
+        ),
+        "contact_regions": {
+            "names": contact_region_names,
+            "minimum_vertices": args.contact_region_min_vertices,
+            "active_frame_regions": int(contact_region_active_np.sum()),
+            "active_frames_by_region": {
+                name: int(contact_region_active_np[:, index].sum())
+                for index, name in enumerate(contact_region_names)
+            },
+            "distance_mm": region_distance_summary,
+        },
         "containment_refresh": args.containment_refresh,
         "collision_stop_count": args.collision_stop_count,
         "gt_audit": gt_summary,
@@ -445,8 +607,15 @@ def main() -> None:
         "mano_faces": faces_np,
         "contact_mask": contact_mask_np,
         "contact_probability": probability_np.astype(np.float16),
+        "contact_region_names": np.asarray(contact_region_names),
+        "contact_region_id": contact_region_ids_np.astype(np.int16),
+        "contact_region_vertex_count": contact_region_count_np,
+        "contact_region_active": contact_region_active_np,
+        "initial_contact_region_distance_median_mm": initial_region_distance,
+        "refined_contact_region_distance_median_mm": refined_region_distance,
         "contact_gate": phase_gate_np,
         "contact_correction_gate": contact_gate_np,
+        "contact_correction_distance_mm": correction_distance_np,
         "translation_camera": translation.detach().cpu().numpy().astype(np.float32),
         "rotation_euler_xyz": angles.detach().cpu().numpy().astype(np.float32),
         "initial_contact_distance_median_mm": initial_per_frame["contact_distance_median_mm"],
