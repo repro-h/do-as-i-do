@@ -10,8 +10,8 @@ HACO_PYTHON=${HACO_PYTHON:-/home/mengxiangting/nas/mengxt/miniconda3/envs/haco/b
 GPU=${GPU:-7}
 FORCE=${FORCE:-0}
 STOP_AFTER_STAGE1=${STOP_AFTER_STAGE1:-0}
-PHASE_VARIANT=${PHASE_VARIANT:-object_dynamic_v1}
-REFINEMENT_VARIANT=${REFINEMENT_VARIANT:-grasp_balanced_dynamic_v1}
+PHASE_VARIANT=${PHASE_VARIANT:-object_dynamic_v4}
+REFINEMENT_VARIANT=${REFINEMENT_VARIANT:-grasp_balanced_dynamic_v4}
 STAGE2_VARIANT=${STAGE2_VARIANT:-${REFINEMENT_VARIANT}_region_balanced_v1}
 STAGE1_CONTACT_TARGET_MM=${STAGE1_CONTACT_TARGET_MM:-2}
 STAGE1_CORRECTION_STOP_MM=${STAGE1_CORRECTION_STOP_MM:-4}
@@ -107,6 +107,9 @@ WINDOWS=$FEATURE_ROOT/manifests/v13_${SPLIT}_windows.jsonl
 DENSE_ROOT=$FEATURE_ROOT/$SPLIT
 GLOBAL_ROOT=$GLOBAL_V2_ROOT/supervision/$SPLIT
 SUPERVISION_NPZ=$GLOBAL_V2_ROOT/object_frame_hand_se3_supervision_v2/$SPLIT/$STREAM_ID.npz
+OBJECT_MOTION_SUPERVISION_NPZ=$GLOBAL_ROOT/$STREAM_ID.npz
+OBJECT_MOTION_ROOT=${OBJECT_MOTION_ROOT:-$HYBRID_ROOT/object_motion_filter_v2_compact}
+OBJECT_MOTION_JSON=${OBJECT_MOTION_JSON:-$OBJECT_MOTION_ROOT/$SPLIT/$STREAM_ID/segmented_ekf_rts/foundationpose_segmented_ekf_rts.json}
 
 V14_CKPT=${V14_CKPT:-$FEATURE_ROOT/checkpoints/v14_wilor_pi3x_absolute_full_v1/best_translation.pt}
 V14_SCRIPT=$DO_AS_I_DO/reconstruction/hyp_scripts/train/apply_v14_wilor_pi3x_absolute_hand_trajectory.py
@@ -240,7 +243,9 @@ raise SystemExit(0 if cached == selected else 1)
 
 for path in \
   "$PI3_PYTHON" "$HACO_PYTHON" "$MANIFEST" "$WINDOWS" \
-  "$SUPERVISION_NPZ" "$V14_CKPT" "$V14_SCRIPT" "$PHASE_SCRIPT" \
+  "$SUPERVISION_NPZ" "$OBJECT_MOTION_SUPERVISION_NPZ" \
+  "$OBJECT_MOTION_JSON" \
+  "$V14_CKPT" "$V14_SCRIPT" "$PHASE_SCRIPT" \
   "$STAGE1_SCRIPT" "$STAGE2_SCRIPT" "$HACO_VIS_SCRIPT" \
   "$GT_EXPORT_SCRIPT" "$FRAME_MAP_JSON" \
   "$WILOR_EXPORT" "$WILOR_CKPT" \
@@ -394,6 +399,8 @@ run_stage "contact phase" "$PHASE_NPZ" \
     --query-npz "$QUERY_NPZ" \
     --contact-sequence-npz "$CONTACT_NPZ" \
     --supervision-npz "$SUPERVISION_NPZ" \
+    --object-motion-supervision-npz "$OBJECT_MOTION_SUPERVISION_NPZ" \
+    --object-motion-json "$OBJECT_MOTION_JSON" \
     --object-mesh "$OBJECT_MESH" \
     "${gt_phase_args[@]}" \
     --out-npz "$PHASE_NPZ" \

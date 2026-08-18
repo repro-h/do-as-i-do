@@ -21,6 +21,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-npz", required=True)
     parser.add_argument("--contact-sequence-npz", required=True)
     parser.add_argument("--supervision-npz", required=True)
+    parser.add_argument("--object-motion-supervision-npz")
+    parser.add_argument("--object-motion-json")
     parser.add_argument("--object-mesh", required=True)
     parser.add_argument("--gt-hand-npz")
     parser.add_argument("--out-npz", required=True)
@@ -174,20 +176,35 @@ def ramped_gate(mask: np.ndarray, width: int) -> np.ndarray:
 
 
 def object_dynamic_mask(
-    supervision: dict[str, np.ndarray], frame_count: int
-) -> tuple[np.ndarray, str | None, list[dict[str, object]]]:
+    supervision: dict[str, np.ndarray],
+    frame_count: int,
+    path_override: str | None = None,
+) -> tuple[np.ndarray, str | None, str | None, list[dict[str, object]]]:
     mask = np.zeros(frame_count, dtype=bool)
-    if "filtered_object_json" not in supervision:
-        return mask, None, []
-    path = Path(str(supervision["filtered_object_json"].item())).expanduser().resolve()
+    if path_override:
+        path = Path(path_override).expanduser().resolve()
+    else:
+        if "filtered_object_json" not in supervision:
+            raise KeyError(
+                "Object-motion supervision lacks 'filtered_object_json'; "
+                "pass --object-motion-json explicitly"
+            )
+        path = Path(
+            str(supervision["filtered_object_json"].item())
+        ).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f"Object motion segmentation not found: {path}")
     payload = json.loads(path.read_text(encoding="utf-8"))
-    rows = payload.get("dynamic_segments")
+    # The segmented EKF/RTS output may retain an older top-level field from
+    # its source JSON. Prefer the final TAPIR segmentation written by the
+    # consolidation stage.
+    rows = payload.get("tapir_motion_segmentation", {}).get(
+        "dynamic_segments"
+    )
+    field = "tapir_motion_segmentation.dynamic_segments"
     if rows is None:
-        rows = payload.get("tapir_motion_segmentation", {}).get(
-            "dynamic_segments"
-        )
+        rows = payload.get("dynamic_segments")
+        field = "dynamic_segments"
     if rows is None:
         raise KeyError(f"No dynamic_segments in {path}")
     for row in rows:
@@ -196,7 +213,7 @@ def object_dynamic_mask(
         end = min(frame_count - 1, end)
         if begin <= end:
             mask[begin:end + 1] = True
-    return mask, str(path), rows
+    return mask, str(path), field, rows
 
 
 def write_npz(path: Path, payload: dict[str, np.ndarray]) -> None:
@@ -213,6 +230,13 @@ def main() -> None:
     query = load_npz(Path(args.query_npz).expanduser().resolve())
     contact = load_npz(Path(args.contact_sequence_npz).expanduser().resolve())
     supervision = load_npz(Path(args.supervision_npz).expanduser().resolve())
+    motion_supervision = (
+        load_npz(
+            Path(args.object_motion_supervision_npz).expanduser().resolve()
+        )
+        if args.object_motion_supervision_npz
+        else supervision
+    )
     ids = np.asarray(query["frame_ids"])
     trajectory_indices = aligned_indices(trajectory["frame_ids"], ids)
     contact_indices = aligned_indices(contact["frame_ids"], ids)
@@ -286,10 +310,16 @@ def main() -> None:
     geometry_gate = ramped_gate(geometry_phase, args.boundary_ramp)
     dynamic_phase = np.zeros(count, dtype=bool)
     dynamic_source = None
+    dynamic_field = None
     dynamic_segments: list[dict[str, object]] = []
     if args.use_object_dynamic_phase:
-        dynamic_phase, dynamic_source, dynamic_segments = object_dynamic_mask(
-            supervision, count
+        (
+            dynamic_phase,
+            dynamic_source,
+            dynamic_field,
+            dynamic_segments,
+        ) = object_dynamic_mask(
+            motion_supervision, count, args.object_motion_json
         )
     predicted_phase = geometry_phase | dynamic_phase
     predicted_gate = np.maximum(
@@ -344,6 +374,7 @@ def main() -> None:
         "object_dynamic_frames": int(dynamic_phase.sum()),
         "object_dynamic_segments": dynamic_segments,
         "object_dynamic_source": dynamic_source,
+        "object_dynamic_field": dynamic_field,
         "oracle_contact_frames": int(gt_phase.sum()),
         "oracle_segments": gt_segments,
         "phase_iou": float(intersection / union) if union else None,
