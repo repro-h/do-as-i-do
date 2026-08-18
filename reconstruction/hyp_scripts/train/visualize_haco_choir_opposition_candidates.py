@@ -26,10 +26,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--supervision-npz", required=True)
     parser.add_argument("--object-mesh", required=True)
     parser.add_argument("--mano-data-dir", required=True)
+    parser.add_argument("--dense-root")
+    parser.add_argument("--intrinsics", type=float, nargs=4)
     parser.add_argument("--frame-id", required=True)
     parser.add_argument("--object-samples", type=int, default=16384)
     parser.add_argument("--candidate-topk", type=int, default=256)
     parser.add_argument("--candidate-slack-mm", type=float, default=20.0)
+    parser.add_argument("--pixel-radius", type=float, default=30.0)
+    parser.add_argument("--pixel-soft-topk", type=int, default=8)
+    parser.add_argument("--pixel-sigma", type=float, default=12.0)
+    parser.add_argument("--w-pixel", type=float, default=0.5)
     parser.add_argument("--choir-topk", type=int, default=8)
     parser.add_argument("--choir-sigma-mm", type=float, default=10.0)
     parser.add_argument("--w-opposition", type=float, default=20.0)
@@ -86,6 +92,45 @@ def choir_distance(
     return np.sqrt((weights * nearest * nearest).sum(axis=1))
 
 
+def load_intrinsics(
+    args: argparse.Namespace,
+    query: dict[str, np.ndarray],
+    stream_id: str,
+) -> np.ndarray:
+    if "intrinsics" in query:
+        matrix = np.asarray(query["intrinsics"], dtype=np.float32)
+        return matrix[0] if matrix.ndim == 3 else matrix.reshape(3, 3)
+    if args.dense_root:
+        windows = sorted(
+            (Path(args.dense_root).expanduser().resolve() / stream_id / "windows")
+            .glob("*.npz")
+        )
+        if not windows:
+            raise FileNotFoundError(f"No Pi3X windows for {stream_id}")
+        dense = load_npz(windows[0])
+        matrix = np.asarray(dense["intrinsics_resized"], dtype=np.float32)
+        matrix = (matrix[0] if matrix.ndim == 3 else matrix).reshape(3, 3).copy()
+        resized_wh = np.asarray(dense["resized_wh"], dtype=np.float32).reshape(2)
+        original_wh = np.asarray(query["image_wh"], dtype=np.float32).reshape(-1, 2)[0]
+        matrix[0, (0, 2)] *= original_wh[0] / resized_wh[0]
+        matrix[1, (1, 2)] *= original_wh[1] / resized_wh[1]
+        return matrix
+    if args.intrinsics:
+        fx, fy, cx, cy = args.intrinsics
+        return np.asarray(
+            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
+    raise KeyError("Pass --dense-root or --intrinsics FX FY CX CY")
+
+
+def project(points: np.ndarray, intrinsics: np.ndarray) -> np.ndarray:
+    projected = points @ intrinsics.T
+    uv = projected[:, :2] / np.maximum(projected[:, 2:3], 1e-8)
+    uv[points[:, 2] <= 1e-6] = np.nan
+    return uv
+
+
 def colors(count: int, rgb: tuple[int, int, int]) -> np.ndarray:
     return np.tile(np.asarray(rgb, dtype=np.uint8), (count, 1))
 
@@ -104,6 +149,9 @@ def main() -> None:
 
     hand = np.asarray(
         stage1["refined_hand_vertices_camera"][stage_index], dtype=np.float32
+    )
+    initial_hand = np.asarray(
+        stage1["initial_hand_vertices_camera"][stage_index], dtype=np.float32
     )
     faces = np.asarray(query["mano_faces"], dtype=np.int64)
     probability = np.asarray(
@@ -130,11 +178,8 @@ def main() -> None:
         mesh = trimesh.util.concatenate(tuple(mesh.geometry.values()))
     object_vertices_local = np.asarray(mesh.vertices, dtype=np.float32)
     object_faces = np.asarray(mesh.faces, dtype=np.int64)
-    np.random.seed(0)
-    surface_local, face_index = trimesh.sample.sample_surface(
-        mesh, args.object_samples
-    )
-    normals_local = np.asarray(mesh.face_normals[face_index], dtype=np.float32)
+    surface_local = object_vertices_local
+    normals_local = np.asarray(mesh.vertex_normals, dtype=np.float32)
     pose = physical_pose(
         supervision["gt_ycb_object_pose"][supervision_index],
         bool(np.asarray(supervision.get("normalized_left", False)).item()),
@@ -146,6 +191,19 @@ def main() -> None:
     normals = normals_local @ pose[:3, :3].T
     normals /= np.maximum(np.linalg.norm(normals, axis=-1, keepdims=True), 1e-12)
 
+    stream_id = str(np.asarray(query["stream_id"]).item())
+    intrinsics = load_intrinsics(args, query, stream_id)
+    object_uv = project(surface, intrinsics)
+    initial_hand_uv = project(initial_hand, intrinsics)
+    thumb_pixel_distance = choir_distance(
+        object_uv, initial_hand_uv[thumb_mask],
+        args.pixel_soft_topk, args.pixel_sigma,
+    )
+    index_pixel_distance = choir_distance(
+        object_uv, initial_hand_uv[index_mask],
+        args.pixel_soft_topk, args.pixel_sigma,
+    )
+
     sigma = args.choir_sigma_mm / 1000.0
     thumb_distance = choir_distance(
         surface, hand[thumb_mask], args.choir_topk, sigma
@@ -153,20 +211,19 @@ def main() -> None:
     index_distance = choir_distance(
         surface, hand[index_mask], args.choir_topk, sigma
     )
-    candidate_count = min(args.candidate_topk, len(surface))
-    thumb_candidates = np.argpartition(
-        thumb_distance, candidate_count - 1
-    )[:candidate_count]
-    index_candidates = np.argpartition(
-        index_distance, candidate_count - 1
-    )[:candidate_count]
-    thumb_candidates = thumb_candidates[
-        thumb_distance[thumb_candidates]
-        <= thumb_distance.min() + args.candidate_slack_mm / 1000.0
+    thumb_eligible = np.flatnonzero(
+        np.isfinite(thumb_pixel_distance)
+        & (thumb_pixel_distance <= args.pixel_radius)
+    )
+    index_eligible = np.flatnonzero(
+        np.isfinite(index_pixel_distance)
+        & (index_pixel_distance <= args.pixel_radius)
+    )
+    thumb_candidates = thumb_eligible[
+        np.argsort(thumb_pixel_distance[thumb_eligible])[:args.candidate_topk]
     ]
-    index_candidates = index_candidates[
-        index_distance[index_candidates]
-        <= index_distance.min() + args.candidate_slack_mm / 1000.0
+    index_candidates = index_eligible[
+        np.argsort(index_pixel_distance[index_eligible])[:args.candidate_topk]
     ]
     if len(thumb_candidates) == 0 or len(index_candidates) == 0:
         raise RuntimeError("Local candidate filtering removed every candidate")
@@ -211,8 +268,13 @@ def main() -> None:
         thumb_distance[thumb_candidates, None]
         + index_distance[index_candidates][None]
     ) * 1000.0
+    pixel_distance = (
+        thumb_pixel_distance[thumb_candidates, None]
+        + index_pixel_distance[index_candidates][None]
+    )
     score = (
         distance_mm
+        + args.w_pixel * pixel_distance
         + args.w_opposition * opposition
         + args.w_facing * facing
         + args.w_midpoint * midpoint_shift * 1000.0
@@ -241,6 +303,8 @@ def main() -> None:
         "index_contact_vertices": int(index_mask.sum()),
         "thumb_candidate_count": int(len(thumb_candidates)),
         "index_candidate_count": int(len(index_candidates)),
+        "thumb_pixel_distance_min": float(thumb_pixel_distance.min()),
+        "index_pixel_distance_min": float(index_pixel_distance.min()),
         "selected_score": float(score[thumb_choice, index_choice]),
         "selected_pair_width_mm": float(width[thumb_choice, index_choice] * 1000.0),
         "selected_normal_dot": float(normal_dot[thumb_choice, index_choice]),
@@ -254,6 +318,12 @@ def main() -> None:
         ),
         "selected_index_choir_mm": float(
             index_distance[index_candidates[index_choice]] * 1000.0
+        ),
+        "selected_thumb_pixel_distance": float(
+            thumb_pixel_distance[thumb_candidates[thumb_choice]]
+        ),
+        "selected_index_pixel_distance": float(
+            index_pixel_distance[index_candidates[index_choice]]
         ),
     }
     print(json.dumps(summary, indent=2), flush=True)
@@ -273,6 +343,8 @@ def main() -> None:
             index_candidates=index_points,
             thumb_candidate_choir_mm=thumb_distance[thumb_candidates] * 1000.0,
             index_candidate_choir_mm=index_distance[index_candidates] * 1000.0,
+            thumb_candidate_pixel_distance=thumb_pixel_distance[thumb_candidates],
+            index_candidate_pixel_distance=index_pixel_distance[index_candidates],
             selected_thumb=selected_thumb,
             selected_index=selected_index,
             selected_thumb_normal=thumb_normals[thumb_choice],
