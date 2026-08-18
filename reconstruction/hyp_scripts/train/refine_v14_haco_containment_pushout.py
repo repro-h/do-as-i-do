@@ -65,6 +65,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-activation-mm", type=float, default=12.0)
     parser.add_argument("--contact-probability-power", type=float, default=2.0)
     parser.add_argument("--contact-weight-floor", type=float, default=0.05)
+    parser.add_argument("--region-balanced-contact", action="store_true")
+    parser.add_argument("--contact-region-min-vertices", type=int, default=3)
     parser.add_argument("--filter-contact-points", action="store_true")
     parser.add_argument("--filtered-contact-topk", type=int, default=48)
     parser.add_argument("--filtered-component-topk", type=int, default=8)
@@ -934,6 +936,29 @@ def main() -> None:
         )
     )
     total_contact_weight = contact_weight.sum().clamp_min(1e-6)
+    contact_region_names: list[str] = []
+    contact_region_ids_np = np.full(reconstructed.shape[1], -1, dtype=np.int64)
+    contact_region_mask = None
+    if args.region_balanced_contact:
+        if "contact_region_id" not in stage1 or "contact_region_names" not in stage1:
+            raise KeyError(
+                "--region-balanced-contact requires a region-balanced Stage1 archive"
+            )
+        contact_region_ids_np = np.asarray(
+            stage1["contact_region_id"], dtype=np.int64
+        )
+        contact_region_names = [
+            value.decode() if isinstance(value, bytes) else str(value)
+            for value in np.asarray(stage1["contact_region_names"])
+        ]
+        if contact_region_ids_np.shape != (reconstructed.shape[1],):
+            raise ValueError(
+                "Stage1 contact_region_id does not match MANO vertex count"
+            )
+        contact_region_mask = torch.from_numpy(np.stack([
+            contact_region_ids_np == index
+            for index in range(len(contact_region_names))
+        ])).to(device)
 
     delta = torch.zeros(
         (frame_count, 15, 3), device=device, requires_grad=True
@@ -1053,6 +1078,20 @@ def main() -> None:
                 if args.adaptive_reset_optimizer_on_refresh:
                     optimizer.state.clear()
         optimizer.zero_grad(set_to_none=True)
+        contact_region_active = None
+        total_contact_region_scale = None
+        if args.region_balanced_contact:
+            contact_region_count = torch.stack([
+                ((contact_weight > 0) & contact_region_mask[index][None]).sum(dim=-1)
+                for index in range(len(contact_region_names))
+            ], dim=-1)
+            contact_region_active = (
+                (contact_region_count >= args.contact_region_min_vertices)
+                & optimization_gate[:, None]
+            )
+            total_contact_region_scale = (
+                contact_region_active * frame_contact_scale[:, None]
+            ).sum().clamp_min(1e-6)
         contact_value = 0.0
         collision_value = 0.0
         object_normal_pushout_value = 0.0
@@ -1080,11 +1119,28 @@ def main() -> None:
             contact_error = torch.clamp(
                 fixed_distance - contact_target, min=0.0
             ).square()
-            chunk_contact = (
-                contact_error
-                * contact_weight[indices]
-                * frame_contact_scale[indices, None]
-            ).sum() / total_contact_weight
+            if args.region_balanced_contact:
+                region_weight = (
+                    contact_weight[indices, None]
+                    * contact_region_mask[None]
+                )
+                region_denominator = region_weight.sum(dim=-1).clamp_min(1e-6)
+                region_error = (
+                    contact_error[:, None] * region_weight
+                ).sum(dim=-1) / region_denominator
+                region_scale = (
+                    contact_region_active[indices]
+                    * frame_contact_scale[indices, None]
+                )
+                chunk_contact = (
+                    region_error * region_scale
+                ).sum() / total_contact_region_scale
+            else:
+                chunk_contact = (
+                    contact_error
+                    * contact_weight[indices]
+                    * frame_contact_scale[indices, None]
+                ).sum() / total_contact_weight
             displacement = refined - reconstructed[indices]
             normal_component = (
                 displacement * fixed_contact_normal[indices]
@@ -1320,6 +1376,44 @@ def main() -> None:
             np.mean(selected_refined_mm <= 5.0)
         ) if len(selected_refined_mm) else None,
     }
+    contact_region_count_np = np.zeros(
+        (frame_count, len(contact_region_names)), dtype=np.int32
+    )
+    initial_contact_region_distance_np = np.full(
+        (frame_count, len(contact_region_names)), np.nan, dtype=np.float32
+    )
+    refined_contact_region_distance_np = np.full_like(
+        initial_contact_region_distance_np, np.nan
+    )
+    contact_region_summary: dict[str, object] = {}
+    if args.region_balanced_contact:
+        initial_distance_np = initial_distance.cpu().numpy() * 1000.0
+        refined_distance_np = refined_distance.cpu().numpy() * 1000.0
+        for region, name in enumerate(contact_region_names):
+            region_vertices = contact_region_ids_np == region
+            selected = filtered_contact_mask_np & region_vertices[None]
+            contact_region_count_np[:, region] = selected.sum(axis=1)
+            for frame in range(frame_count):
+                if selected[frame].any():
+                    initial_contact_region_distance_np[frame, region] = np.median(
+                        initial_distance_np[frame, selected[frame]]
+                    )
+                    refined_contact_region_distance_np[frame, region] = np.median(
+                        refined_distance_np[frame, selected[frame]]
+                    )
+            evaluated = (
+                contact_region_count_np[:, region]
+                >= args.contact_region_min_vertices
+            )
+            contact_region_summary[name] = {
+                "active_frames": int(evaluated.sum()),
+                "initial_distance_mm": distribution(
+                    initial_contact_region_distance_np[evaluated, region]
+                ),
+                "refined_distance_mm": distribution(
+                    refined_contact_region_distance_np[evaluated, region]
+                ),
+            }
 
     initial_geometry, _ = geometry_summary(
         initial_distance.cpu().numpy(),
@@ -1438,6 +1532,15 @@ def main() -> None:
             "collision_region_floor": args.collision_region_floor,
             "metrics": filtered_contact_metrics,
         },
+        "contact_aggregation": (
+            "mano_region_balanced"
+            if args.region_balanced_contact else "global_vertex"
+        ),
+        "contact_regions": {
+            "names": contact_region_names,
+            "minimum_vertices": args.contact_region_min_vertices,
+            "metrics": contact_region_summary,
+        },
         "adaptive_balance": {
             "enabled": args.adaptive_balance,
             "refresh_steps": args.adaptive_refresh_steps,
@@ -1492,6 +1595,15 @@ def main() -> None:
         "adaptive_contact_gate": adaptive_gate.cpu().numpy().astype(np.float32),
         "filtered_contact_mask": filtered_contact_mask_np,
         "filtered_contact_weight": filtered_contact_weight_np.astype(np.float16),
+        "contact_region_names": np.asarray(contact_region_names),
+        "contact_region_id": contact_region_ids_np.astype(np.int16),
+        "contact_region_vertex_count": contact_region_count_np,
+        "initial_contact_region_distance_median_mm": (
+            initial_contact_region_distance_np
+        ),
+        "refined_contact_region_distance_median_mm": (
+            refined_contact_region_distance_np
+        ),
         "initial_gt_vertex_error_median_mm": initial_gt_frame,
         "refined_gt_vertex_error_median_mm": refined_gt_frame,
         "stream_id": np.asarray(str(query["stream_id"].item())),

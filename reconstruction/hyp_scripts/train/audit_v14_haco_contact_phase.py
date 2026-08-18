@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gt-contact-mm", type=float, default=5.0)
     parser.add_argument("--gt-exit-mm", type=float, default=8.0)
     parser.add_argument("--gt-min-vertices", type=int, default=5)
+    parser.add_argument("--use-object-dynamic-phase", action="store_true")
     return parser.parse_args()
 
 
@@ -172,6 +173,32 @@ def ramped_gate(mask: np.ndarray, width: int) -> np.ndarray:
     return gate
 
 
+def object_dynamic_mask(
+    supervision: dict[str, np.ndarray], frame_count: int
+) -> tuple[np.ndarray, str | None, list[dict[str, object]]]:
+    mask = np.zeros(frame_count, dtype=bool)
+    if "filtered_object_json" not in supervision:
+        return mask, None, []
+    path = Path(str(supervision["filtered_object_json"].item())).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Object motion segmentation not found: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    rows = payload.get("dynamic_segments")
+    if rows is None:
+        rows = payload.get("tapir_motion_segmentation", {}).get(
+            "dynamic_segments"
+        )
+    if rows is None:
+        raise KeyError(f"No dynamic_segments in {path}")
+    for row in rows:
+        begin, end = (int(value) for value in row["output_frames"])
+        begin = max(0, begin)
+        end = min(frame_count - 1, end)
+        if begin <= end:
+            mask[begin:end + 1] = True
+    return mask, str(path), rows
+
+
 def write_npz(path: Path, payload: dict[str, np.ndarray]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -253,10 +280,21 @@ def main() -> None:
         & (gap_topk <= args.exit_gap_mm)
         & (exit_near_contacts >= args.exit_min_near_contacts)
     )
-    predicted_phase = hysteresis(
+    geometry_phase = hysteresis(
         enter, stay, args.enter_patience, args.exit_patience
     )
-    predicted_gate = ramped_gate(predicted_phase, args.boundary_ramp)
+    geometry_gate = ramped_gate(geometry_phase, args.boundary_ramp)
+    dynamic_phase = np.zeros(count, dtype=bool)
+    dynamic_source = None
+    dynamic_segments: list[dict[str, object]] = []
+    if args.use_object_dynamic_phase:
+        dynamic_phase, dynamic_source, dynamic_segments = object_dynamic_mask(
+            supervision, count
+        )
+    predicted_phase = geometry_phase | dynamic_phase
+    predicted_gate = np.maximum(
+        geometry_gate, dynamic_phase.astype(np.float32)
+    )
 
     gt_phase = np.zeros(count, dtype=bool)
     gt_gate = np.zeros(count, dtype=np.float32)
@@ -291,12 +329,21 @@ def main() -> None:
     intersection = int((predicted_phase & gt_phase).sum())
     union = int((predicted_phase | gt_phase).sum())
     summary = {
-        "method": "v14_haco_geometry_contact_phase_v1",
+        "method": (
+            "v14_haco_geometry_object_dynamic_contact_phase_v2"
+            if args.use_object_dynamic_phase
+            else "v14_haco_geometry_contact_phase_v1"
+        ),
         "stream_id": str(query["stream_id"].item()),
         "frames": count,
         "valid_frames": int(valid.sum()),
         "predicted_contact_frames": int(predicted_phase.sum()),
         "predicted_segments": predicted_segments,
+        "geometry_contact_frames": int(geometry_phase.sum()),
+        "geometry_segments": segments(geometry_phase, ids),
+        "object_dynamic_frames": int(dynamic_phase.sum()),
+        "object_dynamic_segments": dynamic_segments,
+        "object_dynamic_source": dynamic_source,
         "oracle_contact_frames": int(gt_phase.sum()),
         "oracle_segments": gt_segments,
         "phase_iou": float(intersection / union) if union else None,
@@ -321,6 +368,9 @@ def main() -> None:
         "exit_near_contact_vertices": exit_near_contacts,
         "predicted_contact_phase": predicted_phase,
         "predicted_contact_gate": predicted_gate,
+        "geometry_contact_phase": geometry_phase,
+        "geometry_contact_gate": geometry_gate,
+        "object_dynamic_phase": dynamic_phase,
         "gt_near_contact_vertices": gt_near_vertices,
         "gt_min_contact_distance_mm": gt_min_distance,
         "oracle_contact_phase": gt_phase,

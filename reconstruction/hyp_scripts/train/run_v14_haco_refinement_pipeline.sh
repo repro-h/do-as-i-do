@@ -9,7 +9,10 @@ PI3_PYTHON=${PI3_PYTHON:-/home/mengxiangting/nas/mengxt/anaconda3/envs/pi3/bin/p
 HACO_PYTHON=${HACO_PYTHON:-/home/mengxiangting/nas/mengxt/miniconda3/envs/haco/bin/python}
 GPU=${GPU:-7}
 FORCE=${FORCE:-0}
-REFINEMENT_VARIANT=${REFINEMENT_VARIANT:-grasp_balanced_v1}
+STOP_AFTER_STAGE1=${STOP_AFTER_STAGE1:-0}
+PHASE_VARIANT=${PHASE_VARIANT:-object_dynamic_v1}
+REFINEMENT_VARIANT=${REFINEMENT_VARIANT:-grasp_balanced_dynamic_v1}
+STAGE2_VARIANT=${STAGE2_VARIANT:-${REFINEMENT_VARIANT}_region_balanced_v1}
 STAGE1_CONTACT_TARGET_MM=${STAGE1_CONTACT_TARGET_MM:-2}
 STAGE1_CORRECTION_STOP_MM=${STAGE1_CORRECTION_STOP_MM:-4}
 STAGE1_CORRECTION_FULL_MM=${STAGE1_CORRECTION_FULL_MM:-12}
@@ -134,12 +137,12 @@ TRAJECTORY_NPZ=$OUT_DIR/v14_trajectory.npz
 CONTACT_NPZ=$OUT_DIR/haco_contact_sequence.npz
 HACO_VIS_DIR=$OUT_DIR/haco_contact_visualization
 HACO_VIS_SUMMARY=$HACO_VIS_DIR/summary.json
-PHASE_NPZ=$OUT_DIR/haco_contact_phase.npz
-PHASE_JSON=$OUT_DIR/haco_contact_phase.json
+PHASE_NPZ=$OUT_DIR/haco_contact_phase_${PHASE_VARIANT}.npz
+PHASE_JSON=$OUT_DIR/haco_contact_phase_${PHASE_VARIANT}.json
 STAGE1_NPZ=$OUT_DIR/haco_contact_containment_stage1_${REFINEMENT_VARIANT}.npz
 STAGE1_JSON=$OUT_DIR/haco_contact_containment_stage1_${REFINEMENT_VARIANT}.json
-STAGE2_NPZ=$OUT_DIR/haco_stage2_object_normal_pushout_joint16_${REFINEMENT_VARIANT}.npz
-STAGE2_JSON=$OUT_DIR/haco_stage2_object_normal_pushout_joint16_${REFINEMENT_VARIANT}.json
+STAGE2_NPZ=$OUT_DIR/haco_stage2_object_normal_pushout_joint16_${STAGE2_VARIANT}.npz
+STAGE2_JSON=$OUT_DIR/haco_stage2_object_normal_pushout_joint16_${STAGE2_VARIANT}.json
 
 timestamp() {
   /bin/date '+%Y-%m-%d %H:%M:%S'
@@ -395,6 +398,7 @@ run_stage "contact phase" "$PHASE_NPZ" \
     "${gt_phase_args[@]}" \
     --out-npz "$PHASE_NPZ" \
     --out-json "$PHASE_JSON" \
+    --use-object-dynamic-phase \
     --object-samples 8192
 
 run_stage "Stage1 rigid contact/containment" "$STAGE1_NPZ" \
@@ -421,6 +425,18 @@ run_stage "Stage1 rigid contact/containment" "$STAGE1_NPZ" \
     --steps 300 \
     --device cuda
 
+if [[ "$STOP_AFTER_STAGE1" == 1 ]]; then
+  cat <<EOF
+
+[$(timestamp)] pipeline stopped after Stage1
+stream:      $STREAM_ID
+phase:       $PHASE_NPZ
+stage1:      $STAGE1_NPZ
+summary:     $STAGE1_JSON
+EOF
+  exit 0
+fi
+
 stage2_force=$FORCE
 if [[ -s "$STAGE2_NPZ" ]] && ! stage2_is_finite; then
   echo "[$(timestamp)] Stage2 cache is non-finite; recomputing $STAGE2_NPZ"
@@ -445,6 +461,8 @@ run_stage "Stage2 object-normal local pose" "$STAGE2_NPZ" \
     "${gt_stage_args[@]}" \
     --out-npz "$STAGE2_NPZ" \
     --out-json "$STAGE2_JSON" \
+    --region-balanced-contact \
+    --contact-region-min-vertices 3 \
     --adaptive-balance \
     --adaptive-refresh-steps 10 \
     --adaptive-reset-optimizer-on-refresh \
