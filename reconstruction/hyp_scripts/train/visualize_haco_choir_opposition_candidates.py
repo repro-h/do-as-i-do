@@ -29,11 +29,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-id", required=True)
     parser.add_argument("--object-samples", type=int, default=16384)
     parser.add_argument("--candidate-topk", type=int, default=256)
+    parser.add_argument("--candidate-slack-mm", type=float, default=20.0)
     parser.add_argument("--choir-topk", type=int, default=8)
     parser.add_argument("--choir-sigma-mm", type=float, default=10.0)
     parser.add_argument("--w-opposition", type=float, default=20.0)
     parser.add_argument("--w-facing", type=float, default=20.0)
     parser.add_argument("--max-pair-width-mm", type=float, default=100.0)
+    parser.add_argument("--max-midpoint-shift-mm", type=float, default=30.0)
+    parser.add_argument("--max-width-change-mm", type=float, default=40.0)
+    parser.add_argument("--min-axis-cosine", type=float, default=0.35)
+    parser.add_argument("--w-midpoint", type=float, default=2.0)
+    parser.add_argument("--w-axis", type=float, default=20.0)
     parser.add_argument("--out-npz")
     parser.add_argument("--out-json")
     parser.add_argument("--port", type=int, default=8098)
@@ -154,6 +160,16 @@ def main() -> None:
     index_candidates = np.argpartition(
         index_distance, candidate_count - 1
     )[:candidate_count]
+    thumb_candidates = thumb_candidates[
+        thumb_distance[thumb_candidates]
+        <= thumb_distance.min() + args.candidate_slack_mm / 1000.0
+    ]
+    index_candidates = index_candidates[
+        index_distance[index_candidates]
+        <= index_distance.min() + args.candidate_slack_mm / 1000.0
+    ]
+    if len(thumb_candidates) == 0 or len(index_candidates) == 0:
+        raise RuntimeError("Local candidate filtering removed every candidate")
 
     thumb_points = surface[thumb_candidates]
     index_points = surface[index_candidates]
@@ -171,6 +187,26 @@ def main() -> None:
         1.0 - (direction * index_normals[None]).sum(axis=-1)
     )
     facing = thumb_facing + index_facing
+    thumb_weight = probability[thumb_mask]
+    index_weight = probability[index_mask]
+    thumb_center = np.average(
+        hand[thumb_mask], axis=0, weights=np.maximum(thumb_weight, 1e-6)
+    )
+    index_center = np.average(
+        hand[index_mask], axis=0, weights=np.maximum(index_weight, 1e-6)
+    )
+    hand_midpoint = 0.5 * (thumb_center + index_center)
+    hand_axis = index_center - thumb_center
+    hand_width = float(np.linalg.norm(hand_axis))
+    hand_axis /= max(hand_width, 1e-12)
+    pair_midpoint = 0.5 * (
+        thumb_points[:, None] + index_points[None]
+    )
+    midpoint_shift = np.linalg.norm(
+        pair_midpoint - hand_midpoint[None, None], axis=-1
+    )
+    axis_cosine = (direction * hand_axis[None, None]).sum(axis=-1)
+    axis_error = 1.0 - axis_cosine
     distance_mm = (
         thumb_distance[thumb_candidates, None]
         + index_distance[index_candidates][None]
@@ -179,11 +215,19 @@ def main() -> None:
         distance_mm
         + args.w_opposition * opposition
         + args.w_facing * facing
+        + args.w_midpoint * midpoint_shift * 1000.0
+        + args.w_axis * axis_error
     )
     invalid_width = (width <= 1e-4) | (
         width * 1000.0 > args.max_pair_width_mm
     )
-    score[invalid_width] = np.inf
+    invalid = (
+        invalid_width
+        | (midpoint_shift * 1000.0 > args.max_midpoint_shift_mm)
+        | (np.abs(width - hand_width) * 1000.0 > args.max_width_change_mm)
+        | (axis_cosine < args.min_axis_cosine)
+    )
+    score[invalid] = np.inf
     flat = int(np.argmin(score))
     thumb_choice, index_choice = np.unravel_index(flat, score.shape)
     if not np.isfinite(score[thumb_choice, index_choice]):
@@ -195,10 +239,16 @@ def main() -> None:
         "frame_id": requested,
         "thumb_contact_vertices": int(thumb_mask.sum()),
         "index_contact_vertices": int(index_mask.sum()),
-        "candidate_count_per_region": candidate_count,
+        "thumb_candidate_count": int(len(thumb_candidates)),
+        "index_candidate_count": int(len(index_candidates)),
         "selected_score": float(score[thumb_choice, index_choice]),
         "selected_pair_width_mm": float(width[thumb_choice, index_choice] * 1000.0),
         "selected_normal_dot": float(normal_dot[thumb_choice, index_choice]),
+        "selected_midpoint_shift_mm": float(
+            midpoint_shift[thumb_choice, index_choice] * 1000.0
+        ),
+        "selected_axis_cosine": float(axis_cosine[thumb_choice, index_choice]),
+        "hand_contact_width_mm": float(hand_width * 1000.0),
         "selected_thumb_choir_mm": float(
             thumb_distance[thumb_candidates[thumb_choice]] * 1000.0
         ),
@@ -248,11 +298,11 @@ def main() -> None:
     )
     server.scene.add_point_cloud(
         "/candidates/thumb", points=thumb_points,
-        colors=colors(candidate_count, (255, 140, 220)), point_size=0.002,
+        colors=colors(len(thumb_points), (255, 140, 220)), point_size=0.002,
     )
     server.scene.add_point_cloud(
         "/candidates/index", points=index_points,
-        colors=colors(candidate_count, (120, 255, 145)), point_size=0.002,
+        colors=colors(len(index_points), (120, 255, 145)), point_size=0.002,
     )
     server.scene.add_point_cloud(
         "/selected/pair", points=np.stack([selected_thumb, selected_index]),
