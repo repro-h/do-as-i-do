@@ -163,16 +163,52 @@ stage2_is_finite() {
 import numpy as np
 import sys
 
+def text(value):
+    return value.decode() if isinstance(value, bytes) else str(value)
+
 required = (
     "refined_hand_vertices_camera",
     "refined_hand_pose_canonical_right",
     "joint_rotation_delta_rotvec",
 )
-with np.load(sys.argv[1], allow_pickle=False) as data:
+with np.load(sys.argv[1], allow_pickle=False) as data, \
+     np.load(sys.argv[2], allow_pickle=False) as query, \
+     np.load(sys.argv[3], allow_pickle=False) as trajectory:
+    stage_ids = [text(value) for value in data["frame_ids"]]
+    query_valid = {
+        text(value): bool(valid)
+        for value, valid in zip(query["frame_ids"], query["model_valid"])
+    }
+    trajectory_valid = {
+        text(value): bool(valid)
+        for value, valid in zip(
+            trajectory["frame_ids"], trajectory["prediction_valid"]
+        )
+    }
+    valid = np.asarray([
+        query_valid.get(value, False)
+        and trajectory_valid.get(value, False)
+        for value in stage_ids
+    ])
+    if not valid.any():
+        print("Stage2 validation found no valid frames", file=sys.stderr)
+        raise SystemExit(1)
     for key in required:
-        if key not in data.files or not np.isfinite(data[key]).all():
+        if key not in data.files:
+            print(f"Stage2 output lacks {key}", file=sys.stderr)
             raise SystemExit(1)
-' "$STAGE2_NPZ"
+        values = data[key]
+        if len(values) != len(valid):
+            print(f"Stage2 {key} frame count mismatch", file=sys.stderr)
+            raise SystemExit(1)
+        bad = int((~np.isfinite(values[valid])).sum())
+        if bad:
+            print(
+                f"Stage2 {key} has {bad} non-finite values in valid frames",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+' "$STAGE2_NPZ" "$QUERY_NPZ" "$TRAJECTORY_NPZ"
 }
 
 for path in \
