@@ -175,7 +175,12 @@ def main() -> None:
 
     mesh = load_mesh(Path(args.object_mesh).expanduser().resolve(), args.object_scale)
     normalized_left = bool(np.asarray(supervision.get("normalized_left", False)).item())
-    object_vertices_np, object_points_np, object_normals_np = build_object_geometry(
+    (
+        object_vertices_np,
+        _object_vertex_normals_np,
+        object_points_np,
+        object_normals_np,
+    ) = build_object_geometry(
         mesh, supervision, supervision_indices, normalized_left, args.object_samples
     )
     boundary = directed_boundary_loop(faces_np)
