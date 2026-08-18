@@ -9,8 +9,8 @@ PI3_PYTHON=${PI3_PYTHON:-/home/mengxiangting/nas/mengxt/anaconda3/envs/pi3/bin/p
 HACO_PYTHON=${HACO_PYTHON:-/home/mengxiangting/nas/mengxt/miniconda3/envs/haco/bin/python}
 GPU=${GPU:-7}
 FORCE=${FORCE:-0}
-INPUT_SEQUENCE=${STREAM_ID:-${1:-}}
-SPLIT=${SPLIT:-${2:-}}
+INPUT_SEQUENCE=${1:-}
+SPLIT=${2:-}
 
 if [[ -z "$INPUT_SEQUENCE" ]]; then
   cat >&2 <<'EOF'
@@ -20,7 +20,7 @@ Usage:
 The train/val split is detected from the V13 manifests when omitted.
 
 Optional environment variables:
-  GPU=7 FORCE=1 V14_CKPT=/path/to/best.pt OBJECT_MESH=/path/to/model.obj
+  GPU=7 FORCE=1 V14_CKPT=/path/to/best.pt
 EOF
   exit 2
 fi
@@ -87,15 +87,17 @@ if [[ "$SPLIT" != train && "$SPLIT" != val ]]; then
   exit 2
 fi
 
-TEST_ROOT=${TEST_ROOT:-$DO_AS_I_DO/reconstruction/test_contact}
-OUT_DIR=${OUT_DIR:-$TEST_ROOT/$STREAM_ID}
-QUERY_ROOT=${QUERY_ROOT:-$OUT_DIR/wilor_query_v2}
+TEST_ROOT=$DO_AS_I_DO/reconstruction/test_contact
+OUT_DIR=$TEST_ROOT/$STREAM_ID
+QUERY_ROOT=$OUT_DIR/wilor_query_v2
 
-MANIFEST=${MANIFEST:-$FEATURE_ROOT/manifests/$SPLIT.jsonl}
-WINDOWS=${WINDOWS:-$FEATURE_ROOT/manifests/v13_${SPLIT}_windows.jsonl}
-DENSE_ROOT=${DENSE_ROOT:-$FEATURE_ROOT/$SPLIT}
-GLOBAL_ROOT=${GLOBAL_ROOT:-$GLOBAL_V2_ROOT/supervision/$SPLIT}
-SUPERVISION_NPZ=${SUPERVISION_NPZ:-$GLOBAL_V2_ROOT/object_frame_hand_se3_supervision_v2/$SPLIT/$STREAM_ID.npz}
+# Sequence-dependent paths are always rebuilt here. This prevents exported
+# variables from an earlier run from silently redirecting a new sequence.
+MANIFEST=$FEATURE_ROOT/manifests/$SPLIT.jsonl
+WINDOWS=$FEATURE_ROOT/manifests/v13_${SPLIT}_windows.jsonl
+DENSE_ROOT=$FEATURE_ROOT/$SPLIT
+GLOBAL_ROOT=$GLOBAL_V2_ROOT/supervision/$SPLIT
+SUPERVISION_NPZ=$GLOBAL_V2_ROOT/object_frame_hand_se3_supervision_v2/$SPLIT/$STREAM_ID.npz
 
 V14_CKPT=${V14_CKPT:-$FEATURE_ROOT/checkpoints/v14_wilor_pi3x_absolute_full_v1/best.pt}
 V14_SCRIPT=$DO_AS_I_DO/reconstruction/hyp_scripts/train/apply_v14_wilor_pi3x_absolute_hand_trajectory.py
@@ -115,7 +117,7 @@ HACO_EXPORT=$HACO_ROOT/export_dexycb_contact_sequence.py
 HACO_CKPT=${HACO_CKPT:-$HACO_ROOT/release_checkpoint/haco_neurips_hamer_checkpoint.ckpt}
 
 DEXYCB_MODELS=${DEXYCB_MODELS:-/mnt/nas/wuke/HumanData/DexYCB/models}
-GT_HAND_NPZ=${GT_HAND_NPZ:-$GLOBAL_V2_ROOT/visualization/phase_a_full_v1_${SPLIT}/$STREAM_ID/gt/dexycb_gt_hand_meshes.npz}
+GT_HAND_NPZ=$GLOBAL_V2_ROOT/visualization/phase_a_full_v1_${SPLIT}/$STREAM_ID/gt/dexycb_gt_hand_meshes.npz
 
 QUERY_NPZ=$QUERY_ROOT/$STREAM_ID/wilor_query_cache.npz
 TRAJECTORY_NPZ=$OUT_DIR/v14_trajectory.npz
@@ -184,12 +186,12 @@ else:
     raise SystemExit(f"Stream not found in manifest: {stream_id}")
 ' "$MANIFEST" "$STREAM_ID"
 )
-OBJECT_NAME=${OBJECT_NAME:-$selection}
+OBJECT_NAME=$selection
 if [[ -z "$OBJECT_NAME" ]]; then
-  echo "[$(timestamp)] manifest row lacks object_name; set OBJECT_NAME" >&2
+  echo "[$(timestamp)] manifest row lacks object_name" >&2
   exit 2
 fi
-OBJECT_MESH=${OBJECT_MESH:-$DEXYCB_MODELS/$OBJECT_NAME/textured_simple.obj}
+OBJECT_MESH=$DEXYCB_MODELS/$OBJECT_NAME/textured_simple.obj
 require_file "$OBJECT_MESH"
 
 query_valid=0
