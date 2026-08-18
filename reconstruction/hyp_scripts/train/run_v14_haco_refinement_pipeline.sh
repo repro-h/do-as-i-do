@@ -105,7 +105,7 @@ DENSE_ROOT=$FEATURE_ROOT/$SPLIT
 GLOBAL_ROOT=$GLOBAL_V2_ROOT/supervision/$SPLIT
 SUPERVISION_NPZ=$GLOBAL_V2_ROOT/object_frame_hand_se3_supervision_v2/$SPLIT/$STREAM_ID.npz
 
-V14_CKPT=${V14_CKPT:-$FEATURE_ROOT/checkpoints/v14_wilor_pi3x_absolute_full_v1/best.pt}
+V14_CKPT=${V14_CKPT:-$FEATURE_ROOT/checkpoints/v14_wilor_pi3x_absolute_full_v1/best_translation.pt}
 V14_SCRIPT=$DO_AS_I_DO/reconstruction/hyp_scripts/train/apply_v14_wilor_pi3x_absolute_hand_trajectory.py
 PHASE_SCRIPT=$DO_AS_I_DO/reconstruction/hyp_scripts/train/audit_v14_haco_contact_phase.py
 STAGE1_SCRIPT=$DO_AS_I_DO/reconstruction/hyp_scripts/train/refine_v14_haco_sequence_contact_containment.py
@@ -220,6 +220,21 @@ with np.load(sys.argv[1], allow_pickle=False) as data, \
 ' "$STAGE2_NPZ" "$QUERY_NPZ" "$TRAJECTORY_NPZ"
 }
 
+v14_cache_matches_checkpoint() {
+  [[ -s "$TRAJECTORY_NPZ" ]] || return 1
+  [[ "$TRAJECTORY_NPZ" -nt "$V14_CKPT" ]] || return 1
+  "$PI3_PYTHON" -c '
+import numpy as np
+import sys
+from pathlib import Path
+
+with np.load(sys.argv[1], allow_pickle=False) as data:
+    cached = Path(str(data["checkpoint"].item())).expanduser().resolve()
+selected = Path(sys.argv[2]).expanduser().resolve()
+raise SystemExit(0 if cached == selected else 1)
+' "$TRAJECTORY_NPZ" "$V14_CKPT"
+}
+
 for path in \
   "$PI3_PYTHON" "$HACO_PYTHON" "$MANIFEST" "$WINDOWS" \
   "$SUPERVISION_NPZ" "$V14_CKPT" "$V14_SCRIPT" "$PHASE_SCRIPT" \
@@ -315,6 +330,12 @@ else
 fi
 require_file "$QUERY_NPZ"
 
+v14_force=$FORCE
+if [[ -s "$TRAJECTORY_NPZ" ]] && ! v14_cache_matches_checkpoint; then
+  echo "[$(timestamp)] V14 checkpoint changed; recomputing $TRAJECTORY_NPZ"
+  FORCE=1
+fi
+
 run_stage "V14 trajectory" "$TRAJECTORY_NPZ" \
   env CUDA_VISIBLE_DEVICES="$GPU" "$PI3_PYTHON" -u "$V14_SCRIPT" \
     --windows "$WINDOWS" \
@@ -325,6 +346,8 @@ run_stage "V14 trajectory" "$TRAJECTORY_NPZ" \
     --stream-id "$STREAM_ID" \
     --out-npz "$TRAJECTORY_NPZ" \
     --device cuda
+
+FORCE=$v14_force
 
 if [[ "$FORCE" != 1 && -s "$CONTACT_NPZ" ]]; then
   echo "[$(timestamp)] HACO contact: cached $CONTACT_NPZ"
