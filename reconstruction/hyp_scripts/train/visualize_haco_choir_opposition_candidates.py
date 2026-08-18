@@ -122,6 +122,8 @@ def main() -> None:
     )
     if isinstance(mesh, trimesh.Scene):
         mesh = trimesh.util.concatenate(tuple(mesh.geometry.values()))
+    object_vertices_local = np.asarray(mesh.vertices, dtype=np.float32)
+    object_faces = np.asarray(mesh.faces, dtype=np.int64)
     np.random.seed(0)
     surface_local, face_index = trimesh.sample.sample_surface(
         mesh, args.object_samples
@@ -132,6 +134,9 @@ def main() -> None:
         bool(np.asarray(supervision.get("normalized_left", False)).item()),
     )
     surface = np.asarray(surface_local, dtype=np.float32) @ pose[:3, :3].T + pose[:3, 3]
+    object_vertices_camera = (
+        object_vertices_local @ pose[:3, :3].T + pose[:3, 3]
+    )
     normals = normals_local @ pose[:3, :3].T
     normals /= np.maximum(np.linalg.norm(normals, axis=-1, keepdims=True), 1e-12)
 
@@ -226,8 +231,8 @@ def main() -> None:
 
     server = viser.ViserServer(port=args.port)
     server.scene.add_mesh_simple(
-        "/object", vertices=surface_local @ pose[:3, :3].T + pose[:3, 3],
-        faces=np.asarray(mesh.faces), color=(170, 180, 195), opacity=0.65,
+        "/object", vertices=object_vertices_camera,
+        faces=object_faces, color=(170, 180, 195), opacity=0.8,
     )
     server.scene.add_mesh_simple(
         "/stage1_hand", vertices=hand, faces=faces,
