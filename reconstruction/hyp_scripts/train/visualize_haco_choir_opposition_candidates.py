@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
 import time
 from pathlib import Path
@@ -46,6 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-axis-cosine", type=float, default=0.35)
     parser.add_argument("--w-midpoint", type=float, default=2.0)
     parser.add_argument("--w-axis", type=float, default=20.0)
+    parser.add_argument("--patch-radius-mm", type=float, default=8.0)
+    parser.add_argument("--patch-normal-cosine", type=float, default=0.7)
     parser.add_argument("--out-npz")
     parser.add_argument("--out-json")
     parser.add_argument("--port", type=int, default=8098)
@@ -133,6 +136,43 @@ def project(points: np.ndarray, intrinsics: np.ndarray) -> np.ndarray:
 
 def colors(count: int, rgb: tuple[int, int, int]) -> np.ndarray:
     return np.tile(np.asarray(rgb, dtype=np.uint8), (count, 1))
+
+
+def geodesic_patch(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    normals: np.ndarray,
+    center: int,
+    radius: float,
+    normal_cosine: float,
+) -> np.ndarray:
+    adjacency: list[dict[int, float]] = [dict() for _ in range(len(vertices))]
+    for triangle in faces:
+        for first, second in (
+            (int(triangle[0]), int(triangle[1])),
+            (int(triangle[1]), int(triangle[2])),
+            (int(triangle[2]), int(triangle[0])),
+        ):
+            distance = float(np.linalg.norm(vertices[first] - vertices[second]))
+            previous = adjacency[first].get(second)
+            if previous is None or distance < previous:
+                adjacency[first][second] = distance
+                adjacency[second][first] = distance
+    distances = {center: 0.0}
+    queue = [(0.0, center)]
+    while queue:
+        distance, vertex = heapq.heappop(queue)
+        if distance != distances.get(vertex) or distance > radius:
+            continue
+        for neighbor, edge_length in adjacency[vertex].items():
+            candidate = distance + edge_length
+            if candidate <= radius and candidate < distances.get(neighbor, np.inf):
+                distances[neighbor] = candidate
+                heapq.heappush(queue, (candidate, neighbor))
+    selected = np.asarray(sorted(distances), dtype=np.int64)
+    normal_gate = normals[selected] @ normals[center] >= normal_cosine
+    selected = selected[normal_gate]
+    return selected if len(selected) else np.asarray([center], dtype=np.int64)
 
 
 def main() -> None:
@@ -296,6 +336,19 @@ def main() -> None:
         raise RuntimeError("No valid opposition pair")
     selected_thumb = thumb_points[thumb_choice]
     selected_index = index_points[index_choice]
+    selected_thumb_vertex = int(thumb_candidates[thumb_choice])
+    selected_index_vertex = int(index_candidates[index_choice])
+    patch_radius = args.patch_radius_mm / 1000.0
+    thumb_patch_ids = geodesic_patch(
+        object_vertices_local, object_faces, normals_local,
+        selected_thumb_vertex, patch_radius, args.patch_normal_cosine,
+    )
+    index_patch_ids = geodesic_patch(
+        object_vertices_local, object_faces, normals_local,
+        selected_index_vertex, patch_radius, args.patch_normal_cosine,
+    )
+    thumb_patch_camera = object_vertices_camera[thumb_patch_ids]
+    index_patch_camera = object_vertices_camera[index_patch_ids]
 
     summary = {
         "frame_id": requested,
@@ -307,6 +360,12 @@ def main() -> None:
         "index_pixel_distance_min": float(index_pixel_distance.min()),
         "selected_score": float(score[thumb_choice, index_choice]),
         "selected_pair_width_mm": float(width[thumb_choice, index_choice] * 1000.0),
+        "selected_thumb_vertex_id": selected_thumb_vertex,
+        "selected_index_vertex_id": selected_index_vertex,
+        "thumb_patch_vertices": int(len(thumb_patch_ids)),
+        "index_patch_vertices": int(len(index_patch_ids)),
+        "patch_radius_mm": args.patch_radius_mm,
+        "patch_normal_cosine": args.patch_normal_cosine,
         "selected_normal_dot": float(normal_dot[thumb_choice, index_choice]),
         "selected_midpoint_shift_mm": float(
             midpoint_shift[thumb_choice, index_choice] * 1000.0
@@ -349,6 +408,14 @@ def main() -> None:
             selected_index=selected_index,
             selected_thumb_normal=thumb_normals[thumb_choice],
             selected_index_normal=index_normals[index_choice],
+            selected_thumb_vertex_id=np.asarray(selected_thumb_vertex, dtype=np.int64),
+            selected_index_vertex_id=np.asarray(selected_index_vertex, dtype=np.int64),
+            thumb_patch_vertex_ids=thumb_patch_ids,
+            index_patch_vertex_ids=index_patch_ids,
+            thumb_patch_vertices_canonical=object_vertices_local[thumb_patch_ids],
+            index_patch_vertices_canonical=object_vertices_local[index_patch_ids],
+            thumb_patch_normals_canonical=normals_local[thumb_patch_ids],
+            index_patch_normals_canonical=normals_local[index_patch_ids],
         )
 
     server = viser.ViserServer(port=args.port)
@@ -380,6 +447,14 @@ def main() -> None:
         "/selected/pair", points=np.stack([selected_thumb, selected_index]),
         colors=np.asarray([[255, 0, 255], [0, 255, 0]], dtype=np.uint8),
         point_size=0.009,
+    )
+    server.scene.add_point_cloud(
+        "/patch/thumb_fixed", points=thumb_patch_camera,
+        colors=colors(len(thumb_patch_camera), (255, 40, 190)), point_size=0.006,
+    )
+    server.scene.add_point_cloud(
+        "/patch/index_fixed", points=index_patch_camera,
+        colors=colors(len(index_patch_camera), (20, 255, 80)), point_size=0.006,
     )
     server.scene.add_line_segments(
         "/selected/opposition",
