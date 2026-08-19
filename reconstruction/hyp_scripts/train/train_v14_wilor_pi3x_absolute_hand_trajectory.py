@@ -684,12 +684,68 @@ def scalar_error_metrics(values: list[np.ndarray]) -> dict:
     }
 
 
+def signed_metrics(
+    values: list[np.ndarray], scale: float = 1000.0
+) -> dict:
+    array = np.concatenate(values) if values else np.empty(0, dtype=np.float32)
+    if not array.size:
+        return {
+            "count": 0,
+            "mean": None,
+            "median": None,
+            "p10": None,
+            "p90": None,
+            "mae": None,
+            "rmse": None,
+        }
+    scaled = array.astype(np.float64) * scale
+    return {
+        "count": int(scaled.size),
+        "mean": float(scaled.mean()),
+        "median": float(np.median(scaled)),
+        "p10": float(np.percentile(scaled, 10)),
+        "p90": float(np.percentile(scaled, 90)),
+        "mae": float(np.abs(scaled).mean()),
+        "rmse": float(np.sqrt(np.mean(scaled ** 2))),
+    }
+
+
+def pixel_error_metrics(values: list[np.ndarray]) -> dict:
+    array = np.concatenate(values) if values else np.empty(0, dtype=np.float32)
+    if not array.size:
+        return {
+            "count": 0,
+            "median_px": None,
+            "p90_px": None,
+            "max_px": None,
+            "mean_px": None,
+            "rmse_px": None,
+        }
+    return {
+        "count": int(array.size),
+        "median_px": float(np.median(array)),
+        "p90_px": float(np.percentile(array, 90)),
+        "max_px": float(np.max(array)),
+        "mean_px": float(np.mean(array)),
+        "rmse_px": float(np.sqrt(np.mean(array ** 2))),
+    }
+
+
 def summarize_metrics(source: dict[str, list[np.ndarray]]) -> dict:
     return {
         "translation_error": scalar_error_metrics(source["translation_error"]),
         "ray_depth_error": scalar_error_metrics(source["ray_depth_error"]),
         "absolute_target_depth": distribution(source["target_depth"]),
         "absolute_predicted_depth": distribution(source["predicted_depth"]),
+        "signed_translation_error_mm": {
+            axis: signed_metrics(source[f"signed_{axis}"])
+            for axis in ("x", "y", "z")
+        },
+        "image_error_px": pixel_error_metrics(source["pixel_error"]),
+        "signed_image_error_px": {
+            axis: signed_metrics(source[f"signed_{axis}"], scale=1.0)
+            for axis in ("u", "v")
+        },
     }
 
 
@@ -710,6 +766,8 @@ def run_epoch(
     metric_names = (
         "translation_error", "ray_depth_error",
         "target_depth", "predicted_depth",
+        "signed_x", "signed_y", "signed_z",
+        "pixel_error", "signed_u", "signed_v",
     )
     metrics = {name: [] for name in metric_names}
     side_metrics = {
@@ -738,7 +796,7 @@ def run_epoch(
 
         with torch.set_grad_enabled(training):
             predicted_depth, image_offset = model(batch)
-            predicted_t, _ = compose_translation(
+            predicted_t, predicted_pixels = compose_translation(
                 predicted_depth, image_offset, batch
             )
             absolute = masked_mean(
@@ -803,15 +861,31 @@ def run_epoch(
         batches += 1
         iterator.set_postfix(loss=f"{sums['total'] / batches:.5f}")
 
+        target_pixels = torch.stack((
+            target_t[..., 0] / target_depth.clamp_min(1e-6)
+            * batch["intrinsics"][..., 0, 0]
+            + batch["intrinsics"][..., 0, 2],
+            target_t[..., 1] / target_depth.clamp_min(1e-6)
+            * batch["intrinsics"][..., 1, 1]
+            + batch["intrinsics"][..., 1, 2],
+        ), dim=-1)
+        signed_translation = predicted_t - target_t
+        signed_pixels = predicted_pixels - target_pixels
         values = {
             "translation_error": torch.linalg.norm(
-                predicted_t - target_t, dim=-1
+                signed_translation, dim=-1
             ),
             "ray_depth_error": (
                 (predicted_t - target_t) * ray
             ).sum(dim=-1).abs(),
             "target_depth": target_depth,
             "predicted_depth": predicted_depth,
+            "signed_x": signed_translation[..., 0],
+            "signed_y": signed_translation[..., 1],
+            "signed_z": signed_translation[..., 2],
+            "pixel_error": torch.linalg.norm(signed_pixels, dim=-1),
+            "signed_u": signed_pixels[..., 0],
+            "signed_v": signed_pixels[..., 1],
         }
         valid_np = valid.detach().cpu().numpy().astype(bool)
         side_np = batch["side"].detach().cpu().numpy()
@@ -829,6 +903,7 @@ def run_epoch(
             target_np = target_t.detach().cpu().numpy()
             stream_np = batch["stream_index"].detach().cpu().numpy()
             frame_np = batch["frame_index"].detach().cpu().numpy()
+            intrinsics_np = batch["intrinsics"].detach().cpu().numpy()
             length = pred_np.shape[1]
             center_weight = 1.0 - np.abs(
                 np.linspace(-1.0, 1.0, length, dtype=np.float32)
@@ -843,6 +918,7 @@ def run_epoch(
                         "sum": np.zeros(3, dtype=np.float64), "weight": 0.0,
                         "ray": ray_np[batch_index, local],
                         "target": target_np[batch_index, local],
+                        "intrinsics": intrinsics_np[batch_index, local],
                         "side": int(side_np[batch_index, local]),
                     })
                     weight = float(center_weight[local])
@@ -873,7 +949,26 @@ def run_epoch(
             )
             ray_value = np.asarray(item["ray"])
             target_value = np.asarray(item["target"])
+            intrinsics_value = np.asarray(item["intrinsics"])
             target_depth_value = float(target_value[2])
+            signed_translation_value = prediction_value - target_value
+            predicted_pixel_value = np.asarray((
+                intrinsics_value[0, 0] * prediction_value[0]
+                / max(float(prediction_value[2]), 1e-6)
+                + intrinsics_value[0, 2],
+                intrinsics_value[1, 1] * prediction_value[1]
+                / max(float(prediction_value[2]), 1e-6)
+                + intrinsics_value[1, 2],
+            ))
+            target_pixel_value = np.asarray((
+                intrinsics_value[0, 0] * target_value[0]
+                / max(float(target_value[2]), 1e-6)
+                + intrinsics_value[0, 2],
+                intrinsics_value[1, 1] * target_value[1]
+                / max(float(target_value[2]), 1e-6)
+                + intrinsics_value[1, 2],
+            ))
+            signed_pixel_value = predicted_pixel_value - target_pixel_value
             row = {
                 "translation_error": np.linalg.norm(
                     prediction_value - target_value
@@ -883,6 +978,12 @@ def run_epoch(
                 ))),
                 "target_depth": target_depth_value,
                 "predicted_depth": float(prediction_value[2]),
+                "signed_x": signed_translation_value[0],
+                "signed_y": signed_translation_value[1],
+                "signed_z": signed_translation_value[2],
+                "pixel_error": np.linalg.norm(signed_pixel_value),
+                "signed_u": signed_pixel_value[0],
+                "signed_v": signed_pixel_value[1],
             }
             side_name = "left" if int(item["side"]) == 0 else "right"
             for name, value in row.items():
