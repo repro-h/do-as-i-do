@@ -30,6 +30,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dense-root")
     parser.add_argument("--intrinsics", type=float, nargs=4)
     parser.add_argument("--frame-id", required=True)
+    parser.add_argument(
+        "--pair-hand-source", choices=("v14", "stage1"), default="stage1"
+    )
     parser.add_argument("--object-samples", type=int, default=16384)
     parser.add_argument("--candidate-topk", type=int, default=256)
     parser.add_argument("--candidate-slack-mm", type=float, default=20.0)
@@ -193,6 +196,7 @@ def main() -> None:
     initial_hand = np.asarray(
         stage1["initial_hand_vertices_camera"][stage_index], dtype=np.float32
     )
+    pair_hand = initial_hand if args.pair_hand_source == "v14" else hand
     faces = np.asarray(query["mano_faces"], dtype=np.int64)
     probability = np.asarray(
         contact["contact_probability"][contact_index], dtype=np.float32
@@ -246,10 +250,10 @@ def main() -> None:
 
     sigma = args.choir_sigma_mm / 1000.0
     thumb_distance = choir_distance(
-        surface, hand[thumb_mask], args.choir_topk, sigma
+        surface, pair_hand[thumb_mask], args.choir_topk, sigma
     )
     index_distance = choir_distance(
-        surface, hand[index_mask], args.choir_topk, sigma
+        surface, pair_hand[index_mask], args.choir_topk, sigma
     )
     thumb_eligible = np.flatnonzero(
         np.isfinite(thumb_pixel_distance)
@@ -287,10 +291,10 @@ def main() -> None:
     thumb_weight = probability[thumb_mask]
     index_weight = probability[index_mask]
     thumb_center = np.average(
-        hand[thumb_mask], axis=0, weights=np.maximum(thumb_weight, 1e-6)
+        pair_hand[thumb_mask], axis=0, weights=np.maximum(thumb_weight, 1e-6)
     )
     index_center = np.average(
-        hand[index_mask], axis=0, weights=np.maximum(index_weight, 1e-6)
+        pair_hand[index_mask], axis=0, weights=np.maximum(index_weight, 1e-6)
     )
     hand_midpoint = 0.5 * (thumb_center + index_center)
     hand_axis = index_center - thumb_center
@@ -352,6 +356,7 @@ def main() -> None:
 
     summary = {
         "frame_id": requested,
+        "pair_hand_source": args.pair_hand_source,
         "thumb_contact_vertices": int(thumb_mask.sum()),
         "index_contact_vertices": int(index_mask.sum()),
         "thumb_candidate_count": int(len(thumb_candidates)),
