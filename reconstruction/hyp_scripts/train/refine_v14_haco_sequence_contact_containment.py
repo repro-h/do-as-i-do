@@ -497,10 +497,9 @@ def main() -> None:
                         nearest - contact_target, min=0.0
                     ).square().mean(dim=-1)
                     weights = contact_weight[indices][:, selected]
-                    region_weights = weights.sum(dim=-1).clamp_min(1e-6)
+                    region_weights = weights.sum().clamp_min(1e-6)
                     region_losses.append(
-                        (error * (region_weights > 1e-6)).sum()
-                        / (region_weights > 1e-6).sum().clamp_min(1)
+                        (error * weights).sum() / region_weights
                     )
                 chunk_contact = (
                     torch.stack(region_losses).mean()
