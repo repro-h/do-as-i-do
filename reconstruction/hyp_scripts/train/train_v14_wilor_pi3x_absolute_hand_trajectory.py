@@ -74,6 +74,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smooth-l1-beta-mm", type=float, default=5.0)
     parser.add_argument("--w-absolute", type=float, default=1.0)
     parser.add_argument("--w-depth", type=float, default=0.5)
+    parser.add_argument("--w-depth-bias", type=float, default=0.0)
+    parser.add_argument("--w-depth-tail", type=float, default=0.0)
+    parser.add_argument("--depth-tail-cap-mm", type=float, default=150.0)
+    parser.add_argument("--depth-tail-scale-mm", type=float, default=50.0)
     parser.add_argument("--w-relative", type=float, default=0.5)
     parser.add_argument("--w-velocity", type=float, default=0.05)
     parser.add_argument("--w-acceleration", type=float, default=0.02)
@@ -759,8 +763,8 @@ def run_epoch(
     training = optimizer is not None
     model.train(training)
     names = (
-        "total", "absolute", "depth", "relative", "velocity",
-        "acceleration", "overlap",
+        "total", "absolute", "depth", "depth_bias", "depth_tail",
+        "relative", "velocity", "acceleration", "overlap",
     )
     sums = {name: 0.0 for name in names}
     metric_names = (
@@ -813,6 +817,26 @@ def run_epoch(
                 ),
                 valid,
             )
+            depth_error = predicted_depth - target_depth
+            valid_weight = valid.to(depth_error.dtype)
+            window_valid = valid.any(dim=1)
+            window_depth_bias = (
+                depth_error * valid_weight
+            ).sum(dim=1) / valid_weight.sum(dim=1).clamp_min(1.0)
+            depth_bias = masked_mean(
+                smooth_l1(
+                    window_depth_bias,
+                    args.smooth_l1_beta_mm / 1000.0,
+                ),
+                window_valid,
+            )
+            tail_cap = args.depth_tail_cap_mm / 1000.0
+            tail_scale = args.depth_tail_scale_mm / 1000.0
+            depth_tail = masked_mean(
+                depth_error.clamp(-tail_cap, tail_cap).square()
+                / max(tail_scale, 1e-8),
+                valid,
+            )
             relative = centered_trajectory_loss(
                 predicted_t, target_t, valid,
                 args.smooth_l1_beta_mm / 1000.0,
@@ -836,6 +860,8 @@ def run_epoch(
             total = (
                 args.w_absolute * absolute
                 + args.w_depth * depth
+                + args.w_depth_bias * depth_bias
+                + args.w_depth_tail * depth_tail
                 + args.w_relative * relative
                 + args.w_velocity * velocity
                 + args.w_acceleration * acceleration
@@ -852,7 +878,7 @@ def run_epoch(
         for name, value in zip(
             names,
             (
-                total, absolute, depth, relative,
+                total, absolute, depth, depth_bias, depth_tail, relative,
                 velocity, acceleration, overlap,
             ),
         ):
@@ -1039,6 +1065,10 @@ def model_args_from_checkpoint(
 ) -> SimpleNamespace:
     values = dict(checkpoint["args"])
     values["feature_mode"] = cli.feature_mode
+    values.setdefault("w_depth_bias", 0.0)
+    values.setdefault("w_depth_tail", 0.0)
+    values.setdefault("depth_tail_cap_mm", 150.0)
+    values.setdefault("depth_tail_scale_mm", 50.0)
     return SimpleNamespace(**values)
 
 
