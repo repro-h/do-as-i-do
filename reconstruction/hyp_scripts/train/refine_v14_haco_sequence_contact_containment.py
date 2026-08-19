@@ -385,11 +385,11 @@ def main() -> None:
         args.contact_weight_floor + (1.0 - args.contact_weight_floor) * confidence
     ) * contact_mask
     if args.fixed_patch_npz:
-        patch_region_np = np.isin(
+        patch_region = torch.from_numpy(np.isin(
             contact_region_ids_np,
             [contact_region_names.index("thumb"), contact_region_names.index("index")],
-        )
-        contact_base_weight = contact_base_weight * patch_region_np[None]
+        )).to(device=device, dtype=contact_base_weight.dtype)
+        contact_base_weight = contact_base_weight * patch_region[None]
     contact_weight = contact_base_weight * phase_gate[:, None]
 
     contact_region_mask = None
