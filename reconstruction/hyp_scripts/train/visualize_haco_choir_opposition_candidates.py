@@ -21,7 +21,11 @@ MIRROR_X = np.diag([-1.0, 1.0, 1.0]).astype(np.float32)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stage1-npz", required=True)
+    parser.add_argument("--stage1-npz")
+    parser.add_argument(
+        "--trajectory-npz",
+        help="V14 trajectory used to reconstruct the initial hand directly.",
+    )
     parser.add_argument("--query-npz", required=True)
     parser.add_argument("--contact-sequence-npz", required=True)
     parser.add_argument("--supervision-npz", required=True)
@@ -181,21 +185,39 @@ def geodesic_patch(
 def main() -> None:
     args = parse_args()
     requested = frame_id(args.frame_id)
-    stage1 = load_npz(Path(args.stage1_npz).expanduser().resolve())
     query = load_npz(Path(args.query_npz).expanduser().resolve())
     contact = load_npz(Path(args.contact_sequence_npz).expanduser().resolve())
     supervision = load_npz(Path(args.supervision_npz).expanduser().resolve())
-    stage_index = index_for(stage1["frame_ids"], requested)
     query_index = index_for(query["frame_ids"], requested)
     contact_index = index_for(contact["frame_ids"], requested)
     supervision_index = index_for(supervision["frame_ids"], requested)
 
-    hand = np.asarray(
-        stage1["refined_hand_vertices_camera"][stage_index], dtype=np.float32
-    )
-    initial_hand = np.asarray(
-        stage1["initial_hand_vertices_camera"][stage_index], dtype=np.float32
-    )
+    if args.trajectory_npz:
+        trajectory = load_npz(Path(args.trajectory_npz).expanduser().resolve())
+        trajectory_index = index_for(trajectory["frame_ids"], requested)
+        wrist = np.asarray(
+            trajectory["predicted_wrist_camera"][trajectory_index],
+            dtype=np.float32,
+        )
+        root_relative = np.asarray(
+            query["vertices_3d_root_relative_original"][query_index],
+            dtype=np.float32,
+        )
+        initial_hand = root_relative + wrist[None]
+        hand = initial_hand.copy()
+    elif args.stage1_npz:
+        stage1 = load_npz(Path(args.stage1_npz).expanduser().resolve())
+        stage_index = index_for(stage1["frame_ids"], requested)
+        hand = np.asarray(
+            stage1["refined_hand_vertices_camera"][stage_index], dtype=np.float32
+        )
+        initial_hand = np.asarray(
+            stage1["initial_hand_vertices_camera"][stage_index], dtype=np.float32
+        )
+    else:
+        raise ValueError("Pass either --trajectory-npz or --stage1-npz")
+    if args.pair_hand_source == "stage1" and not args.stage1_npz:
+        raise ValueError("--pair-hand-source stage1 requires --stage1-npz")
     pair_hand = initial_hand if args.pair_hand_source == "v14" else hand
     faces = np.asarray(query["mano_faces"], dtype=np.int64)
     probability = np.asarray(
