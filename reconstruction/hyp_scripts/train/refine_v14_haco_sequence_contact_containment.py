@@ -62,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-probability-power", type=float, default=2.0)
     parser.add_argument("--contact-weight-floor", type=float, default=0.05)
     parser.add_argument("--mano-data-dir")
+    parser.add_argument("--fixed-patch-npz")
     parser.add_argument("--region-balanced-contact", action="store_true")
     parser.add_argument("--contact-region-min-vertices", type=int, default=3)
     parser.add_argument("--contact-target-mm", type=float, default=6.0)
@@ -244,12 +245,61 @@ def main() -> None:
     ) = build_object_geometry(
         mesh, supervision, supervision_indices, normalized_left, args.object_samples
     )
+    fixed_thumb_np = fixed_index_np = None
+    fixed_patch_source = None
+    if args.fixed_patch_npz:
+        fixed_patch = load_npz(
+            Path(args.fixed_patch_npz).expanduser().resolve()
+        )
+        required_patch_keys = (
+            "thumb_patch_vertices_canonical",
+            "index_patch_vertices_canonical",
+        )
+        missing_patch_keys = [
+            key for key in required_patch_keys if key not in fixed_patch
+        ]
+        if missing_patch_keys:
+            raise KeyError(f"Fixed patch archive lacks {missing_patch_keys}")
+        thumb_canonical = np.asarray(
+            fixed_patch["thumb_patch_vertices_canonical"], dtype=np.float32
+        )
+        index_canonical = np.asarray(
+            fixed_patch["index_patch_vertices_canonical"], dtype=np.float32
+        )
+        fixed_thumb_np = np.empty(
+            (frame_count, len(thumb_canonical), 3), dtype=np.float32
+        )
+        fixed_index_np = np.empty(
+            (frame_count, len(index_canonical), 3), dtype=np.float32
+        )
+        for output_index, supervision_index in enumerate(supervision_indices):
+            pose = physical_pose(
+                supervision["gt_ycb_object_pose"][supervision_index],
+                normalized_left,
+            )
+            fixed_thumb_np[output_index] = (
+                thumb_canonical @ pose[:3, :3].T + pose[:3, 3]
+            )
+            fixed_index_np[output_index] = (
+                index_canonical @ pose[:3, :3].T + pose[:3, 3]
+            )
+        fixed_patch_source = str(
+            Path(args.fixed_patch_npz).expanduser().resolve()
+        )
     boundary = directed_boundary_loop(faces_np)
 
     vertices = torch.from_numpy(vertices_np).to(device)
     wrists = torch.from_numpy(wrist_np).to(device)
     object_points = torch.from_numpy(object_points_np).to(device)
     object_normals = torch.from_numpy(object_normals_np).to(device)
+    fixed_thumb = (
+        torch.from_numpy(fixed_thumb_np).to(device)
+        if fixed_thumb_np is not None else None
+    )
+    fixed_index = (
+        torch.from_numpy(fixed_index_np).to(device)
+        if fixed_index_np is not None else None
+    )
     faces = torch.from_numpy(faces_np).to(device)
     contact_mask = torch.from_numpy(contact_mask_np).to(device)
     probability = torch.from_numpy(probability_np).to(device)
@@ -305,6 +355,12 @@ def main() -> None:
         correction_distance_np, phase_gate_np,
         args.correction_stop_mm, args.correction_full_mm,
     )
+    if args.fixed_patch_npz:
+        if not args.region_balanced_contact:
+            raise ValueError("--fixed-patch-npz requires --region-balanced-contact")
+        # The patch was selected independently of the old global-distance
+        # gate. Every phase-active frame must be allowed to reach it.
+        contact_gate_np = phase_gate_np.copy()
     contact_gate = torch.from_numpy(contact_gate_np).to(device)
     threshold = float(np.asarray(contact["contact_threshold"]).item())
     confidence = torch.clamp(
@@ -316,6 +372,12 @@ def main() -> None:
     contact_base_weight = (
         args.contact_weight_floor + (1.0 - args.contact_weight_floor) * confidence
     ) * contact_mask
+    if args.fixed_patch_npz:
+        patch_region_np = np.isin(
+            contact_region_ids_np,
+            [contact_region_names.index("thumb"), contact_region_names.index("index")],
+        )
+        contact_base_weight = contact_base_weight * patch_region_np[None]
     contact_weight = contact_base_weight * phase_gate[:, None]
 
     contact_region_mask = None
@@ -403,18 +465,51 @@ def main() -> None:
             refined = transform_batch(
                 vertices[indices], wrists[indices], translation[indices], angles[indices]
             )
-            pairwise = torch.cdist(refined, object_points[indices])
-            nearest = torch.topk(pairwise, topk, dim=-1, largest=False).values
-            soft_weight = torch.softmax(
-                -nearest.square() / (2.0 * sigma * sigma), dim=-1
-            )
-            effective_distance = torch.sqrt(
-                (soft_weight * nearest.square()).sum(dim=-1) + 1e-12
-            )
-            contact_error = torch.clamp(
-                effective_distance - contact_target, min=0.0
-            ).square()
-            if args.region_balanced_contact:
+            if args.fixed_patch_npz:
+                region_losses = []
+                for region_name, region_patch in (
+                    ("thumb", fixed_thumb), ("index", fixed_index)
+                ):
+                    region_index = contact_region_names.index(region_name)
+                    selected = contact_region_mask[region_index]
+                    if not selected.any():
+                        continue
+                    distances = torch.cdist(
+                        refined[:, selected], region_patch[indices]
+                    )
+                    patch_topk = min(topk, distances.shape[-1])
+                    nearest = torch.topk(
+                        distances, patch_topk, dim=-1, largest=False
+                    ).values
+                    error = torch.clamp(
+                        nearest - contact_target, min=0.0
+                    ).square().mean(dim=-1)
+                    weights = contact_weight[indices][:, selected]
+                    region_weights = weights.sum(dim=-1).clamp_min(1e-6)
+                    region_losses.append(
+                        (error * (region_weights > 1e-6)).sum()
+                        / (region_weights > 1e-6).sum().clamp_min(1)
+                    )
+                chunk_contact = (
+                    torch.stack(region_losses).mean()
+                    if region_losses
+                    else torch.zeros((), device=device)
+                )
+            else:
+                pairwise = torch.cdist(refined, object_points[indices])
+                nearest = torch.topk(pairwise, topk, dim=-1, largest=False).values
+                soft_weight = torch.softmax(
+                    -nearest.square() / (2.0 * sigma * sigma), dim=-1
+                )
+                effective_distance = torch.sqrt(
+                    (soft_weight * nearest.square()).sum(dim=-1) + 1e-12
+                )
+                contact_error = torch.clamp(
+                    effective_distance - contact_target, min=0.0
+                ).square()
+            if args.fixed_patch_npz:
+                pass
+            elif args.region_balanced_contact:
                 region_weight = (
                     contact_base_weight[indices, None]
                     * contact_region_mask[None]
@@ -553,7 +648,9 @@ def main() -> None:
 
     summary = {
         "method": (
-            "region_balanced_haco_contact_capped_mano_containment_rigid_stage1_v4"
+            "v14_fixed_canonical_contact_patch_rigid_stage1_v1"
+            if args.fixed_patch_npz
+            else "region_balanced_haco_contact_capped_mano_containment_rigid_stage1_v4"
             if args.region_balanced_contact
             else "joint_haco_contact_capped_mano_containment_rigid_stage1_v3"
         ),
@@ -581,8 +678,11 @@ def main() -> None:
             "rotation_anchor": args.w_rotation_anchor,
         },
         "contact_aggregation": (
-            "mano_region_balanced" if args.region_balanced_contact else "global_vertex"
+            "fixed_thumb_index_canonical_patches"
+            if args.fixed_patch_npz
+            else "mano_region_balanced" if args.region_balanced_contact else "global_vertex"
         ),
+        "fixed_patch_source": fixed_patch_source,
         "contact_regions": {
             "names": contact_region_names,
             "minimum_vertices": args.contact_region_min_vertices,
@@ -627,6 +727,11 @@ def main() -> None:
         "initial_gt_vertex_error_median_mm": initial_gt_frame,
         "refined_gt_vertex_error_median_mm": refined_gt_frame,
         "stream_id": np.asarray(str(query["stream_id"].item())),
+        **({
+            "fixed_thumb_patch_vertices_camera": fixed_thumb_np,
+            "fixed_index_patch_vertices_camera": fixed_index_np,
+            "fixed_patch_source": np.asarray(fixed_patch_source),
+        } if args.fixed_patch_npz else {}),
         "method": np.asarray(summary["method"]),
     })
     summary_path = Path(
