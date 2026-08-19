@@ -44,6 +44,18 @@ MANO_CONTACT_REGIONS = {
 }
 
 
+MIRROR_X = np.diag([-1.0, 1.0, 1.0]).astype(np.float32)
+
+
+def physical_pose(pose: np.ndarray, normalized_left: bool) -> np.ndarray:
+    """Convert a canonical-right object pose back to physical camera axes."""
+    result = np.asarray(pose, dtype=np.float32).copy()
+    if normalized_left:
+        result[:3, :3] = MIRROR_X @ result[:3, :3] @ MIRROR_X
+        result[:3, 3] = MIRROR_X @ result[:3, 3]
+    return result
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--trajectory-npz", required=True)
