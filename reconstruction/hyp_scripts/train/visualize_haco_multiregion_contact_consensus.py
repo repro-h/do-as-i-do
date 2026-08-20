@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""Visualize fixed multi-region YCB contact patches across a sequence."""
+
+from __future__ import annotations
+
+import argparse
+import threading
+import time
+from pathlib import Path
+
+import numpy as np
+import trimesh
+import viser
+
+from refine_v14_haco_sequence_contact_containment import mano_contact_region_ids
+from select_haco_multiregion_object_contacts_sequence import (
+    adjacency,
+    strongest_components,
+)
+from visualize_haco_choir_opposition_candidates import (
+    frame_id,
+    index_for,
+    load_npz,
+    physical_pose,
+)
+from visualize_haco_multiregion_object_contacts import PALETTE, colors, lighter
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--selection-npz", required=True)
+    parser.add_argument("--trajectory-npz", required=True)
+    parser.add_argument("--query-npz", required=True)
+    parser.add_argument("--contact-sequence-npz", required=True)
+    parser.add_argument("--supervision-npz", required=True)
+    parser.add_argument("--object-mesh", required=True)
+    parser.add_argument("--mano-data-dir", required=True)
+    parser.add_argument("--initial-frame", type=int, default=0)
+    parser.add_argument("--fps", type=int, default=10)
+    parser.add_argument("--port", type=int, default=8098)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    selection = load_npz(Path(args.selection_npz).expanduser().resolve())
+    trajectory = load_npz(Path(args.trajectory_npz).expanduser().resolve())
+    query = load_npz(Path(args.query_npz).expanduser().resolve())
+    contact = load_npz(Path(args.contact_sequence_npz).expanduser().resolve())
+    supervision = load_npz(Path(args.supervision_npz).expanduser().resolve())
+
+    ids = np.asarray(query["frame_ids"])
+    count = len(ids)
+    trajectory_indices = np.asarray(
+        [index_for(trajectory["frame_ids"], frame_id(value)) for value in ids]
+    )
+    contact_indices = np.asarray(
+        [index_for(contact["frame_ids"], frame_id(value)) for value in ids]
+    )
+    supervision_indices = np.asarray(
+        [index_for(supervision["frame_ids"], frame_id(value)) for value in ids]
+    )
+    hand = (
+        np.asarray(query["vertices_3d_root_relative_original"], dtype=np.float32)
+        + np.asarray(
+            trajectory["predicted_wrist_camera"][trajectory_indices],
+            dtype=np.float32,
+        )[:, None]
+    )
+    hand_faces = np.asarray(query["mano_faces"], dtype=np.int64)
+    valid = (
+        np.asarray(query["model_valid"]).astype(bool)
+        & np.asarray(trajectory["prediction_valid"][trajectory_indices]).astype(bool)
+    )
+    probability = np.asarray(
+        contact["contact_probability"][contact_indices], dtype=np.float32
+    )
+    threshold = float(np.asarray(contact["contact_threshold"]).item())
+    region_ids, region_names = mano_contact_region_ids(
+        args.mano_data_dir, str(query["hand_side"].item()).lower()
+    )
+    mano_graph = adjacency(hand_faces, 778)
+
+    mesh = trimesh.load(Path(args.object_mesh).expanduser().resolve(), process=False)
+    if isinstance(mesh, trimesh.Scene):
+        mesh = trimesh.util.concatenate(tuple(mesh.geometry.values()))
+    object_local = np.asarray(mesh.vertices, dtype=np.float32)
+    object_faces = np.asarray(mesh.faces, dtype=np.int64)
+    normalized_left = bool(
+        np.asarray(supervision.get("normalized_left", False)).item()
+    )
+    poses = [
+        physical_pose(
+            supervision["gt_ycb_object_pose"][supervision_index],
+            normalized_left,
+        )
+        for supervision_index in supervision_indices
+    ]
+    selected_regions = [str(value) for value in selection["selected_region_names"]]
+    patches = {
+        name: np.asarray(
+            selection[f"{name}_patch_vertices_canonical"], dtype=np.float32
+        )
+        for name in selected_regions
+    }
+    observation_lookup: dict[tuple[str, str], int] = {}
+    for observation_frame, observation_region, vertex_id in zip(
+        selection["observation_frame_ids"],
+        selection["observation_region_names"],
+        selection["observation_selected_vertex_ids"],
+    ):
+        observation_lookup[(str(observation_frame), str(observation_region))] = int(vertex_id)
+
+    server = viser.ViserServer(port=args.port)
+    server.scene.set_up_direction("-y")
+    initial = max(0, min(count - 1, args.initial_frame))
+    frame_slider = server.gui.add_slider(
+        "Frame", min=0, max=count - 1, step=1, initial_value=initial
+    )
+    play_button = server.gui.add_button("Play / Pause")
+    fps_slider = server.gui.add_slider(
+        "FPS", min=1, max=30, step=1, initial_value=max(1, args.fps)
+    )
+    point_size = server.gui.add_slider(
+        "Point size", min=0.001, max=0.015, step=0.001, initial_value=0.006
+    )
+    show_object = server.gui.add_checkbox("GT YCB object", initial_value=True)
+    show_hand = server.gui.add_checkbox("V14 hand", initial_value=True)
+    show_haco = server.gui.add_checkbox("HACO components", initial_value=True)
+    show_patches = server.gui.add_checkbox("Fixed object patches", initial_value=True)
+    show_observations = server.gui.add_checkbox(
+        "Sampled frame observations", initial_value=True
+    )
+    handles = []
+    playing = {"value": False}
+    suppress = {"value": False}
+
+    def clear() -> None:
+        while handles:
+            handles.pop().remove()
+
+    def show_frame(index: int) -> None:
+        index = max(0, min(count - 1, int(index)))
+        clear()
+        pose = poses[index]
+        object_vertices = object_local @ pose[:3, :3].T + pose[:3, 3]
+        requested = frame_id(ids[index])
+        if show_object.value:
+            handles.append(server.scene.add_mesh_simple(
+                "/object",
+                vertices=object_vertices,
+                faces=object_faces,
+                color=(170, 180, 195),
+                opacity=0.55,
+            ))
+        if show_hand.value and valid[index]:
+            handles.append(server.scene.add_mesh_simple(
+                "/v14_hand",
+                vertices=hand[index],
+                faces=hand_faces,
+                color=(80, 175, 245),
+                opacity=0.45,
+            ))
+        for region_index, name in enumerate(region_names):
+            color = PALETTE[name]
+            raw_mask = (
+                (region_ids == region_index)
+                & (probability[index] >= threshold)
+            )
+            component = strongest_components(
+                raw_mask, mano_graph, probability[index], 1
+            ) if raw_mask.any() else raw_mask
+            if show_haco.value and component.any():
+                handles.append(server.scene.add_point_cloud(
+                    f"/haco/{name}",
+                    points=hand[index, component],
+                    colors=colors(int(component.sum()), lighter(color)),
+                    point_size=float(point_size.value) * 0.75,
+                ))
+            if name not in patches:
+                continue
+            patch_camera = patches[name] @ pose[:3, :3].T + pose[:3, 3]
+            if show_patches.value:
+                handles.append(server.scene.add_point_cloud(
+                    f"/fixed_patch/{name}",
+                    points=patch_camera,
+                    colors=colors(len(patch_camera), color),
+                    point_size=float(point_size.value),
+                ))
+            observation_id = observation_lookup.get((requested, name))
+            if show_observations.value and observation_id is not None:
+                handles.append(server.scene.add_point_cloud(
+                    f"/observation/{name}",
+                    points=object_vertices[[observation_id]],
+                    colors=colors(1, color),
+                    point_size=float(point_size.value) * 1.8,
+                ))
+        print(
+            f"frame={requested} index={index} "
+            f"sampled={any(frame == requested for frame, _ in observation_lookup)}",
+            flush=True,
+        )
+
+    @frame_slider.on_update
+    def _(_) -> None:
+        if not suppress["value"]:
+            show_frame(int(frame_slider.value))
+
+    @play_button.on_click
+    def _(_) -> None:
+        playing["value"] = not playing["value"]
+
+    for control in (
+        point_size,
+        show_object,
+        show_hand,
+        show_haco,
+        show_patches,
+        show_observations,
+    ):
+        control.on_update(lambda _: show_frame(int(frame_slider.value)))
+
+    def playback() -> None:
+        while True:
+            if playing["value"]:
+                next_frame = (int(frame_slider.value) + 1) % count
+                suppress["value"] = True
+                frame_slider.value = next_frame
+                suppress["value"] = False
+                show_frame(next_frame)
+                time.sleep(1.0 / max(float(fps_slider.value), 1.0))
+            else:
+                time.sleep(0.05)
+
+    threading.Thread(target=playback, daemon=True).start()
+    show_frame(initial)
+    print(f"Viewer: http://localhost:{args.port}", flush=True)
+    print("Press Ctrl+C to stop", flush=True)
+    while True:
+        time.sleep(1.0)
+
+
+if __name__ == "__main__":
+    main()
