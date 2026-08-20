@@ -46,8 +46,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pixel-soft-topk", type=int, default=8)
     parser.add_argument("--pixel-sigma", type=float, default=12.0)
     parser.add_argument("--candidate-topk", type=int, default=512)
-    parser.add_argument("--distance-slack-mm", type=float, default=25.0)
+    parser.add_argument("--distance-slack-mm", type=float, default=60.0)
     parser.add_argument("--max-contact-distance-mm", type=float, default=90.0)
+    parser.add_argument("--max-depth-intrusion-mm", type=float, default=12.0)
+    parser.add_argument("--depth-intrusion-sigma-mm", type=float, default=4.0)
+    parser.add_argument("--onset-half-life-frames", type=float, default=24.0)
     parser.add_argument("--min-facing-cosine", type=float, default=0.15)
     parser.add_argument("--max-normal-dot", type=float, default=1.0)
     parser.add_argument("--visible-surface-only", action="store_true")
@@ -56,7 +59,8 @@ def parse_args() -> argparse.Namespace:
         "--visibility-depth-tolerance-mm", type=float, default=10.0
     )
     parser.add_argument("--w-pixel", type=float, default=2.0)
-    parser.add_argument("--w-distance", type=float, default=1.0)
+    parser.add_argument("--w-distance", type=float, default=0.15)
+    parser.add_argument("--w-depth-intrusion", type=float, default=8.0)
     parser.add_argument("--w-facing", type=float, default=50.0)
     parser.add_argument("--w-normal", type=float, default=60.0)
     parser.add_argument("--cluster-radius-mm", type=float, default=12.0)
@@ -198,6 +202,10 @@ def main() -> None:
     args = parse_args()
     if args.frame_stride <= 0:
         raise ValueError("--frame-stride must be positive")
+    if args.depth_intrusion_sigma_mm <= 0:
+        raise ValueError("--depth-intrusion-sigma-mm must be positive")
+    if args.onset_half_life_frames <= 0:
+        raise ValueError("--onset-half-life-frames must be positive")
     trajectory = load_npz(Path(args.trajectory_npz).expanduser().resolve())
     query = load_npz(Path(args.query_npz).expanduser().resolve())
     contact = load_npz(Path(args.contact_sequence_npz).expanduser().resolve())
@@ -268,6 +276,7 @@ def main() -> None:
 
     observations: list[dict[str, object]] = []
     skipped: list[dict[str, object]] = []
+    contact_onset_index = int(np.flatnonzero(valid)[0])
     for progress, index in enumerate(eligible, start=1):
         requested = frame_id(ids[index])
         hand = hand_vertices[index]
@@ -339,6 +348,13 @@ def main() -> None:
             points = object_vertices[candidates]
             displacement = matched_hand - points
             distance_mm = np.linalg.norm(displacement, axis=-1) * 1000.0
+            # A matched hand point behind the nearest visible object surface is
+            # a local penetration signal. Unlike mesh containment, this remains
+            # cheap and does not require the object mesh to be watertight.
+            depth_intrusion_mm = np.maximum(
+                (matched_hand[:, 2] - points[:, 2]) * 1000.0,
+                0.0,
+            )
             direction = displacement / np.maximum(
                 np.linalg.norm(displacement, axis=-1, keepdims=True), 1e-12
             )
@@ -350,6 +366,7 @@ def main() -> None:
             candidate_valid = (
                 (distance_mm <= args.max_contact_distance_mm)
                 & (distance_mm <= minimum_distance + args.distance_slack_mm)
+                & (depth_intrusion_mm <= args.max_depth_intrusion_mm)
                 & (facing >= args.min_facing_cosine)
                 & (normal_dot <= args.max_normal_dot)
             )
@@ -359,6 +376,9 @@ def main() -> None:
                     "region": region_name,
                     "reason": "distance_or_direction_gate",
                     "minimum_distance_mm": minimum_distance,
+                    "minimum_depth_intrusion_mm": float(
+                        depth_intrusion_mm.min()
+                    ),
                     "maximum_facing_cosine": float(facing.max()),
                     "minimum_normal_dot": float(normal_dot.min()),
                 })
@@ -366,12 +386,14 @@ def main() -> None:
             candidates = candidates[candidate_valid]
             matched = matched[candidate_valid]
             distance_mm = distance_mm[candidate_valid]
+            depth_intrusion_mm = depth_intrusion_mm[candidate_valid]
             facing = facing[candidate_valid]
             normal_dot = normal_dot[candidate_valid]
             candidate_pixel = pixel_distance[candidates]
             score = (
                 args.w_pixel * candidate_pixel
                 + args.w_distance * distance_mm
+                + args.w_depth_intrusion * depth_intrusion_mm
                 + args.w_facing * (1.0 - facing)
                 + args.w_normal * (1.0 + normal_dot)
             )
@@ -379,11 +401,21 @@ def main() -> None:
             selected_id = int(candidates[selected_offset])
             contact_vertices = np.flatnonzero(mask)
             haco_probability = float(probability[contact_vertices].mean())
+            onset_weight = 0.5 ** (
+                max(int(index) - contact_onset_index, 0)
+                / args.onset_half_life_frames
+            )
+            intrusion_weight = np.exp(
+                -float(depth_intrusion_mm[selected_offset])
+                / args.depth_intrusion_sigma_mm
+            )
             quality = (
                 haco_probability
                 * np.sqrt(len(contact_vertices))
                 * np.exp(-float(candidate_pixel[selected_offset]) / 20.0)
-                * np.exp(-float(distance_mm[selected_offset]) / 80.0)
+                * np.exp(-float(distance_mm[selected_offset]) / 160.0)
+                * intrusion_weight
+                * onset_weight
                 * max(float(facing[selected_offset]), 0.05)
                 * np.clip((1.0 - float(normal_dot[selected_offset])) * 0.5, 0.1, 1.0)
             )
@@ -395,10 +427,15 @@ def main() -> None:
                 "score": float(score[selected_offset]),
                 "pixel_distance": float(candidate_pixel[selected_offset]),
                 "distance_mm": float(distance_mm[selected_offset]),
+                "depth_intrusion_mm": float(
+                    depth_intrusion_mm[selected_offset]
+                ),
                 "facing_cosine": float(facing[selected_offset]),
                 "normal_dot": float(normal_dot[selected_offset]),
                 "haco_vertices": int(len(contact_vertices)),
                 "haco_probability": haco_probability,
+                "onset_weight": float(onset_weight),
+                "intrusion_weight": float(intrusion_weight),
                 "vote_weight": float(quality),
             })
             selected_this_frame.append(region_name)
@@ -430,6 +467,16 @@ def main() -> None:
         ),
         "observation_scores": np.asarray(
             [row["score"] for row in observations], dtype=np.float32
+        ),
+        "observation_distance_mm": np.asarray(
+            [row["distance_mm"] for row in observations], dtype=np.float32
+        ),
+        "observation_depth_intrusion_mm": np.asarray(
+            [row["depth_intrusion_mm"] for row in observations],
+            dtype=np.float32,
+        ),
+        "observation_onset_weights": np.asarray(
+            [row["onset_weight"] for row in observations], dtype=np.float32
         ),
         "observation_vote_weights": np.asarray(
             [row["vote_weight"] for row in observations], dtype=np.float32
@@ -501,7 +548,7 @@ def main() -> None:
     selected_names = [str(row["region"]) for row in selected_regions]
     output_arrays["selected_region_names"] = np.asarray(selected_names)
     summary = {
-        "method": "v14_haco_multiregion_sequence_consensus_v1",
+        "method": "v14_haco_multiregion_sequence_consensus_v2",
         "stream_id": str(np.asarray(query["stream_id"]).item()),
         "frames": len(ids),
         "eligible_frames": int(valid.sum()),
@@ -517,11 +564,21 @@ def main() -> None:
             "pixel_radius": args.pixel_radius,
             "distance_slack_mm": args.distance_slack_mm,
             "max_contact_distance_mm": args.max_contact_distance_mm,
+            "max_depth_intrusion_mm": args.max_depth_intrusion_mm,
+            "depth_intrusion_sigma_mm": args.depth_intrusion_sigma_mm,
+            "onset_half_life_frames": args.onset_half_life_frames,
             "min_facing_cosine": args.min_facing_cosine,
             "max_normal_dot": args.max_normal_dot,
             "visible_surface_only": args.visible_surface_only,
             "cluster_radius_mm": args.cluster_radius_mm,
             "minimum_consensus": args.minimum_consensus,
+            "weights": {
+                "pixel": args.w_pixel,
+                "distance": args.w_distance,
+                "depth_intrusion": args.w_depth_intrusion,
+                "facing": args.w_facing,
+                "normal": args.w_normal,
+            },
         },
         "observations": observations,
         "skipped": skipped,
