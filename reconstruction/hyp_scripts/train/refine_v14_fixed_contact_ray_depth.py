@@ -25,6 +25,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--trajectory-npz", required=True)
     parser.add_argument("--query-npz", required=True)
+    parser.add_argument(
+        "--initial-hand-npz",
+        help="Optional prior refinement whose camera-space hand initializes this pass",
+    )
+    parser.add_argument(
+        "--initial-hand-vertices-key",
+        default="refined_hand_vertices_camera",
+    )
     parser.add_argument("--contact-sequence-npz", required=True)
     parser.add_argument("--fixed-patch-npz", required=True)
     parser.add_argument(
@@ -197,6 +205,26 @@ def main() -> None:
     hand = np.asarray(
         query["vertices_3d_root_relative_original"], dtype=np.float32
     ) + wrist[:, None]
+    initial_hand_source = None
+    if args.initial_hand_npz:
+        initial_hand_source = str(
+            Path(args.initial_hand_npz).expanduser().resolve()
+        )
+        initial_hand = load_npz(Path(initial_hand_source))
+        initial_indices = aligned_indices(initial_hand["frame_ids"], ids)
+        if args.initial_hand_vertices_key not in initial_hand:
+            raise KeyError(
+                f"Initial hand archive lacks {args.initial_hand_vertices_key!r}"
+            )
+        hand = np.asarray(
+            initial_hand[args.initial_hand_vertices_key][initial_indices],
+            dtype=np.float32,
+        )
+        if "refined_wrist_camera" in initial_hand:
+            wrist = np.asarray(
+                initial_hand["refined_wrist_camera"][initial_indices],
+                dtype=np.float32,
+            )
     faces = np.asarray(query["mano_faces"], dtype=np.int64)
     gate = np.asarray(phase[args.phase_key][phase_indices], dtype=np.float32)
     contact_mask = np.asarray(
@@ -440,6 +468,7 @@ def main() -> None:
     summary = {
         "method": "fixed_contact_threshold_ray_depth_feedback_v1",
         "stream_id": str(query["stream_id"].item()),
+        "initial_hand_source": initial_hand_source,
         "contact_target_source_npz": str(
             Path(args.fixed_patch_npz).expanduser().resolve()
         ),
@@ -500,6 +529,7 @@ def main() -> None:
         "initial_inside_object_vertices": initial_inside,
         "refined_inside_object_vertices": refined_inside,
         "stream_id": np.asarray(str(query["stream_id"].item())),
+        "initial_hand_source": np.asarray(initial_hand_source or "v14"),
         "method": np.asarray(summary["method"]),
     })
     summary_path.parent.mkdir(parents=True, exist_ok=True)
