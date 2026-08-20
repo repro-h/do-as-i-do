@@ -257,44 +257,50 @@ def main() -> None:
     ) = build_object_geometry(
         mesh, supervision, supervision_indices, normalized_left, args.object_samples
     )
-    fixed_thumb_np = fixed_index_np = None
+    fixed_region_np: dict[str, np.ndarray] = {}
     fixed_patch_source = None
     if args.fixed_patch_npz:
         fixed_patch = load_npz(
             Path(args.fixed_patch_npz).expanduser().resolve()
         )
-        required_patch_keys = (
-            "thumb_patch_vertices_canonical",
-            "index_patch_vertices_canonical",
-        )
-        missing_patch_keys = [
-            key for key in required_patch_keys if key not in fixed_patch
-        ]
-        if missing_patch_keys:
-            raise KeyError(f"Fixed patch archive lacks {missing_patch_keys}")
-        thumb_canonical = np.asarray(
-            fixed_patch["thumb_patch_vertices_canonical"], dtype=np.float32
-        )
-        index_canonical = np.asarray(
-            fixed_patch["index_patch_vertices_canonical"], dtype=np.float32
-        )
-        fixed_thumb_np = np.empty(
-            (frame_count, len(thumb_canonical), 3), dtype=np.float32
-        )
-        fixed_index_np = np.empty(
-            (frame_count, len(index_canonical), 3), dtype=np.float32
-        )
-        for output_index, supervision_index in enumerate(supervision_indices):
-            pose = physical_pose(
-                supervision["gt_ycb_object_pose"][supervision_index],
-                normalized_left,
+        if "stable_region_names" in fixed_patch:
+            fixed_region_names = [
+                str(value) for value in fixed_patch["stable_region_names"]
+            ]
+            if not fixed_region_names:
+                raise RuntimeError(
+                    "Fixed patch archive has no consensus-stable regions"
+                )
+        elif "selected_region_names" in fixed_patch:
+            fixed_region_names = [
+                str(value) for value in fixed_patch["selected_region_names"]
+            ]
+        else:
+            fixed_region_names = [
+                name for name in ("thumb", "index")
+                if f"{name}_patch_vertices_canonical" in fixed_patch
+            ]
+        if not fixed_region_names:
+            raise KeyError(
+                "Fixed patch archive has no selected region patches"
             )
-            fixed_thumb_np[output_index] = (
-                thumb_canonical @ pose[:3, :3].T + pose[:3, 3]
+        for region_name in fixed_region_names:
+            key = f"{region_name}_patch_vertices_canonical"
+            if key not in fixed_patch:
+                raise KeyError(f"Fixed patch archive lacks {key!r}")
+            canonical = np.asarray(fixed_patch[key], dtype=np.float32)
+            camera = np.empty(
+                (frame_count, len(canonical), 3), dtype=np.float32
             )
-            fixed_index_np[output_index] = (
-                index_canonical @ pose[:3, :3].T + pose[:3, 3]
-            )
+            for output_index, supervision_index in enumerate(supervision_indices):
+                pose = physical_pose(
+                    supervision["gt_ycb_object_pose"][supervision_index],
+                    normalized_left,
+                )
+                camera[output_index] = (
+                    canonical @ pose[:3, :3].T + pose[:3, 3]
+                )
+            fixed_region_np[region_name] = camera
         fixed_patch_source = str(
             Path(args.fixed_patch_npz).expanduser().resolve()
         )
@@ -304,14 +310,10 @@ def main() -> None:
     wrists = torch.from_numpy(wrist_np).to(device)
     object_points = torch.from_numpy(object_points_np).to(device)
     object_normals = torch.from_numpy(object_normals_np).to(device)
-    fixed_thumb = (
-        torch.from_numpy(fixed_thumb_np).to(device)
-        if fixed_thumb_np is not None else None
-    )
-    fixed_index = (
-        torch.from_numpy(fixed_index_np).to(device)
-        if fixed_index_np is not None else None
-    )
+    fixed_regions = {
+        name: torch.from_numpy(values).to(device)
+        for name, values in fixed_region_np.items()
+    }
     faces = torch.from_numpy(faces_np).to(device)
     contact_mask = torch.from_numpy(contact_mask_np).to(device)
     probability = torch.from_numpy(probability_np).to(device)
@@ -370,6 +372,13 @@ def main() -> None:
     if args.fixed_patch_npz:
         if not args.region_balanced_contact:
             raise ValueError("--fixed-patch-npz requires --region-balanced-contact")
+        unknown_regions = sorted(
+            set(fixed_regions).difference(contact_region_names)
+        )
+        if unknown_regions:
+            raise KeyError(
+                f"Fixed patch regions are unknown to MANO: {unknown_regions}"
+            )
         # The patch was selected independently of the old global-distance
         # gate. Every phase-active frame must be allowed to reach it.
         contact_gate_np = phase_gate_np.copy()
@@ -385,9 +394,12 @@ def main() -> None:
         args.contact_weight_floor + (1.0 - args.contact_weight_floor) * confidence
     ) * contact_mask
     if args.fixed_patch_npz:
+        fixed_region_indices = [
+            contact_region_names.index(name) for name in fixed_regions
+        ]
         patch_region = torch.from_numpy(np.isin(
             contact_region_ids_np,
-            [contact_region_names.index("thumb"), contact_region_names.index("index")],
+            fixed_region_indices,
         )).to(device=device, dtype=contact_base_weight.dtype)
         contact_base_weight = contact_base_weight * patch_region[None]
     contact_weight = contact_base_weight * phase_gate[:, None]
@@ -479,9 +491,7 @@ def main() -> None:
             )
             if args.fixed_patch_npz:
                 region_losses = []
-                for region_name, region_patch in (
-                    ("thumb", fixed_thumb), ("index", fixed_index)
-                ):
+                for region_name, region_patch in fixed_regions.items():
                     region_index = contact_region_names.index(region_name)
                     selected = contact_region_mask[region_index]
                     if not selected.any():
@@ -659,7 +669,7 @@ def main() -> None:
 
     summary = {
         "method": (
-            "v14_fixed_canonical_contact_patch_rigid_stage1_v1"
+            "v14_fixed_multiregion_canonical_contact_patch_rigid_stage1_v2"
             if args.fixed_patch_npz
             else "region_balanced_haco_contact_capped_mano_containment_rigid_stage1_v4"
             if args.region_balanced_contact
@@ -689,11 +699,12 @@ def main() -> None:
             "rotation_anchor": args.w_rotation_anchor,
         },
         "contact_aggregation": (
-            "fixed_thumb_index_canonical_patches"
+            "fixed_multiregion_canonical_patches"
             if args.fixed_patch_npz
             else "mano_region_balanced" if args.region_balanced_contact else "global_vertex"
         ),
         "fixed_patch_source": fixed_patch_source,
+        "fixed_patch_regions": list(fixed_regions),
         "contact_regions": {
             "names": contact_region_names,
             "minimum_vertices": args.contact_region_min_vertices,
@@ -739,8 +750,11 @@ def main() -> None:
         "refined_gt_vertex_error_median_mm": refined_gt_frame,
         "stream_id": np.asarray(str(query["stream_id"].item())),
         **({
-            "fixed_thumb_patch_vertices_camera": fixed_thumb_np,
-            "fixed_index_patch_vertices_camera": fixed_index_np,
+            **{
+                f"fixed_{name}_patch_vertices_camera": values
+                for name, values in fixed_region_np.items()
+            },
+            "fixed_patch_region_names": np.asarray(list(fixed_region_np)),
             "fixed_patch_source": np.asarray(fixed_patch_source),
         } if args.fixed_patch_npz else {}),
         "method": np.asarray(summary["method"]),

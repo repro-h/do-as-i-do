@@ -546,7 +546,11 @@ def main() -> None:
         output_arrays[f"{region_name}_patch_normals_canonical"] = object_normals_local[patch_ids]
 
     selected_names = [str(row["region"]) for row in selected_regions]
+    stable_names = [
+        str(row["region"]) for row in selected_regions if bool(row["stable"])
+    ]
     output_arrays["selected_region_names"] = np.asarray(selected_names)
+    output_arrays["stable_region_names"] = np.asarray(stable_names)
     summary = {
         "method": "v14_haco_multiregion_sequence_consensus_v2",
         "stream_id": str(np.asarray(query["stream_id"]).item()),
