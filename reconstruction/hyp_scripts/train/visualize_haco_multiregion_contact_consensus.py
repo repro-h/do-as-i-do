@@ -15,6 +15,7 @@ import viser
 from refine_v14_haco_sequence_contact_containment import mano_contact_region_ids
 from select_haco_multiregion_object_contacts_sequence import (
     adjacency,
+    select_hand_vertices_key,
     strongest_components,
 )
 from visualize_haco_choir_opposition_candidates import (
@@ -31,6 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--selection-npz", required=True)
     parser.add_argument("--trajectory-npz", required=True)
     parser.add_argument("--query-npz", required=True)
+    parser.add_argument("--hand-npz")
+    parser.add_argument("--hand-vertices-key")
     parser.add_argument("--contact-sequence-npz", required=True)
     parser.add_argument("--supervision-npz", required=True)
     parser.add_argument("--object-mesh", required=True)
@@ -67,6 +70,19 @@ def main() -> None:
             dtype=np.float32,
         )[:, None]
     )
+    hand_label = "V14 hand"
+    if args.hand_npz:
+        hand_data = load_npz(Path(args.hand_npz).expanduser().resolve())
+        hand_indices = np.asarray([
+            index_for(hand_data["frame_ids"], frame_id(value)) for value in ids
+        ])
+        hand_key = select_hand_vertices_key(
+            hand_data, args.hand_vertices_key
+        )
+        hand = np.asarray(
+            hand_data[hand_key][hand_indices], dtype=np.float32
+        )
+        hand_label = f"Selection hand: {hand_key}"
     hand_faces = np.asarray(query["mano_faces"], dtype=np.int64)
     valid = (
         np.asarray(query["model_valid"]).astype(bool)
@@ -125,7 +141,7 @@ def main() -> None:
         "Point size", min=0.001, max=0.015, step=0.001, initial_value=0.006
     )
     show_object = server.gui.add_checkbox("GT YCB object", initial_value=True)
-    show_hand = server.gui.add_checkbox("V14 hand", initial_value=True)
+    show_hand = server.gui.add_checkbox(hand_label, initial_value=True)
     show_haco = server.gui.add_checkbox("HACO components", initial_value=True)
     show_patches = server.gui.add_checkbox("Fixed object patches", initial_value=True)
     show_observations = server.gui.add_checkbox(
@@ -155,7 +171,7 @@ def main() -> None:
             ))
         if show_hand.value and valid[index]:
             handles.append(server.scene.add_mesh_simple(
-                "/v14_hand",
+                "/selection_hand",
                 vertices=hand[index],
                 faces=hand_faces,
                 color=(80, 175, 245),

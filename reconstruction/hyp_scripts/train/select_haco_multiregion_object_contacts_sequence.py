@@ -30,6 +30,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--trajectory-npz", required=True)
     parser.add_argument("--query-npz", required=True)
+    parser.add_argument("--hand-npz")
+    parser.add_argument("--hand-vertices-key")
     parser.add_argument("--contact-sequence-npz", required=True)
     parser.add_argument("--phase-npz")
     parser.add_argument("--phase-key", default="predicted_contact_gate")
@@ -54,6 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-facing-cosine", type=float, default=0.15)
     parser.add_argument("--max-normal-dot", type=float, default=1.0)
     parser.add_argument("--visible-surface-only", action="store_true")
+    parser.add_argument("--visibility-layers", type=int, default=1)
     parser.add_argument("--visibility-bin-px", type=float, default=3.0)
     parser.add_argument(
         "--visibility-depth-tolerance-mm", type=float, default=10.0
@@ -84,6 +87,62 @@ def vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
         np.add.at(output, faces[:, corner], face_normals)
     output /= np.maximum(np.linalg.norm(output, axis=-1, keepdims=True), 1e-12)
     return output
+
+
+def select_hand_vertices_key(
+    data: dict[str, np.ndarray], requested: str | None
+) -> str:
+    if requested:
+        if requested not in data:
+            raise KeyError(f"Hand archive lacks {requested!r}")
+        return requested
+    for key in (
+        "refined_hand_vertices_camera",
+        "stage1_hand_vertices_camera",
+        "initial_hand_vertices_camera",
+    ):
+        if key in data:
+            return key
+    raise KeyError("Could not find camera-space hand vertices in hand archive")
+
+
+def layered_visible_object_vertices(
+    uv: np.ndarray,
+    depth: np.ndarray,
+    bin_size: float,
+    tolerance: float,
+    layer_count: int,
+) -> np.ndarray:
+    if layer_count <= 1:
+        return visible_object_vertices(uv, depth, bin_size, tolerance)
+    valid = np.isfinite(uv).all(axis=-1) & np.isfinite(depth) & (depth > 0)
+    bins = np.zeros((len(uv), 2), dtype=np.int64)
+    bins[valid] = np.floor(
+        uv[valid] / max(bin_size, 1.0)
+    ).astype(np.int64)
+    grouped: dict[tuple[int, int], list[int]] = {}
+    for index in np.flatnonzero(valid):
+        key = (int(bins[index, 0]), int(bins[index, 1]))
+        grouped.setdefault(key, []).append(int(index))
+    selected = np.zeros(len(uv), dtype=bool)
+    for indices in grouped.values():
+        ordered = sorted(indices, key=lambda index: float(depth[index]))
+        layer_depths: list[float] = []
+        for index in ordered:
+            value = float(depth[index])
+            if not layer_depths or value > layer_depths[-1] + tolerance:
+                layer_depths.append(value)
+                if len(layer_depths) > layer_count:
+                    break
+            if len(layer_depths) <= layer_count:
+                selected[index] = True
+        retained = layer_depths[:layer_count]
+        if retained:
+            selected[indices] = np.asarray([
+                any(abs(float(depth[index]) - value) <= tolerance for value in retained)
+                for index in indices
+            ])
+    return selected
 
 
 def adjacency(faces: np.ndarray, vertex_count: int) -> list[set[int]]:
@@ -209,6 +268,8 @@ def main() -> None:
         raise ValueError("--onset-half-life-frames must be positive")
     if args.minimum_dominant_observations <= 0:
         raise ValueError("--minimum-dominant-observations must be positive")
+    if args.visibility_layers <= 0:
+        raise ValueError("--visibility-layers must be positive")
     trajectory = load_npz(Path(args.trajectory_npz).expanduser().resolve())
     query = load_npz(Path(args.query_npz).expanduser().resolve())
     contact = load_npz(Path(args.contact_sequence_npz).expanduser().resolve())
@@ -261,7 +322,34 @@ def main() -> None:
     root_relative = np.asarray(
         query["vertices_3d_root_relative_original"], dtype=np.float32
     )
+    hand_source = str(Path(args.trajectory_npz).expanduser().resolve())
+    hand_vertices_key = "query_root_relative_plus_predicted_wrist"
     hand_vertices = root_relative + wrists[:, None]
+    hand_valid = np.isfinite(hand_vertices).all(axis=(1, 2))
+    if args.hand_npz:
+        hand_data = load_npz(Path(args.hand_npz).expanduser().resolve())
+        if "frame_ids" not in hand_data:
+            raise KeyError("Hand archive lacks 'frame_ids'")
+        hand_indices = np.asarray([
+            index_for(hand_data["frame_ids"], frame_id(value)) for value in ids
+        ])
+        hand_vertices_key = select_hand_vertices_key(
+            hand_data, args.hand_vertices_key
+        )
+        hand_vertices = np.asarray(
+            hand_data[hand_vertices_key][hand_indices], dtype=np.float32
+        )
+        if hand_vertices.shape != root_relative.shape:
+            raise ValueError(
+                f"Hand shape mismatch: {hand_vertices.shape} != "
+                f"{root_relative.shape}"
+            )
+        hand_valid = np.isfinite(hand_vertices).all(axis=(1, 2))
+        hand_source = str(Path(args.hand_npz).expanduser().resolve())
+    valid &= hand_valid
+    eligible = np.flatnonzero(valid)[:: args.frame_stride]
+    if not len(eligible):
+        raise RuntimeError("No valid stable-contact frame was selected")
 
     mesh = trimesh.load(Path(args.object_mesh).expanduser().resolve(), process=False)
     if isinstance(mesh, trimesh.Scene):
@@ -298,11 +386,12 @@ def main() -> None:
         hand_uv = project(hand, intrinsics)
         visible = np.ones(len(object_vertices), dtype=bool)
         if args.visible_surface_only:
-            visible = visible_object_vertices(
+            visible = layered_visible_object_vertices(
                 object_uv,
                 object_vertices[:, 2],
                 args.visibility_bin_px,
                 args.visibility_depth_tolerance_mm / 1000.0,
+                args.visibility_layers,
             )
 
         selected_this_frame: list[str] = []
@@ -456,6 +545,8 @@ def main() -> None:
         "frame_ids": ids,
         "sampled_frame_ids": ids[eligible],
         "intrinsics": intrinsics.astype(np.float32),
+        "hand_source": np.asarray(hand_source),
+        "hand_vertices_key": np.asarray(hand_vertices_key),
         "observation_frame_ids": np.asarray(
             [row["frame_id"] for row in observations]
         ),
@@ -558,8 +649,14 @@ def main() -> None:
     output_arrays["selected_region_names"] = np.asarray(selected_names)
     output_arrays["stable_region_names"] = np.asarray(stable_names)
     summary = {
-        "method": "v14_haco_multiregion_sequence_consensus_v2",
+        "method": (
+            "stage1_haco_multiregion_sequence_reselection_v3"
+            if args.hand_npz
+            else "v14_haco_multiregion_sequence_consensus_v2"
+        ),
         "stream_id": str(np.asarray(query["stream_id"]).item()),
+        "hand_source": hand_source,
+        "hand_vertices_key": hand_vertices_key,
         "frames": len(ids),
         "eligible_frames": int(valid.sum()),
         "sampled_frames": int(len(eligible)),
@@ -580,6 +677,7 @@ def main() -> None:
             "min_facing_cosine": args.min_facing_cosine,
             "max_normal_dot": args.max_normal_dot,
             "visible_surface_only": args.visible_surface_only,
+            "visibility_layers": args.visibility_layers,
             "cluster_radius_mm": args.cluster_radius_mm,
             "minimum_consensus": args.minimum_consensus,
             "minimum_dominant_observations": (

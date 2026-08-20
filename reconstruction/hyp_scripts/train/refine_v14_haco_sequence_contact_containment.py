@@ -60,6 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--trajectory-npz", required=True)
     parser.add_argument("--query-npz", required=True)
+    parser.add_argument("--initial-hand-npz")
+    parser.add_argument("--initial-hand-vertices-key")
     parser.add_argument("--contact-sequence-npz", required=True)
     parser.add_argument("--phase-npz", required=True)
     parser.add_argument("--supervision-npz", required=True)
@@ -129,6 +131,23 @@ def mano_contact_region_ids(
         axis=-1,
     )
     return np.argmax(scores, axis=-1).astype(np.int64), names
+
+
+def initial_hand_vertices_key(
+    data: dict[str, np.ndarray], requested: str | None
+) -> str:
+    if requested:
+        if requested not in data:
+            raise KeyError(f"Initial hand archive lacks {requested!r}")
+        return requested
+    for key in (
+        "refined_hand_vertices_camera",
+        "stage1_hand_vertices_camera",
+        "initial_hand_vertices_camera",
+    ):
+        if key in data:
+            return key
+    raise KeyError("Could not find camera-space vertices in initial hand archive")
 
 
 @torch.no_grad()
@@ -245,6 +264,37 @@ def main() -> None:
     vertices_np = np.asarray(
         query["vertices_3d_root_relative_original"], dtype=np.float32
     ) + wrist_np[:, None]
+    initial_hand_source = "v14_trajectory"
+    initial_vertices_key = "query_root_relative_plus_predicted_wrist"
+    if args.initial_hand_npz:
+        initial_hand = load_npz(
+            Path(args.initial_hand_npz).expanduser().resolve()
+        )
+        initial_indices = aligned_indices(initial_hand["frame_ids"], ids)
+        initial_vertices_key = initial_hand_vertices_key(
+            initial_hand, args.initial_hand_vertices_key
+        )
+        vertices_np = np.asarray(
+            initial_hand[initial_vertices_key][initial_indices],
+            dtype=np.float32,
+        )
+        if vertices_np.shape != (frame_count, 778, 3):
+            raise ValueError(
+                f"Initial hand shape mismatch: {vertices_np.shape}"
+            )
+        if "refined_wrist_camera" in initial_hand:
+            wrist_np = np.asarray(
+                initial_hand["refined_wrist_camera"][initial_indices],
+                dtype=np.float32,
+            )
+        elif "translation_camera" in initial_hand:
+            wrist_np = wrist_np + np.asarray(
+                initial_hand["translation_camera"][initial_indices],
+                dtype=np.float32,
+            )
+        initial_hand_source = str(
+            Path(args.initial_hand_npz).expanduser().resolve()
+        )
     faces_np = np.asarray(query["mano_faces"], dtype=np.int64)
     probability_np = np.asarray(
         contact["contact_probability"][contact_indices], dtype=np.float32
@@ -256,6 +306,7 @@ def main() -> None:
         np.asarray(trajectory["prediction_valid"][trajectory_indices]).astype(bool)
         & np.asarray(query["model_valid"]).astype(bool)
         & np.asarray(contact["contact_valid"][contact_indices]).astype(bool)
+        & np.isfinite(vertices_np).all(axis=(1, 2))
     )
     phase_gate_np *= valid_np.astype(np.float32)
 
@@ -760,6 +811,11 @@ def main() -> None:
 
     summary = {
         "method": (
+            "iterative_multiregion_containment_first_rigid_stage1_v5"
+            if args.initial_hand_npz
+            and args.fixed_patch_npz
+            and args.containment_best_state
+            else
             "v14_fixed_multiregion_containment_first_rigid_stage1_v4"
             if args.fixed_patch_npz and args.containment_best_state
             else
@@ -772,6 +828,8 @@ def main() -> None:
             else "joint_haco_contact_capped_mano_containment_rigid_stage1_v3"
         ),
         "stream_id": str(query["stream_id"].item()),
+        "initial_hand_source": initial_hand_source,
+        "initial_hand_vertices_key": initial_vertices_key,
         "frames": frame_count,
         "gate_source": gate_key,
         "contact_active_frames": int((contact_gate_np > 0).sum()),
@@ -839,6 +897,9 @@ def main() -> None:
         "contact_correction_distance_mm": correction_distance_np,
         "translation_camera": selected_translation.cpu().numpy().astype(np.float32),
         "rotation_euler_xyz": selected_angles.cpu().numpy().astype(np.float32),
+        "refined_wrist_camera": (
+            wrist_np + selected_translation.cpu().numpy()
+        ).astype(np.float32),
         "initial_contact_distance_median_mm": initial_per_frame["contact_distance_median_mm"],
         "refined_contact_distance_median_mm": refined_per_frame["contact_distance_median_mm"],
         "initial_object_vertex_inside_capped_mano": initial_inside_mask,
@@ -848,6 +909,8 @@ def main() -> None:
         "initial_gt_vertex_error_median_mm": initial_gt_frame,
         "refined_gt_vertex_error_median_mm": refined_gt_frame,
         "stream_id": np.asarray(str(query["stream_id"].item())),
+        "initial_hand_source": np.asarray(initial_hand_source),
+        "initial_hand_vertices_key": np.asarray(initial_vertices_key),
         **({
             **{
                 f"fixed_{name}_patch_vertices_camera": values
