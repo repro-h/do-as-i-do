@@ -101,6 +101,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-rotation-acceleration", type=float, default=0.02)
     parser.add_argument("--penetration-tolerance-mm", type=float, default=1.5)
     parser.add_argument("--penetration-trust-mm", type=float, default=20.0)
+    parser.add_argument("--containment-best-state", action="store_true")
     parser.add_argument("--use-oracle-gate", action="store_true")
     parser.add_argument("--device", default="cuda")
     return parser.parse_args()
@@ -441,6 +442,9 @@ def main() -> None:
     collision_faces: list[torch.Tensor | None] = [None] * frame_count
     collision_barycentric: list[torch.Tensor | None] = [None] * frame_count
     correction_support_np = np.zeros(frame_count, dtype=bool)
+    best_inside_count = np.full(frame_count, np.iinfo(np.int32).max, dtype=np.int32)
+    best_translation = torch.zeros((frame_count, 3), device=device)
+    best_angles = torch.zeros((frame_count, 3), device=device)
 
     for step in range(1, args.steps + 1):
         if (step - 1) % args.containment_refresh == 0:
@@ -453,6 +457,12 @@ def main() -> None:
             )
             inside_mask &= valid_np[:, None]
             inside_count = inside_mask.sum(axis=1).astype(np.int32)
+            improved_state = inside_count < best_inside_count
+            if improved_state.any():
+                improved_tensor = torch.from_numpy(improved_state).to(device)
+                best_inside_count[improved_state] = inside_count[improved_state]
+                best_translation[improved_tensor] = translation.detach()[improved_tensor]
+                best_angles[improved_tensor] = angles.detach()[improved_tensor]
             (
                 collision_points,
                 collision_object_normals,
@@ -682,18 +692,50 @@ def main() -> None:
             print(row, flush=True)
 
     with torch.no_grad():
-        refined = transform_batch(vertices, wrists, translation, angles)
+        final_candidate = transform_batch(vertices, wrists, translation, angles)
+    final_candidate_np = final_candidate.cpu().numpy().astype(np.float32)
+    candidate_inside_mask, candidate_inside_count = exact_inside_counts(
+        final_candidate_np,
+        faces_np,
+        object_vertices_np,
+        boundary,
+        device,
+        args.point_chunk,
+    )
+    candidate_inside_mask &= valid_np[:, None]
+    candidate_inside_count = candidate_inside_mask.sum(axis=1).astype(np.int32)
+    improved_state = candidate_inside_count < best_inside_count
+    if improved_state.any():
+        improved_tensor = torch.from_numpy(improved_state).to(device)
+        best_inside_count[improved_state] = candidate_inside_count[improved_state]
+        best_translation[improved_tensor] = translation.detach()[improved_tensor]
+        best_angles[improved_tensor] = angles.detach()[improved_tensor]
+    initial_inside_mask, initial_inside_count = exact_inside_counts(
+        vertices_np, faces_np, object_vertices_np, boundary, device, args.point_chunk
+    )
+    initial_inside_mask &= valid_np[:, None]
+    initial_inside_count = initial_inside_mask.sum(axis=1).astype(np.int32)
+    selected_translation = translation.detach().clone()
+    selected_angles = angles.detach().clone()
+    if args.containment_best_state:
+        collision_initial = initial_inside_count > args.collision_stop_count
+        collision_initial_tensor = torch.from_numpy(collision_initial).to(device)
+        selected_translation[collision_initial_tensor] = best_translation[
+            collision_initial_tensor
+        ]
+        selected_angles[collision_initial_tensor] = best_angles[
+            collision_initial_tensor
+        ]
+    with torch.no_grad():
+        refined = transform_batch(
+            vertices, wrists, selected_translation, selected_angles
+        )
     refined_np = refined.cpu().numpy().astype(np.float32)
     final_inside_mask, final_inside_count = exact_inside_counts(
         refined_np, faces_np, object_vertices_np, boundary, device, args.point_chunk
     )
     final_inside_mask &= valid_np[:, None]
     final_inside_count = final_inside_mask.sum(axis=1).astype(np.int32)
-    initial_inside_mask, initial_inside_count = exact_inside_counts(
-        vertices_np, faces_np, object_vertices_np, boundary, device, args.point_chunk
-    )
-    initial_inside_mask &= valid_np[:, None]
-    initial_inside_count = initial_inside_mask.sum(axis=1).astype(np.int32)
     refined_metrics, refined_per_frame = audit_geometry(
         refined, contact_mask, object_points, object_normals, phase_gate,
         args.penetration_tolerance_mm, args.penetration_trust_mm, args.frame_chunk,
@@ -718,6 +760,9 @@ def main() -> None:
 
     summary = {
         "method": (
+            "v14_fixed_multiregion_containment_first_rigid_stage1_v4"
+            if args.fixed_patch_npz and args.containment_best_state
+            else
             "v14_fixed_multiregion_object_normal_rigid_stage1_v3"
             if args.fixed_patch_npz and args.w_object_normal_pushout > 0
             else "v14_fixed_multiregion_canonical_contact_patch_rigid_stage1_v2"
@@ -738,10 +783,11 @@ def main() -> None:
         "contact": {"initial": initial_metrics, "refined": refined_metrics},
         "containment": collision_summary,
         "translation_norm_mm": distribution(
-            np.linalg.norm(translation.detach().cpu().numpy(), axis=-1) * 1000.0
+            np.linalg.norm(selected_translation.cpu().numpy(), axis=-1) * 1000.0
         ),
         "rotation_norm_deg": distribution(
-            np.linalg.norm(angles.detach().cpu().numpy(), axis=-1) * 180.0 / math.pi
+            np.linalg.norm(selected_angles.cpu().numpy(), axis=-1)
+            * 180.0 / math.pi
         ),
         "weights": {
             "contact": args.w_contact,
@@ -768,6 +814,7 @@ def main() -> None:
             "distance_mm": region_distance_summary,
         },
         "containment_refresh": args.containment_refresh,
+        "containment_best_state": args.containment_best_state,
         "collision_stop_count": args.collision_stop_count,
         "gt_audit": gt_summary,
         "refresh_history": refresh_history,
@@ -790,8 +837,8 @@ def main() -> None:
         "contact_gate": phase_gate_np,
         "contact_correction_gate": contact_gate_np,
         "contact_correction_distance_mm": correction_distance_np,
-        "translation_camera": translation.detach().cpu().numpy().astype(np.float32),
-        "rotation_euler_xyz": angles.detach().cpu().numpy().astype(np.float32),
+        "translation_camera": selected_translation.cpu().numpy().astype(np.float32),
+        "rotation_euler_xyz": selected_angles.cpu().numpy().astype(np.float32),
         "initial_contact_distance_median_mm": initial_per_frame["contact_distance_median_mm"],
         "refined_contact_distance_median_mm": refined_per_frame["contact_distance_median_mm"],
         "initial_object_vertex_inside_capped_mano": initial_inside_mask,
