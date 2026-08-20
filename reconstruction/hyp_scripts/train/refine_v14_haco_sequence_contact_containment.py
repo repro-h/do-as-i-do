@@ -77,6 +77,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-weight-floor", type=float, default=0.05)
     parser.add_argument("--mano-data-dir")
     parser.add_argument("--fixed-patch-npz")
+    parser.add_argument(
+        "--fixed-contact-source",
+        choices=("patch", "candidate_surface"),
+        default="patch",
+        help=(
+            "Use geodesic patch vertices or the full HACO-aligned object "
+            "candidate surface from --fixed-patch-npz"
+        ),
+    )
     parser.add_argument("--region-balanced-contact", action="store_true")
     parser.add_argument("--contact-region-min-vertices", type=int, default=3)
     parser.add_argument("--contact-target-mm", type=float, default=6.0)
@@ -326,7 +335,14 @@ def main() -> None:
         fixed_patch = load_npz(
             Path(args.fixed_patch_npz).expanduser().resolve()
         )
-        if "stable_region_names" in fixed_patch:
+        if (
+            args.fixed_contact_source == "candidate_surface"
+            and "selected_region_names" in fixed_patch
+        ):
+            fixed_region_names = [
+                str(value) for value in fixed_patch["selected_region_names"]
+            ]
+        elif "stable_region_names" in fixed_patch:
             fixed_region_names = [
                 str(value) for value in fixed_patch["stable_region_names"]
             ]
@@ -348,10 +364,20 @@ def main() -> None:
                 "Fixed patch archive has no selected region patches"
             )
         for region_name in fixed_region_names:
-            key = f"{region_name}_patch_vertices_canonical"
+            key = (
+                f"{region_name}_candidate_vertex_ids"
+                if args.fixed_contact_source == "candidate_surface"
+                else f"{region_name}_patch_vertices_canonical"
+            )
             if key not in fixed_patch:
                 raise KeyError(f"Fixed patch archive lacks {key!r}")
-            canonical = np.asarray(fixed_patch[key], dtype=np.float32)
+            if args.fixed_contact_source == "candidate_surface":
+                candidate_ids = np.asarray(fixed_patch[key], dtype=np.int64)
+                canonical = np.asarray(mesh.vertices, dtype=np.float32)[
+                    candidate_ids
+                ]
+            else:
+                canonical = np.asarray(fixed_patch[key], dtype=np.float32)
             camera = np.empty(
                 (frame_count, len(canonical), 3), dtype=np.float32
             )
@@ -860,6 +886,7 @@ def main() -> None:
             else "mano_region_balanced" if args.region_balanced_contact else "global_vertex"
         ),
         "fixed_patch_source": fixed_patch_source,
+        "fixed_contact_source": args.fixed_contact_source,
         "fixed_patch_regions": list(fixed_regions),
         "contact_regions": {
             "names": contact_region_names,
