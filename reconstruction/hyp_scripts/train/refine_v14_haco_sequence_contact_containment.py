@@ -508,7 +508,7 @@ def main() -> None:
             )
             inside_mask &= valid_np[:, None]
             inside_count = inside_mask.sum(axis=1).astype(np.int32)
-            improved_state = inside_count < best_inside_count
+            improved_state = inside_count <= best_inside_count
             if improved_state.any():
                 improved_tensor = torch.from_numpy(improved_state).to(device)
                 best_inside_count[improved_state] = inside_count[improved_state]
@@ -755,7 +755,7 @@ def main() -> None:
     )
     candidate_inside_mask &= valid_np[:, None]
     candidate_inside_count = candidate_inside_mask.sum(axis=1).astype(np.int32)
-    improved_state = candidate_inside_count < best_inside_count
+    improved_state = candidate_inside_count <= best_inside_count
     if improved_state.any():
         improved_tensor = torch.from_numpy(improved_state).to(device)
         best_inside_count[improved_state] = candidate_inside_count[improved_state]
@@ -769,13 +769,13 @@ def main() -> None:
     selected_translation = translation.detach().clone()
     selected_angles = angles.detach().clone()
     if args.containment_best_state:
-        collision_initial = initial_inside_count > args.collision_stop_count
-        collision_initial_tensor = torch.from_numpy(collision_initial).to(device)
-        selected_translation[collision_initial_tensor] = best_translation[
-            collision_initial_tensor
+        protected = correction_support_np & valid_np
+        protected_tensor = torch.from_numpy(protected).to(device)
+        selected_translation[protected_tensor] = best_translation[
+            protected_tensor
         ]
-        selected_angles[collision_initial_tensor] = best_angles[
-            collision_initial_tensor
+        selected_angles[protected_tensor] = best_angles[
+            protected_tensor
         ]
     with torch.no_grad():
         refined = transform_batch(
