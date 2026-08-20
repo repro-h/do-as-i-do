@@ -43,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--onset-minimum-gate", type=float, default=0.25)
     parser.add_argument("--onset-pre-frames", type=int, default=2)
     parser.add_argument("--onset-post-frames", type=int, default=6)
+    parser.add_argument("--score-validation-frames", type=int, default=16)
     parser.add_argument("--num-candidates", type=int, default=4096)
     parser.add_argument("--candidate-chunk", type=int, default=128)
     parser.add_argument("--translation-range-mm", type=float, default=80.0)
@@ -56,6 +57,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exact-candidates", type=int, default=48)
     parser.add_argument("--collision-object-samples", type=int, default=2048)
     parser.add_argument("--contact-slack-mm", type=float, default=10.0)
+    parser.add_argument(
+        "--maximum-contact-regression-mm", type=float, default=0.5
+    )
+    parser.add_argument("--w-inside-fraction-mm", type=float, default=25.0)
     parser.add_argument("--maximum-reprojection-px", type=float, default=20.0)
     parser.add_argument("--point-chunk", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=12345)
@@ -162,6 +167,22 @@ def generate_candidates(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarra
     translations[0] = 0.0
     rotation_vectors[0] = 0.0
     return translations, rotation_vectors
+
+
+def scoring_frames(
+    onset_window: np.ndarray,
+    valid: np.ndarray,
+    gate: np.ndarray,
+    minimum_gate: float,
+    maximum_frames: int,
+) -> np.ndarray:
+    active = np.flatnonzero(valid & (gate >= minimum_gate))
+    if maximum_frames > 0 and len(active) > maximum_frames:
+        positions = np.linspace(
+            0, len(active) - 1, maximum_frames, dtype=np.int64
+        )
+        active = active[positions]
+    return np.unique(np.concatenate((onset_window, active))).astype(np.int64)
 
 
 def score_candidates(
@@ -306,6 +327,13 @@ def main() -> None:
     window = window[valid[window]]
     if not len(window):
         raise RuntimeError("First-touch window has no valid frames")
+    score_frames = scoring_frames(
+        window,
+        valid,
+        gate,
+        args.onset_minimum_gate,
+        args.score_validation_frames,
+    )
 
     normalized_left = bool(
         np.asarray(supervision.get("normalized_left", False)).item()
@@ -331,11 +359,12 @@ def main() -> None:
     base_uv = project(hand, intrinsics)
     translations, rotation_vectors = generate_candidates(args)
     objective, contact_score, reprojection = score_candidates(
-        hand_object[window],
-        wrist_object[window],
-        poses[window],
-        base_uv[window],
-        contact_masks[window],
+        hand_object[score_frames],
+        wrist_object[score_frames],
+        poses[score_frames],
+        base_uv[score_frames],
+        contact_masks[score_frames]
+        & (gate[score_frames, None] >= args.onset_minimum_gate),
         region_ids,
         len(region_names),
         object_tree,
@@ -356,19 +385,19 @@ def main() -> None:
         rotation_vectors[exact_ids]
     ).as_matrix().astype(np.float32)
     exact_object = candidate_hands_object(
-        hand_object[window],
-        wrist_object[window],
+        hand_object[score_frames],
+        wrist_object[score_frames],
         exact_rotation,
         translations[exact_ids],
     )
-    exact_camera = to_camera(exact_object, poses[window])
+    exact_camera = to_camera(exact_object, poses[score_frames])
 
     sample_count = min(args.collision_object_samples, len(object_local))
     sample_ids = np.linspace(
         0, len(object_local) - 1, sample_count, dtype=np.int64
     )
     object_sample_camera = transform_object_vertices(
-        object_local[sample_ids], poses[window]
+        object_local[sample_ids], poses[score_frames]
     )
     flattened_hand = exact_camera.reshape(-1, hand.shape[1], 3)
     flattened_object = np.broadcast_to(
@@ -384,24 +413,38 @@ def main() -> None:
         device,
         args.point_chunk,
     )
-    sampled_inside = sampled_inside.reshape(len(exact_ids), len(window)).sum(axis=1)
+    sampled_inside = sampled_inside.reshape(
+        len(exact_ids), len(score_frames)
+    ).sum(axis=1)
 
     exact_contact = contact_score[exact_ids]
     exact_reprojection = reprojection[exact_ids]
-    contact_limit = float(np.nanmin(exact_contact) + args.contact_slack_mm)
+    zero_local = int(np.flatnonzero(exact_ids == 0)[0])
+    initial_exact_contact = float(exact_contact[zero_local])
+    initial_sampled_inside = int(sampled_inside[zero_local])
+    contact_limit = min(
+        initial_exact_contact + args.maximum_contact_regression_mm,
+        float(np.nanmin(exact_contact) + args.contact_slack_mm),
+    )
     feasible = (
         np.isfinite(exact_contact)
         & (exact_contact <= contact_limit)
+        & (sampled_inside <= initial_sampled_inside)
         & (exact_reprojection <= args.maximum_reprojection_px)
     )
     candidate_pool = np.flatnonzero(feasible)
     if not len(candidate_pool):
-        candidate_pool = np.arange(len(exact_ids))
-    order = np.lexsort((
-        objective[exact_ids[candidate_pool]],
-        sampled_inside[candidate_pool],
-    ))
-    selected_local = int(candidate_pool[order[0]])
+        candidate_pool = np.asarray([zero_local], dtype=np.int64)
+    inside_fraction = sampled_inside.astype(np.float32) / float(
+        max(1, sample_count * len(score_frames))
+    )
+    balanced_objective = (
+        objective[exact_ids]
+        + args.w_inside_fraction_mm * inside_fraction
+    )
+    selected_local = int(
+        candidate_pool[np.argmin(balanced_objective[candidate_pool])]
+    )
     selected_id = int(exact_ids[selected_local])
 
     selected_translation = translations[selected_id]
@@ -457,10 +500,11 @@ def main() -> None:
         }
 
     summary = {
-        "method": "first_touch_shared_object_se3_coarse_registration_v1",
+        "method": "first_touch_shared_object_se3_coarse_registration_v2",
         "stream_id": str(query["stream_id"].item()),
         "onset_frame": frame_id(ids[onset]),
         "window_frames": [frame_id(ids[index]) for index in window],
+        "score_frames": [frame_id(ids[index]) for index in score_frames],
         "num_candidates": args.num_candidates,
         "exact_candidates": int(len(exact_ids)),
         "selected_candidate": selected_id,
@@ -475,8 +519,14 @@ def main() -> None:
             np.linalg.norm(selected_rotvec) * 180.0 / np.pi
         ),
         "selected_contact_score_mm": float(contact_score[selected_id]),
+        "initial_contact_score_mm": initial_exact_contact,
+        "contact_score_limit_mm": contact_limit,
         "selected_reprojection_px": float(reprojection[selected_id]),
-        "sampled_inside_window": int(sampled_inside[selected_local]),
+        "initial_sampled_inside": initial_sampled_inside,
+        "sampled_inside_score_frames": int(sampled_inside[selected_local]),
+        "balanced_candidate_objective": float(
+            balanced_objective[selected_local]
+        ),
         "containment": {
             "initial_total": int(initial_inside.sum()),
             "refined_total": int(refined_inside.sum()),
@@ -490,7 +540,7 @@ def main() -> None:
         "gt_audit": gt_summary,
         "warning": (
             "No SDF is used. Capped-MANO ray-parity containment is evaluated "
-            "only as a discrete candidate-ranking and audit metric."
+            "only as a conservative discrete candidate constraint and audit metric."
         ),
     }
     output = Path(args.out_npz).expanduser().resolve()
