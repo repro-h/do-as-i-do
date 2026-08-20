@@ -37,6 +37,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--phase-key", default="predicted_contact_gate")
     parser.add_argument("--minimum-phase-gate", type=float, default=0.999)
     parser.add_argument(
+        "--selection-frame",
+        help=(
+            "Select patches from exactly one frame and accept every geometrically "
+            "valid region without temporal consensus"
+        ),
+    )
+    parser.add_argument(
         "--onset-window-frames",
         type=int,
         default=0,
@@ -269,6 +276,10 @@ def clusters_from_distances(distances: np.ndarray, radius: float) -> list[np.nda
 
 def main() -> None:
     args = parse_args()
+    if args.selection_frame and args.onset_window_frames > 0:
+        raise ValueError(
+            "--selection-frame and --onset-window-frames are mutually exclusive"
+        )
     if args.frame_stride <= 0:
         raise ValueError("--frame-stride must be positive")
     if args.depth_intrusion_sigma_mm <= 0:
@@ -318,7 +329,14 @@ def main() -> None:
     if args.onset_window_frames > 0 and len(valid_indices):
         onset = int(valid_indices[0])
         valid &= np.arange(len(ids)) < onset + args.onset_window_frames
-    eligible = np.flatnonzero(valid)[:: args.frame_stride]
+    if args.selection_frame:
+        selected_index = index_for(ids, frame_id(args.selection_frame))
+        eligible = (
+            np.asarray([selected_index], dtype=np.int64)
+            if valid[selected_index] else np.empty(0, dtype=np.int64)
+        )
+    else:
+        eligible = np.flatnonzero(valid)[:: args.frame_stride]
     if not len(eligible):
         raise RuntimeError("No valid stable-contact frame was selected")
 
@@ -362,7 +380,14 @@ def main() -> None:
         hand_valid = np.isfinite(hand_vertices).all(axis=(1, 2))
         hand_source = str(Path(args.hand_npz).expanduser().resolve())
     valid &= hand_valid
-    eligible = np.flatnonzero(valid)[:: args.frame_stride]
+    if args.selection_frame:
+        selected_index = index_for(ids, frame_id(args.selection_frame))
+        eligible = (
+            np.asarray([selected_index], dtype=np.int64)
+            if valid[selected_index] else np.empty(0, dtype=np.int64)
+        )
+    else:
+        eligible = np.flatnonzero(valid)[:: args.frame_stride]
     if not len(eligible):
         raise RuntimeError("No valid stable-contact frame was selected")
 
@@ -644,8 +669,11 @@ def main() -> None:
             "dominant_observations": int(len(dominant)),
             "consensus_fraction": consensus,
             "stable": bool(
-                consensus >= args.minimum_consensus
-                and len(dominant) >= args.minimum_dominant_observations
+                args.selection_frame
+                or (
+                    consensus >= args.minimum_consensus
+                    and len(dominant) >= args.minimum_dominant_observations
+                )
             ),
             "selected_vertex_id": center_id,
             "patch_vertices": int(len(patch_ids)),
@@ -667,6 +695,8 @@ def main() -> None:
         "method": (
             "stage1_haco_multiregion_sequence_reselection_v3"
             if args.hand_npz
+            else "v14_haco_single_frame_2d_direction_fixed_patches_v1"
+            if args.selection_frame
             else "v14_haco_first_contact_fixed_patches_v1"
             if args.onset_window_frames > 0
             else "v14_haco_multiregion_sequence_consensus_v2"
@@ -684,6 +714,7 @@ def main() -> None:
         ],
         "constraints": {
             "frame_stride": args.frame_stride,
+            "selection_frame": args.selection_frame,
             "minimum_phase_gate": args.minimum_phase_gate,
             "onset_window_frames": args.onset_window_frames,
             "pixel_radius": args.pixel_radius,
