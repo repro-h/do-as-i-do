@@ -113,6 +113,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--penetration-tolerance-mm", type=float, default=1.5)
     parser.add_argument("--penetration-trust-mm", type=float, default=20.0)
     parser.add_argument("--containment-best-state", action="store_true")
+    parser.add_argument(
+        "--fixed-region-reduction",
+        choices=("mean", "max"),
+        default="mean",
+        help="Combine per-frame fixed-region contact losses by mean or bottleneck max",
+    )
+    parser.add_argument(
+        "--best-state-selection",
+        choices=("inside", "contact_feasible"),
+        default="inside",
+    )
+    parser.add_argument("--best-state-inside-allowance", type=int, default=0)
     parser.add_argument("--use-oracle-gate", action="store_true")
     parser.add_argument("--device", default="cuda")
     return parser.parse_args()
@@ -179,6 +191,34 @@ def contact_region_distance_median_mm(
                 selected = contact_mask[frame] & (region_ids == region)
                 if selected.any():
                     output[frame, region] = np.median(distance[local, selected]) * 1000.0
+    return output
+
+
+@torch.no_grad()
+def fixed_region_bottleneck_distance_mm(
+    hand: np.ndarray,
+    contact_mask: np.ndarray,
+    region_ids: np.ndarray,
+    region_names: list[str],
+    fixed_regions: dict[str, np.ndarray],
+    minimum_vertices: int,
+) -> np.ndarray:
+    """Maximum per-region median gap for every frame."""
+    output = np.full(len(hand), np.nan, dtype=np.float32)
+    for frame in range(len(hand)):
+        gaps: list[float] = []
+        for name, targets in fixed_regions.items():
+            region = region_names.index(name)
+            selected = contact_mask[frame] & (region_ids == region)
+            if int(selected.sum()) < minimum_vertices or not len(targets[frame]):
+                continue
+            points = hand[frame, selected]
+            pairwise = np.linalg.norm(
+                points[:, None] - targets[frame][None], axis=-1
+            )
+            gaps.append(float(np.median(pairwise.min(axis=-1))) * 1000.0)
+        if gaps:
+            output[frame] = max(gaps)
     return output
 
 
@@ -520,6 +560,8 @@ def main() -> None:
     collision_barycentric: list[torch.Tensor | None] = [None] * frame_count
     correction_support_np = np.zeros(frame_count, dtype=bool)
     best_inside_count = np.full(frame_count, np.iinfo(np.int32).max, dtype=np.int32)
+    baseline_inside_count: np.ndarray | None = None
+    best_contact_gap = np.full(frame_count, np.inf, dtype=np.float32)
     best_translation = torch.zeros((frame_count, 3), device=device)
     best_angles = torch.zeros((frame_count, 3), device=device)
 
@@ -534,7 +576,35 @@ def main() -> None:
             )
             inside_mask &= valid_np[:, None]
             inside_count = inside_mask.sum(axis=1).astype(np.int32)
-            improved_state = inside_count <= best_inside_count
+            if baseline_inside_count is None:
+                baseline_inside_count = inside_count.copy()
+            if args.best_state_selection == "contact_feasible":
+                if not fixed_region_np:
+                    raise ValueError(
+                        "contact_feasible best-state selection requires "
+                        "--fixed-patch-npz"
+                    )
+                current_contact_gap = fixed_region_bottleneck_distance_mm(
+                    current_np,
+                    contact_mask_np,
+                    contact_region_ids_np,
+                    contact_region_names,
+                    fixed_region_np,
+                    args.contact_region_min_vertices,
+                )
+                feasible = inside_count <= (
+                    baseline_inside_count + args.best_state_inside_allowance
+                )
+                improved_state = (
+                    feasible
+                    & np.isfinite(current_contact_gap)
+                    & (current_contact_gap < best_contact_gap)
+                )
+                best_contact_gap[improved_state] = current_contact_gap[
+                    improved_state
+                ]
+            else:
+                improved_state = inside_count <= best_inside_count
             if improved_state.any():
                 improved_tensor = torch.from_numpy(improved_state).to(device)
                 best_inside_count[improved_state] = inside_count[improved_state]
@@ -599,7 +669,8 @@ def main() -> None:
                 vertices[indices], wrists[indices], translation[indices], angles[indices]
             )
             if args.fixed_patch_npz:
-                region_losses = []
+                region_frame_losses = []
+                region_frame_active = []
                 for region_name, region_patch in fixed_regions.items():
                     region_index = contact_region_names.index(region_name)
                     selected = contact_region_mask[region_index]
@@ -616,15 +687,31 @@ def main() -> None:
                         nearest - contact_target, min=0.0
                     ).square().mean(dim=-1)
                     weights = contact_weight[indices][:, selected]
-                    region_weights = weights.sum().clamp_min(1e-6)
-                    region_losses.append(
-                        (error * weights).sum() / region_weights
+                    region_weights = weights.sum(dim=-1)
+                    region_frame_losses.append(
+                        (error * weights).sum(dim=-1)
+                        / region_weights.clamp_min(1e-6)
                     )
-                chunk_contact = (
-                    torch.stack(region_losses).mean()
-                    if region_losses
-                    else torch.zeros((), device=device)
-                )
+                    region_frame_active.append(region_weights > 1e-6)
+                if region_frame_losses:
+                    frame_losses = torch.stack(region_frame_losses, dim=-1)
+                    frame_active = torch.stack(region_frame_active, dim=-1)
+                    if args.fixed_region_reduction == "max":
+                        reduced = frame_losses.masked_fill(
+                            ~frame_active, -torch.inf
+                        ).max(dim=-1).values
+                    else:
+                        reduced = (
+                            frame_losses * frame_active
+                        ).sum(dim=-1) / frame_active.sum(dim=-1).clamp_min(1)
+                    valid_frame = frame_active.any(dim=-1)
+                    chunk_contact = (
+                        reduced[valid_frame].mean()
+                        if valid_frame.any()
+                        else torch.zeros((), device=device)
+                    )
+                else:
+                    chunk_contact = torch.zeros((), device=device)
             else:
                 pairwise = torch.cdist(refined, object_points[indices])
                 nearest = torch.topk(pairwise, topk, dim=-1, largest=False).values
@@ -781,7 +868,27 @@ def main() -> None:
     )
     candidate_inside_mask &= valid_np[:, None]
     candidate_inside_count = candidate_inside_mask.sum(axis=1).astype(np.int32)
-    improved_state = candidate_inside_count <= best_inside_count
+    if args.best_state_selection == "contact_feasible":
+        if baseline_inside_count is None:
+            baseline_inside_count = candidate_inside_count.copy()
+        candidate_contact_gap = fixed_region_bottleneck_distance_mm(
+            final_candidate_np,
+            contact_mask_np,
+            contact_region_ids_np,
+            contact_region_names,
+            fixed_region_np,
+            args.contact_region_min_vertices,
+        )
+        improved_state = (
+            (candidate_inside_count <= (
+                baseline_inside_count + args.best_state_inside_allowance
+            ))
+            & np.isfinite(candidate_contact_gap)
+            & (candidate_contact_gap < best_contact_gap)
+        )
+        best_contact_gap[improved_state] = candidate_contact_gap[improved_state]
+    else:
+        improved_state = candidate_inside_count <= best_inside_count
     if improved_state.any():
         improved_tensor = torch.from_numpy(improved_state).to(device)
         best_inside_count[improved_state] = candidate_inside_count[improved_state]
@@ -900,6 +1007,12 @@ def main() -> None:
         },
         "containment_refresh": args.containment_refresh,
         "containment_best_state": args.containment_best_state,
+        "fixed_region_reduction": args.fixed_region_reduction,
+        "best_state_selection": args.best_state_selection,
+        "best_state_inside_allowance": args.best_state_inside_allowance,
+        "best_fixed_region_bottleneck_gap_mm": distribution(
+            best_contact_gap[np.isfinite(best_contact_gap)]
+        ),
         "collision_stop_count": args.collision_stop_count,
         "gt_audit": gt_summary,
         "refresh_history": refresh_history,
