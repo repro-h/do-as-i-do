@@ -36,6 +36,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--phase-npz")
     parser.add_argument("--phase-key", default="predicted_contact_gate")
     parser.add_argument("--minimum-phase-gate", type=float, default=0.999)
+    parser.add_argument(
+        "--onset-window-frames",
+        type=int,
+        default=0,
+        help=(
+            "Use only this many frames starting at the first eligible contact "
+            "frame; zero keeps the full contact segment"
+        ),
+    )
     parser.add_argument("--supervision-npz", required=True)
     parser.add_argument("--object-mesh", required=True)
     parser.add_argument("--mano-data-dir", required=True)
@@ -270,6 +279,8 @@ def main() -> None:
         raise ValueError("--minimum-dominant-observations must be positive")
     if args.visibility_layers <= 0:
         raise ValueError("--visibility-layers must be positive")
+    if args.onset_window_frames < 0:
+        raise ValueError("--onset-window-frames must be non-negative")
     trajectory = load_npz(Path(args.trajectory_npz).expanduser().resolve())
     query = load_npz(Path(args.query_npz).expanduser().resolve())
     contact = load_npz(Path(args.contact_sequence_npz).expanduser().resolve())
@@ -303,6 +314,10 @@ def main() -> None:
         & np.asarray(contact["contact_valid"][contact_indices]).astype(bool)
         & (gate >= args.minimum_phase_gate)
     )
+    valid_indices = np.flatnonzero(valid)
+    if args.onset_window_frames > 0 and len(valid_indices):
+        onset = int(valid_indices[0])
+        valid &= np.arange(len(ids)) < onset + args.onset_window_frames
     eligible = np.flatnonzero(valid)[:: args.frame_stride]
     if not len(eligible):
         raise RuntimeError("No valid stable-contact frame was selected")
@@ -652,6 +667,8 @@ def main() -> None:
         "method": (
             "stage1_haco_multiregion_sequence_reselection_v3"
             if args.hand_npz
+            else "v14_haco_first_contact_fixed_patches_v1"
+            if args.onset_window_frames > 0
             else "v14_haco_multiregion_sequence_consensus_v2"
         ),
         "stream_id": str(np.asarray(query["stream_id"]).item()),
@@ -668,6 +685,7 @@ def main() -> None:
         "constraints": {
             "frame_stride": args.frame_stride,
             "minimum_phase_gate": args.minimum_phase_gate,
+            "onset_window_frames": args.onset_window_frames,
             "pixel_radius": args.pixel_radius,
             "distance_slack_mm": args.distance_slack_mm,
             "max_contact_distance_mm": args.max_contact_distance_mm,

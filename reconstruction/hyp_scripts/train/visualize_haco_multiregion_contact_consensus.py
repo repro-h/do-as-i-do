@@ -112,7 +112,18 @@ def main() -> None:
         )
         for supervision_index in supervision_indices
     ]
-    selected_regions = [str(value) for value in selection["selected_region_names"]]
+    region_key = (
+        "stable_region_names"
+        if "stable_region_names" in selection
+        and len(selection["stable_region_names"])
+        else "selected_region_names"
+    )
+    selected_regions = [str(value) for value in selection[region_key]]
+    print(
+        f"[viser] fixed patch regions ({region_key}): "
+        f"{','.join(selected_regions)}",
+        flush=True,
+    )
     patches = {
         name: np.asarray(
             selection[f"{name}_patch_vertices_canonical"], dtype=np.float32
