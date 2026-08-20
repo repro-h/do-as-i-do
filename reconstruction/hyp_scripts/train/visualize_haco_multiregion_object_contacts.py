@@ -134,14 +134,7 @@ def visible_object_vertices(
     visible = np.zeros(len(uv), dtype=bool)
     for index in np.flatnonzero(valid):
         x, y = int(bins[index, 0]), int(bins[index, 1])
-        local_minimum = min(
-            (
-                minimum_depth.get((x + dx, y + dy), np.inf)
-                for dx in (-1, 0, 1)
-                for dy in (-1, 0, 1)
-            ),
-            default=np.inf,
-        )
+        local_minimum = minimum_depth.get((x, y), np.inf)
         visible[index] = depth[index] <= local_minimum + tolerance
     return visible
 
@@ -409,11 +402,6 @@ def main() -> None:
         for result in region_results
         if bool(result["selected"])
     ]
-    if not selected_names:
-        print(json.dumps({"regions": region_results}, indent=2), flush=True)
-        raise RuntimeError("No active HACO region produced a valid object patch")
-    arrays["selected_region_names"] = np.asarray(selected_names)
-
     summary = {
         "method": "v14_haco_multiregion_object_contact_v1",
         "frame_id": requested,
@@ -440,6 +428,9 @@ def main() -> None:
         output = Path(args.out_json).expanduser().resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    if not selected_names:
+        raise RuntimeError("No active HACO region produced a valid object patch")
+    arrays["selected_region_names"] = np.asarray(selected_names)
     if args.out_npz:
         output = Path(args.out_npz).expanduser().resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
