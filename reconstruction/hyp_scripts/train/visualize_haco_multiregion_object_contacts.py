@@ -47,6 +47,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dense-root")
     parser.add_argument("--intrinsics", type=float, nargs=4)
     parser.add_argument("--frame-id", required=True)
+    parser.add_argument(
+        "--regions",
+        nargs="+",
+        choices=tuple(PALETTE),
+        help="Only select and visualize these MANO contact regions",
+    )
     parser.add_argument("--minimum-contact-vertices", type=int, default=3)
     parser.add_argument("--haco-components-per-region", type=int, default=1)
     parser.add_argument("--pixel-radius", type=float, default=45.0)
@@ -218,6 +224,8 @@ def main() -> None:
     visual_regions: list[dict[str, object]] = []
 
     for region_index, region_name in enumerate(region_names):
+        if args.regions and region_name not in args.regions:
+            continue
         raw_contact_mask = (
             (region_ids == region_index) & (probability >= threshold)
         )
@@ -410,6 +418,7 @@ def main() -> None:
     summary = {
         "method": "v14_haco_multiregion_object_contact_v1",
         "frame_id": requested,
+        "requested_regions": list(args.regions or region_names),
         "contact_threshold": threshold,
         "selected_regions": selected_names,
         "constraints": {
