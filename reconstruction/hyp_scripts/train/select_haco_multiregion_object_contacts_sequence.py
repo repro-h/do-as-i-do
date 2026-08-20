@@ -65,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-normal", type=float, default=60.0)
     parser.add_argument("--cluster-radius-mm", type=float, default=12.0)
     parser.add_argument("--minimum-consensus", type=float, default=0.6)
+    parser.add_argument("--minimum-dominant-observations", type=int, default=3)
     parser.add_argument("--patch-radius-mm", type=float, default=6.0)
     parser.add_argument("--patch-normal-cosine", type=float, default=0.8)
     parser.add_argument("--out-npz", required=True)
@@ -206,6 +207,8 @@ def main() -> None:
         raise ValueError("--depth-intrusion-sigma-mm must be positive")
     if args.onset_half_life_frames <= 0:
         raise ValueError("--onset-half-life-frames must be positive")
+    if args.minimum_dominant_observations <= 0:
+        raise ValueError("--minimum-dominant-observations must be positive")
     trajectory = load_npz(Path(args.trajectory_npz).expanduser().resolve())
     query = load_npz(Path(args.query_npz).expanduser().resolve())
     contact = load_npz(Path(args.contact_sequence_npz).expanduser().resolve())
@@ -534,7 +537,10 @@ def main() -> None:
             "clusters": len(clusters),
             "dominant_observations": int(len(dominant)),
             "consensus_fraction": consensus,
-            "stable": bool(consensus >= args.minimum_consensus),
+            "stable": bool(
+                consensus >= args.minimum_consensus
+                and len(dominant) >= args.minimum_dominant_observations
+            ),
             "selected_vertex_id": center_id,
             "patch_vertices": int(len(patch_ids)),
         })
@@ -576,6 +582,9 @@ def main() -> None:
             "visible_surface_only": args.visible_surface_only,
             "cluster_radius_mm": args.cluster_radius_mm,
             "minimum_consensus": args.minimum_consensus,
+            "minimum_dominant_observations": (
+                args.minimum_dominant_observations
+            ),
             "weights": {
                 "pixel": args.w_pixel,
                 "distance": args.w_distance,
