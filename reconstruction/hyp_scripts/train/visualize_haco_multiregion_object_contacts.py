@@ -48,16 +48,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--intrinsics", type=float, nargs=4)
     parser.add_argument("--frame-id", required=True)
     parser.add_argument("--minimum-contact-vertices", type=int, default=3)
+    parser.add_argument("--haco-components-per-region", type=int, default=1)
     parser.add_argument("--pixel-radius", type=float, default=45.0)
     parser.add_argument("--pixel-soft-topk", type=int, default=8)
     parser.add_argument("--pixel-sigma", type=float, default=12.0)
     parser.add_argument("--candidate-topk", type=int, default=512)
-    parser.add_argument("--choir-topk", type=int, default=8)
-    parser.add_argument("--choir-sigma-mm", type=float, default=10.0)
     parser.add_argument("--distance-slack-mm", type=float, default=30.0)
     parser.add_argument("--max-contact-distance-mm", type=float, default=100.0)
     parser.add_argument("--min-facing-cosine", type=float, default=0.15)
     parser.add_argument("--max-normal-dot", type=float, default=0.0)
+    parser.add_argument("--visible-surface-only", action="store_true")
+    parser.add_argument("--visibility-bin-px", type=float, default=4.0)
+    parser.add_argument(
+        "--visibility-depth-tolerance-mm", type=float, default=8.0
+    )
     parser.add_argument("--w-pixel", type=float, default=1.0)
     parser.add_argument("--w-distance", type=float, default=1.0)
     parser.add_argument("--w-facing", type=float, default=20.0)
@@ -70,13 +74,76 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def normalized(vector: np.ndarray) -> np.ndarray:
-    norm = float(np.linalg.norm(vector))
-    return vector / max(norm, 1e-12)
-
-
 def lighter(rgb: tuple[int, int, int]) -> tuple[int, int, int]:
     return tuple(min(255, int(0.55 * value + 115)) for value in rgb)
+
+
+def strongest_components(
+    mask: np.ndarray,
+    faces: np.ndarray,
+    probability: np.ndarray,
+    count: int,
+) -> np.ndarray:
+    adjacency: list[set[int]] = [set() for _ in range(len(mask))]
+    for triangle in faces:
+        for first, second in (
+            (int(triangle[0]), int(triangle[1])),
+            (int(triangle[1]), int(triangle[2])),
+            (int(triangle[2]), int(triangle[0])),
+        ):
+            adjacency[first].add(second)
+            adjacency[second].add(first)
+    remaining = set(np.flatnonzero(mask).tolist())
+    components: list[np.ndarray] = []
+    while remaining:
+        seed = remaining.pop()
+        component = [seed]
+        stack = [seed]
+        while stack:
+            vertex = stack.pop()
+            neighbors = adjacency[vertex].intersection(remaining)
+            remaining.difference_update(neighbors)
+            stack.extend(neighbors)
+            component.extend(neighbors)
+        components.append(np.asarray(component, dtype=np.int64))
+    components.sort(
+        key=lambda vertices: float(probability[vertices].sum()), reverse=True
+    )
+    selected = components[: max(1, count)]
+    output = np.zeros_like(mask, dtype=bool)
+    if selected:
+        output[np.concatenate(selected)] = True
+    return output
+
+
+def visible_object_vertices(
+    uv: np.ndarray,
+    depth: np.ndarray,
+    bin_size: float,
+    tolerance: float,
+) -> np.ndarray:
+    valid = np.isfinite(uv).all(axis=-1) & np.isfinite(depth) & (depth > 0)
+    bins = np.zeros((len(uv), 2), dtype=np.int64)
+    bins[valid] = np.floor(
+        uv[valid] / max(bin_size, 1.0)
+    ).astype(np.int64)
+    minimum_depth: dict[tuple[int, int], float] = {}
+    for index in np.flatnonzero(valid):
+        key = (int(bins[index, 0]), int(bins[index, 1]))
+        minimum_depth[key] = min(minimum_depth.get(key, np.inf), float(depth[index]))
+    visible = np.zeros(len(uv), dtype=bool)
+    for index in np.flatnonzero(valid):
+        x, y = int(bins[index, 0]), int(bins[index, 1])
+        local_minimum = min(
+            (
+                minimum_depth.get((x + dx, y + dy), np.inf)
+                for dx in (-1, 0, 1)
+                for dy in (-1, 0, 1)
+            ),
+            default=np.inf,
+        )
+        visible[index] = depth[index] <= local_minimum + tolerance
+    return visible
 
 
 def main() -> None:
@@ -136,7 +203,14 @@ def main() -> None:
     intrinsics = load_intrinsics(args, query, stream_id)
     object_uv = project(object_vertices, intrinsics)
     hand_uv = project(hand, intrinsics)
-    sigma = args.choir_sigma_mm / 1000.0
+    object_visible = np.ones(len(object_vertices), dtype=bool)
+    if args.visible_surface_only:
+        object_visible = visible_object_vertices(
+            object_uv,
+            object_vertices[:, 2],
+            args.visibility_bin_px,
+            args.visibility_depth_tolerance_mm / 1000.0,
+        )
 
     region_results: list[dict[str, object]] = []
     arrays: dict[str, np.ndarray] = {
@@ -146,31 +220,34 @@ def main() -> None:
     visual_regions: list[dict[str, object]] = []
 
     for region_index, region_name in enumerate(region_names):
-        contact_mask = (
+        raw_contact_mask = (
             (region_ids == region_index) & (probability >= threshold)
         )
-        active_count = int(contact_mask.sum())
+        raw_active_count = int(raw_contact_mask.sum())
         result: dict[str, object] = {
             "region": region_name,
-            "contact_vertices": active_count,
+            "raw_contact_vertices": raw_active_count,
             "selected": False,
         }
-        if active_count < args.minimum_contact_vertices:
+        if raw_active_count < args.minimum_contact_vertices:
             result["skip_reason"] = "insufficient_haco_vertices"
             region_results.append(result)
             continue
+        contact_mask = strongest_components(
+            raw_contact_mask,
+            faces,
+            probability,
+            args.haco_components_per_region,
+        )
+        active_count = int(contact_mask.sum())
+        result["component_contact_vertices"] = active_count
+        if active_count < args.minimum_contact_vertices:
+            result["skip_reason"] = "haco_component_too_small"
+            region_results.append(result)
+            continue
 
-        region_probability = np.maximum(probability[contact_mask], 1e-6)
         region_hand = hand[contact_mask]
         region_uv = hand_uv[contact_mask]
-        region_center = np.average(
-            region_hand, axis=0, weights=region_probability
-        )
-        region_normal = normalized(
-            np.average(
-                hand_normals[contact_mask], axis=0, weights=region_probability
-            )
-        )
 
         pixel_distance = choir_distance(
             object_uv,
@@ -181,6 +258,7 @@ def main() -> None:
         pixel_eligible = np.flatnonzero(
             np.isfinite(pixel_distance)
             & (pixel_distance <= args.pixel_radius)
+            & object_visible
         )
         if not len(pixel_eligible):
             result["skip_reason"] = "no_2d_candidates"
@@ -193,22 +271,28 @@ def main() -> None:
             np.argsort(pixel_distance[pixel_eligible])[: args.candidate_topk]
         ]
 
-        contact_distance = choir_distance(
-            object_vertices,
-            region_hand,
-            args.choir_topk,
-            sigma,
-        )
         candidate_points = object_vertices[pixel_candidates]
-        to_hand = region_center[None] - candidate_points
+        candidate_uv = object_uv[pixel_candidates]
+        uv_pairwise = np.linalg.norm(
+            candidate_uv[:, None] - region_uv[None], axis=-1
+        )
+        matched_contact = np.argmin(uv_pairwise, axis=-1)
+        matched_hand = region_hand[matched_contact]
+        matched_hand_normal = hand_normals[contact_mask][matched_contact]
+        contact_distance = np.linalg.norm(
+            candidate_points - matched_hand, axis=-1
+        )
+        to_hand = matched_hand - candidate_points
         to_hand /= np.maximum(
             np.linalg.norm(to_hand, axis=-1, keepdims=True), 1e-12
         )
         facing_cosine = np.sum(
             object_normals[pixel_candidates] * to_hand, axis=-1
         )
-        normal_dot = object_normals[pixel_candidates] @ region_normal
-        candidate_distance_mm = contact_distance[pixel_candidates] * 1000.0
+        normal_dot = np.sum(
+            object_normals[pixel_candidates] * matched_hand_normal, axis=-1
+        )
+        candidate_distance_mm = contact_distance * 1000.0
         minimum_distance_mm = float(candidate_distance_mm.min())
         valid = (
             (candidate_distance_mm <= args.max_contact_distance_mm)
@@ -254,7 +338,7 @@ def main() -> None:
 
         valid_ids = pixel_candidates[valid]
         valid_pixel = pixel_distance[valid_ids]
-        valid_distance_mm = contact_distance[valid_ids] * 1000.0
+        valid_distance_mm = candidate_distance_mm[valid]
         valid_facing = facing_cosine[valid]
         valid_normal_dot = normal_dot[valid]
         score = (
@@ -296,6 +380,9 @@ def main() -> None:
 
         prefix = region_name
         arrays[f"{prefix}_contact_vertex_ids"] = np.flatnonzero(contact_mask)
+        arrays[f"{prefix}_raw_contact_vertex_ids"] = np.flatnonzero(
+            raw_contact_mask
+        )
         arrays[f"{prefix}_contact_vertices_camera"] = region_hand
         arrays[f"{prefix}_candidate_vertex_ids"] = valid_ids
         arrays[f"{prefix}_candidate_vertices_camera"] = object_vertices[valid_ids]
@@ -309,6 +396,7 @@ def main() -> None:
         visual_regions.append(
             {
                 "name": region_name,
+                "raw_contact_mask": raw_contact_mask,
                 "contact_mask": contact_mask,
                 "candidate_ids": valid_ids,
                 "selected_id": selected_id,
@@ -337,6 +425,11 @@ def main() -> None:
             "max_contact_distance_mm": args.max_contact_distance_mm,
             "min_facing_cosine": args.min_facing_cosine,
             "max_normal_dot": args.max_normal_dot,
+            "visible_surface_only": args.visible_surface_only,
+            "visibility_bin_px": args.visibility_bin_px,
+            "visibility_depth_tolerance_mm": (
+                args.visibility_depth_tolerance_mm
+            ),
             "patch_radius_mm": args.patch_radius_mm,
             "patch_normal_cosine": args.patch_normal_cosine,
         },
@@ -370,10 +463,17 @@ def main() -> None:
     for visual in visual_regions:
         name = str(visual["name"])
         color = PALETTE[name]
+        raw_contact_mask = np.asarray(visual["raw_contact_mask"], dtype=bool)
         contact_mask = np.asarray(visual["contact_mask"], dtype=bool)
         candidate_ids = np.asarray(visual["candidate_ids"], dtype=np.int64)
         selected_id = int(visual["selected_id"])
         patch_ids = np.asarray(visual["patch_ids"], dtype=np.int64)
+        server.scene.add_point_cloud(
+            f"/haco_raw/{name}",
+            points=hand[raw_contact_mask],
+            colors=colors(int(raw_contact_mask.sum()), lighter(color)),
+            point_size=0.002,
+        )
         server.scene.add_point_cloud(
             f"/haco/{name}",
             points=hand[contact_mask],
