@@ -28,6 +28,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-sequence-npz", required=True)
     parser.add_argument("--fixed-patch-npz", required=True)
     parser.add_argument(
+        "--contact-target-source",
+        choices=("fixed_patch", "candidate_surface"),
+        default="fixed_patch",
+        help=(
+            "Use the selected geodesic patch or the full HACO-aligned object "
+            "candidate surface as the contact target"
+        ),
+    )
+    parser.add_argument(
         "--fixed-regions",
         nargs="+",
         help=(
@@ -203,14 +212,19 @@ def main() -> None:
     if not active.any():
         raise RuntimeError("No phase-active valid frame")
 
-    stable_names = (
-        [str(value) for value in fixed["stable_region_names"]]
-        if "stable_region_names" in fixed else []
+    default_name_key = (
+        "selected_region_names"
+        if args.contact_target_source == "candidate_surface"
+        else "stable_region_names"
     )
-    fixed_names = list(args.fixed_regions or stable_names)
+    default_names = (
+        [str(value) for value in fixed[default_name_key]]
+        if default_name_key in fixed else []
+    )
+    fixed_names = list(args.fixed_regions or default_names)
     if not fixed_names:
         raise RuntimeError(
-            "Fixed patch archive has no stable regions; inspect the candidates "
+            f"Contact archive has no {default_name_key}; inspect the candidates "
             "and pass --fixed-regions REGION [REGION ...]"
         )
     region_ids, region_names = mano_contact_region_ids(
@@ -219,12 +233,18 @@ def main() -> None:
     unknown = sorted(set(fixed_names).difference(region_names))
     if unknown:
         raise KeyError(f"Unknown fixed patch regions: {unknown}")
+    target_key = (
+        "candidate_vertex_ids"
+        if args.contact_target_source == "candidate_surface"
+        else "patch_vertices_canonical"
+    )
     missing = sorted(
-        name for name in fixed_names
-        if f"{name}_patch_vertices_canonical" not in fixed
+        name for name in fixed_names if f"{name}_{target_key}" not in fixed
     )
     if missing:
-        raise KeyError(f"Fixed patch archive lacks patches for: {missing}")
+        raise KeyError(
+            f"Contact archive lacks {args.contact_target_source} for: {missing}"
+        )
 
     normalized_left = bool(
         np.asarray(supervision.get("normalized_left", False)).item()
@@ -235,18 +255,28 @@ def main() -> None:
         )
         for index in supervision_indices
     ]).astype(np.float32)
-    fixed_region_camera = {
-        name: transform_object(
-            np.asarray(fixed[f"{name}_patch_vertices_canonical"], dtype=np.float32),
-            poses,
-        )
-        for name in fixed_names
-    }
-
     mesh = trimesh.load(Path(args.object_mesh).expanduser().resolve(), process=False)
     if isinstance(mesh, trimesh.Scene):
         mesh = trimesh.util.concatenate(tuple(mesh.geometry.values()))
     object_local = np.asarray(mesh.vertices, dtype=np.float32)
+    if args.contact_target_source == "candidate_surface":
+        fixed_region_local = {
+            name: object_local[
+                np.asarray(fixed[f"{name}_candidate_vertex_ids"], dtype=np.int64)
+            ]
+            for name in fixed_names
+        }
+    else:
+        fixed_region_local = {
+            name: np.asarray(
+                fixed[f"{name}_patch_vertices_canonical"], dtype=np.float32
+            )
+            for name in fixed_names
+        }
+    fixed_region_camera = {
+        name: transform_object(vertices, poses)
+        for name, vertices in fixed_region_local.items()
+    }
     sample_count = min(args.collision_object_samples, len(object_local))
     sample_indices = np.linspace(
         0, len(object_local) - 1, sample_count, dtype=np.int64
@@ -410,9 +440,10 @@ def main() -> None:
     summary = {
         "method": "fixed_contact_threshold_ray_depth_feedback_v1",
         "stream_id": str(query["stream_id"].item()),
-        "fixed_patch_source": str(
+        "contact_target_source_npz": str(
             Path(args.fixed_patch_npz).expanduser().resolve()
         ),
+        "contact_target_source": args.contact_target_source,
         "fixed_regions": fixed_names,
         "active_frames": int(active.sum()),
         "contact_evaluated_frames": int(evaluated.sum()),
@@ -463,6 +494,7 @@ def main() -> None:
         "initial_fixed_contact_gap_mm": initial_gaps,
         "refined_fixed_contact_gap_mm": refined_gaps,
         "fixed_patch_region_names": np.asarray(fixed_names),
+        "contact_target_source": np.asarray(args.contact_target_source),
         "initial_object_vertex_inside_capped_mano": initial_inside_mask,
         "refined_object_vertex_inside_capped_mano": refined_inside_mask,
         "initial_inside_object_vertices": initial_inside,

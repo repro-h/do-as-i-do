@@ -70,6 +70,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-normal-cosine", type=float, default=0.7)
     parser.add_argument("--out-npz")
     parser.add_argument("--out-json")
+    parser.add_argument(
+        "--candidate-surface-only",
+        action="store_true",
+        help="Hide the selected center and geodesic patch in Viser",
+    )
     parser.add_argument("--port", type=int, default=8098)
     return parser.parse_args()
 
@@ -477,18 +482,19 @@ def main() -> None:
             colors=colors(len(candidate_ids), lighter(color)),
             point_size=0.002,
         )
-        server.scene.add_point_cloud(
-            f"/patch/{name}",
-            points=object_vertices[patch_ids],
-            colors=colors(len(patch_ids), color),
-            point_size=0.006,
-        )
-        server.scene.add_point_cloud(
-            f"/selected/{name}",
-            points=object_vertices[[selected_id]],
-            colors=colors(1, color),
-            point_size=0.011,
-        )
+        if not args.candidate_surface_only:
+            server.scene.add_point_cloud(
+                f"/patch/{name}",
+                points=object_vertices[patch_ids],
+                colors=colors(len(patch_ids), color),
+                point_size=0.006,
+            )
+            server.scene.add_point_cloud(
+                f"/selected/{name}",
+                points=object_vertices[[selected_id]],
+                colors=colors(1, color),
+                point_size=0.011,
+            )
     while True:
         time.sleep(1.0)
 
