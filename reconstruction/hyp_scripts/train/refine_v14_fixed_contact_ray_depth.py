@@ -27,6 +27,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-npz", required=True)
     parser.add_argument("--contact-sequence-npz", required=True)
     parser.add_argument("--fixed-patch-npz", required=True)
+    parser.add_argument(
+        "--fixed-regions",
+        nargs="+",
+        help=(
+            "Explicit patch regions to use; by default use stable_region_names"
+        ),
+    )
     parser.add_argument("--phase-npz", required=True)
     parser.add_argument("--phase-key", default="predicted_contact_gate")
     parser.add_argument("--minimum-phase-gate", type=float, default=0.25)
@@ -200,14 +207,24 @@ def main() -> None:
         [str(value) for value in fixed["stable_region_names"]]
         if "stable_region_names" in fixed else []
     )
-    if not stable_names:
-        raise RuntimeError("Fixed patch archive has no stable regions")
+    fixed_names = list(args.fixed_regions or stable_names)
+    if not fixed_names:
+        raise RuntimeError(
+            "Fixed patch archive has no stable regions; inspect the candidates "
+            "and pass --fixed-regions REGION [REGION ...]"
+        )
     region_ids, region_names = mano_contact_region_ids(
         args.mano_data_dir, str(query["hand_side"].item()).lower()
     )
-    unknown = sorted(set(stable_names).difference(region_names))
+    unknown = sorted(set(fixed_names).difference(region_names))
     if unknown:
         raise KeyError(f"Unknown fixed patch regions: {unknown}")
+    missing = sorted(
+        name for name in fixed_names
+        if f"{name}_patch_vertices_canonical" not in fixed
+    )
+    if missing:
+        raise KeyError(f"Fixed patch archive lacks patches for: {missing}")
 
     normalized_left = bool(
         np.asarray(supervision.get("normalized_left", False)).item()
@@ -223,7 +240,7 @@ def main() -> None:
             np.asarray(fixed[f"{name}_patch_vertices_canonical"], dtype=np.float32),
             poses,
         )
-        for name in stable_names
+        for name in fixed_names
     }
 
     mesh = trimesh.load(Path(args.object_mesh).expanduser().resolve(), process=False)
@@ -396,7 +413,7 @@ def main() -> None:
         "fixed_patch_source": str(
             Path(args.fixed_patch_npz).expanduser().resolve()
         ),
-        "fixed_regions": stable_names,
+        "fixed_regions": fixed_names,
         "active_frames": int(active.sum()),
         "contact_evaluated_frames": int(evaluated.sum()),
         "ray_offset_mm": distribution(offsets_mm[active]),
@@ -445,7 +462,7 @@ def main() -> None:
         "prediction_valid": valid,
         "initial_fixed_contact_gap_mm": initial_gaps,
         "refined_fixed_contact_gap_mm": refined_gaps,
-        "fixed_patch_region_names": np.asarray(stable_names),
+        "fixed_patch_region_names": np.asarray(fixed_names),
         "initial_object_vertex_inside_capped_mano": initial_inside_mask,
         "refined_object_vertex_inside_capped_mano": refined_inside_mask,
         "initial_inside_object_vertices": initial_inside,
