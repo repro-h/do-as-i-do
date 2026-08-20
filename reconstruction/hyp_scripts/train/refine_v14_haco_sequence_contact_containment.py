@@ -92,6 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-rotation-deg", type=float, default=5.0)
     parser.add_argument("--w-contact", type=float, default=1.0)
     parser.add_argument("--w-collision", type=float, default=5.0)
+    parser.add_argument("--w-object-normal-pushout", type=float, default=0.0)
     parser.add_argument("--w-translation-anchor", type=float, default=0.1)
     parser.add_argument("--w-rotation-anchor", type=float, default=0.01)
     parser.add_argument("--w-translation-velocity", type=float, default=1.0)
@@ -156,11 +157,18 @@ def contact_region_distance_median_mm(
 def collision_correspondences(
     hand: torch.Tensor,
     object_vertices: np.ndarray,
+    object_normals: np.ndarray,
     inside_mask: np.ndarray,
     faces: torch.Tensor,
     topk: int,
-) -> tuple[list[torch.Tensor | None], list[torch.Tensor | None], list[torch.Tensor | None]]:
+) -> tuple[
+    list[torch.Tensor | None],
+    list[torch.Tensor | None],
+    list[torch.Tensor | None],
+    list[torch.Tensor | None],
+]:
     points: list[torch.Tensor | None] = [None] * len(hand)
+    normals: list[torch.Tensor | None] = [None] * len(hand)
     face_indices: list[torch.Tensor | None] = [None] * len(hand)
     barycentric: list[torch.Tensor | None] = [None] * len(hand)
     for index in np.flatnonzero(inside_mask.any(axis=1)):
@@ -171,9 +179,12 @@ def collision_correspondences(
             selected, hand[index], faces, topk
         )
         points[index] = selected
+        normals[index] = torch.from_numpy(
+            object_normals[index, inside_mask[index]]
+        ).to(device=hand.device, dtype=hand.dtype)
         face_indices[index] = selected_faces
         barycentric[index] = selected_barycentric
-    return points, face_indices, barycentric
+    return points, normals, face_indices, barycentric
 
 
 def gt_audit(
@@ -251,7 +262,7 @@ def main() -> None:
     normalized_left = bool(np.asarray(supervision.get("normalized_left", False)).item())
     (
         object_vertices_np,
-        _object_vertex_normals_np,
+        object_vertex_normals_np,
         object_points_np,
         object_normals_np,
     ) = build_object_geometry(
@@ -426,6 +437,7 @@ def main() -> None:
     inside_mask = np.zeros((frame_count, len(object_vertices_np[0])), dtype=bool)
     inside_count = np.zeros(frame_count, dtype=np.int32)
     collision_points: list[torch.Tensor | None] = [None] * frame_count
+    collision_object_normals: list[torch.Tensor | None] = [None] * frame_count
     collision_faces: list[torch.Tensor | None] = [None] * frame_count
     collision_barycentric: list[torch.Tensor | None] = [None] * frame_count
     correction_support_np = np.zeros(frame_count, dtype=bool)
@@ -441,9 +453,18 @@ def main() -> None:
             )
             inside_mask &= valid_np[:, None]
             inside_count = inside_mask.sum(axis=1).astype(np.int32)
-            collision_points, collision_faces, collision_barycentric = (
+            (
+                collision_points,
+                collision_object_normals,
+                collision_faces,
+                collision_barycentric,
+            ) = (
                 collision_correspondences(
-                    current, object_vertices_np, inside_mask, faces,
+                    current,
+                    object_vertices_np,
+                    object_vertex_normals_np,
+                    inside_mask,
+                    faces,
                     args.correspondence_topk,
                 )
             )
@@ -484,6 +505,7 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         contact_value = 0.0
         collision_value = 0.0
+        object_normal_pushout_value = 0.0
         for start in range(0, len(active_indices_np), args.frame_chunk):
             indices = active_indices[start:start + args.frame_chunk]
             refined = transform_batch(
@@ -551,14 +573,21 @@ def main() -> None:
                 ).sum() / total_contact_weight
 
             collision_sum = torch.zeros((), device=device)
+            object_normal_pushout_sum = torch.zeros((), device=device)
             for local_index, global_tensor in enumerate(indices):
                 global_index = int(global_tensor.item())
                 if not collision_active_np[global_index]:
                     continue
                 points = collision_points[global_index]
+                point_normals = collision_object_normals[global_index]
                 face_index = collision_faces[global_index]
                 barycentric = collision_barycentric[global_index]
-                if points is None or face_index is None or barycentric is None:
+                if (
+                    points is None
+                    or point_normals is None
+                    or face_index is None
+                    or barycentric is None
+                ):
                     continue
                 triangles = refined[local_index, faces[face_index]]
                 surface = (triangles * barycentric[..., None]).sum(dim=-2)
@@ -574,13 +603,30 @@ def main() -> None:
                 collision_sum = collision_sum + torch.clamp(
                     collision_margin - signed_clearance, min=0.0
                 ).square().sum()
+                object_clearance = (
+                    (surface - points) * point_normals
+                ).sum(dim=-1)
+                object_normal_pushout_sum = (
+                    object_normal_pushout_sum
+                    + torch.clamp(
+                        collision_margin - object_clearance, min=0.0
+                    ).square().sum()
+                )
             chunk_collision = collision_sum / total_collision_points
+            chunk_object_normal_pushout = (
+                object_normal_pushout_sum / total_collision_points
+            )
             chunk_loss = (
-                args.w_contact * chunk_contact + args.w_collision * chunk_collision
+                args.w_contact * chunk_contact
+                + args.w_collision * chunk_collision
+                + args.w_object_normal_pushout * chunk_object_normal_pushout
             )
             chunk_loss.backward()
             contact_value += float(chunk_contact.detach())
             collision_value += float(chunk_collision.detach())
+            object_normal_pushout_value += float(
+                chunk_object_normal_pushout.detach()
+            )
 
         active = correction_support
         translation_anchor = translation[active].square().sum(dim=-1).mean()
@@ -615,10 +661,13 @@ def main() -> None:
                 "total": (
                     args.w_contact * contact_value
                     + args.w_collision * collision_value
+                    + args.w_object_normal_pushout
+                    * object_normal_pushout_value
                     + float(regularization.detach())
                 ),
                 "contact": contact_value,
                 "collision": collision_value,
+                "object_normal_pushout": object_normal_pushout_value,
                 "regularization": float(regularization.detach()),
                 "active_frames": int(active.sum().item()),
                 "inside_total_at_refresh": int(inside_count.sum()),
@@ -669,7 +718,9 @@ def main() -> None:
 
     summary = {
         "method": (
-            "v14_fixed_multiregion_canonical_contact_patch_rigid_stage1_v2"
+            "v14_fixed_multiregion_object_normal_rigid_stage1_v3"
+            if args.fixed_patch_npz and args.w_object_normal_pushout > 0
+            else "v14_fixed_multiregion_canonical_contact_patch_rigid_stage1_v2"
             if args.fixed_patch_npz
             else "region_balanced_haco_contact_capped_mano_containment_rigid_stage1_v4"
             if args.region_balanced_contact
@@ -695,6 +746,7 @@ def main() -> None:
         "weights": {
             "contact": args.w_contact,
             "collision": args.w_collision,
+            "object_normal_pushout": args.w_object_normal_pushout,
             "translation_anchor": args.w_translation_anchor,
             "rotation_anchor": args.w_rotation_anchor,
         },
