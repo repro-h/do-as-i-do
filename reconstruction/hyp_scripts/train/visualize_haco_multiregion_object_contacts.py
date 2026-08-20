@@ -63,6 +63,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-contact-distance-mm", type=float, default=100.0)
     parser.add_argument("--min-facing-cosine", type=float, default=0.15)
     parser.add_argument("--max-normal-dot", type=float, default=0.0)
+    parser.add_argument(
+        "--surface-side",
+        choices=("both", "outer", "inner"),
+        default="both",
+        help="Optionally retain only radial outer- or inner-facing mesh vertices",
+    )
+    parser.add_argument("--surface-side-cosine", type=float, default=0.05)
     parser.add_argument("--visible-surface-only", action="store_true")
     parser.add_argument("--visibility-bin-px", type=float, default=4.0)
     parser.add_argument(
@@ -193,6 +200,12 @@ def main() -> None:
     object_vertices_local = np.asarray(mesh.vertices, dtype=np.float32)
     object_faces = np.asarray(mesh.faces, dtype=np.int64)
     object_normals_local = np.asarray(mesh.vertex_normals, dtype=np.float32)
+    object_center_local = np.median(object_vertices_local, axis=0)
+    object_radial_local = object_vertices_local - object_center_local
+    object_radial_local /= np.maximum(
+        np.linalg.norm(object_radial_local, axis=-1, keepdims=True), 1e-12
+    )
+    shell_cosine = np.sum(object_normals_local * object_radial_local, axis=-1)
     pose = physical_pose(
         supervision["gt_ycb_object_pose"][supervision_index],
         bool(np.asarray(supervision.get("normalized_left", False)).item()),
@@ -298,6 +311,17 @@ def main() -> None:
         normal_dot = np.sum(
             object_normals[pixel_candidates] * matched_hand_normal, axis=-1
         )
+        candidate_shell_cosine = shell_cosine[pixel_candidates]
+        if args.surface_side == "outer":
+            surface_side_valid = (
+                candidate_shell_cosine >= args.surface_side_cosine
+            )
+        elif args.surface_side == "inner":
+            surface_side_valid = (
+                candidate_shell_cosine <= -args.surface_side_cosine
+            )
+        else:
+            surface_side_valid = np.ones(len(pixel_candidates), dtype=bool)
         candidate_distance_mm = contact_distance * 1000.0
         minimum_distance_mm = float(candidate_distance_mm.min())
         valid = (
@@ -308,6 +332,7 @@ def main() -> None:
             )
             & (facing_cosine >= args.min_facing_cosine)
             & (normal_dot <= args.max_normal_dot)
+            & surface_side_valid
         )
 
         result.update(
@@ -332,6 +357,12 @@ def main() -> None:
                 "normal_gate_candidates": int(
                     (normal_dot <= args.max_normal_dot).sum()
                 ),
+                "outer_surface_candidates": int(
+                    (candidate_shell_cosine >= args.surface_side_cosine).sum()
+                ),
+                "inner_surface_candidates": int(
+                    (candidate_shell_cosine <= -args.surface_side_cosine).sum()
+                ),
                 "valid_candidates": int(valid.sum()),
             }
         )
@@ -347,6 +378,7 @@ def main() -> None:
         valid_distance_mm = candidate_distance_mm[valid]
         valid_facing = facing_cosine[valid]
         valid_normal_dot = normal_dot[valid]
+        valid_shell_cosine = candidate_shell_cosine[valid]
         score = (
             args.w_pixel * valid_pixel
             + args.w_distance * valid_distance_mm
@@ -392,6 +424,9 @@ def main() -> None:
         arrays[f"{prefix}_contact_vertices_camera"] = region_hand
         arrays[f"{prefix}_candidate_vertex_ids"] = valid_ids
         arrays[f"{prefix}_candidate_vertices_camera"] = object_vertices[valid_ids]
+        arrays[f"{prefix}_candidate_shell_cosine"] = valid_shell_cosine.astype(
+            np.float32
+        )
         arrays[f"{prefix}_selected_vertex_id"] = np.asarray(
             selected_id, dtype=np.int64
         )
@@ -405,6 +440,7 @@ def main() -> None:
                 "raw_contact_mask": raw_contact_mask,
                 "contact_mask": contact_mask,
                 "candidate_ids": valid_ids,
+                "candidate_shell_cosine": valid_shell_cosine,
                 "selected_id": selected_id,
                 "patch_ids": patch_ids,
             }
@@ -427,6 +463,8 @@ def main() -> None:
             "max_contact_distance_mm": args.max_contact_distance_mm,
             "min_facing_cosine": args.min_facing_cosine,
             "max_normal_dot": args.max_normal_dot,
+            "surface_side": args.surface_side,
+            "surface_side_cosine": args.surface_side_cosine,
             "visible_surface_only": args.visible_surface_only,
             "visibility_bin_px": args.visibility_bin_px,
             "visibility_depth_tolerance_mm": (
@@ -471,6 +509,9 @@ def main() -> None:
         raw_contact_mask = np.asarray(visual["raw_contact_mask"], dtype=bool)
         contact_mask = np.asarray(visual["contact_mask"], dtype=bool)
         candidate_ids = np.asarray(visual["candidate_ids"], dtype=np.int64)
+        candidate_shell_cosine = np.asarray(
+            visual["candidate_shell_cosine"], dtype=np.float32
+        )
         selected_id = int(visual["selected_id"])
         patch_ids = np.asarray(visual["patch_ids"], dtype=np.int64)
         server.scene.add_point_cloud(
@@ -485,12 +526,21 @@ def main() -> None:
             colors=colors(int(contact_mask.sum()), color),
             point_size=0.004,
         )
-        server.scene.add_point_cloud(
-            f"/candidates/{name}",
-            points=object_vertices[candidate_ids],
-            colors=colors(len(candidate_ids), lighter(color)),
-            point_size=0.002,
-        )
+        outer = candidate_shell_cosine >= args.surface_side_cosine
+        inner = candidate_shell_cosine <= -args.surface_side_cosine
+        ambiguous = ~(outer | inner)
+        for side, selected, side_color in (
+            ("outer", outer, lighter(color)),
+            ("inner", inner, (255, 45, 45)),
+            ("ambiguous", ambiguous, (150, 150, 150)),
+        ):
+            if selected.any():
+                server.scene.add_point_cloud(
+                    f"/candidates_{side}/{name}",
+                    points=object_vertices[candidate_ids[selected]],
+                    colors=colors(int(selected.sum()), side_color),
+                    point_size=0.0025,
+                )
         if not args.candidate_surface_only:
             server.scene.add_point_cloud(
                 f"/patch/{name}",
