@@ -154,16 +154,24 @@ def transform_hands_object_per_frame(
 
 def generate_candidates(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray]:
     rng = np.random.default_rng(args.seed)
-    translations = rng.uniform(
-        -args.translation_range_mm / 1000.0,
-        args.translation_range_mm / 1000.0,
-        size=(args.num_candidates, 3),
+    scales = np.empty(args.num_candidates, dtype=np.float32)
+    full_end = max(1, int(round(args.num_candidates * 0.45)))
+    local_end = max(full_end, int(round(args.num_candidates * 0.80)))
+    scales[:full_end] = 1.0
+    scales[full_end:local_end] = 0.25
+    scales[local_end:] = 0.0625
+    rng.shuffle(scales)
+    translations = (
+        rng.uniform(-1.0, 1.0, size=(args.num_candidates, 3))
+        * scales[:, None]
+        * args.translation_range_mm
+        / 1000.0
     ).astype(np.float32)
-    rotation_vectors = np.deg2rad(rng.uniform(
-        -args.rotation_range_deg,
-        args.rotation_range_deg,
-        size=(args.num_candidates, 3),
-    )).astype(np.float32)
+    rotation_vectors = np.deg2rad(
+        rng.uniform(-1.0, 1.0, size=(args.num_candidates, 3))
+        * scales[:, None]
+        * args.rotation_range_deg
+    ).astype(np.float32)
     translations[0] = 0.0
     rotation_vectors[0] = 0.0
     return translations, rotation_vectors
@@ -378,9 +386,28 @@ def main() -> None:
     ranked = np.flatnonzero(finite)[np.argsort(objective[finite])]
     if not len(ranked):
         raise RuntimeError("No finite coarse registration candidate")
-    exact_ids = ranked[: args.exact_candidates]
-    if 0 not in exact_ids:
-        exact_ids = np.concatenate((np.asarray([0]), exact_ids[:-1]))
+    translation_size = np.linalg.norm(translations, axis=-1) * 1000.0
+    rotation_size = np.linalg.norm(rotation_vectors, axis=-1) * 180.0 / np.pi
+    small_ranked = np.flatnonzero(finite)[
+        np.argsort((translation_size + 2.0 * rotation_size)[finite])
+    ]
+    contact_ranked = np.flatnonzero(np.isfinite(contact_score))[
+        np.argsort(contact_score[np.isfinite(contact_score)])
+    ]
+    quota = max(1, args.exact_candidates // 3)
+    proposals = np.concatenate((
+        np.asarray([0], dtype=np.int64),
+        ranked[:quota],
+        small_ranked[:quota],
+        contact_ranked[:quota],
+        ranked,
+    ))
+    exact_ids = np.asarray(
+        list(dict.fromkeys(int(value) for value in proposals))[
+            : args.exact_candidates
+        ],
+        dtype=np.int64,
+    )
     exact_rotation = Rotation.from_rotvec(
         rotation_vectors[exact_ids]
     ).as_matrix().astype(np.float32)
@@ -446,6 +473,14 @@ def main() -> None:
         candidate_pool[np.argmin(balanced_objective[candidate_pool])]
     )
     selected_id = int(exact_ids[selected_local])
+    nonzero_feasible = candidate_pool[exact_ids[candidate_pool] != 0]
+    best_nonzero_local = None
+    if len(nonzero_feasible):
+        best_nonzero_local = int(
+            nonzero_feasible[
+                np.argmin(balanced_objective[nonzero_feasible])
+            ]
+        )
 
     selected_translation = translations[selected_id]
     selected_rotvec = rotation_vectors[selected_id]
@@ -500,7 +535,7 @@ def main() -> None:
         }
 
     summary = {
-        "method": "first_touch_shared_object_se3_coarse_registration_v2",
+        "method": "first_touch_shared_object_se3_coarse_registration_v3",
         "stream_id": str(query["stream_id"].item()),
         "onset_frame": frame_id(ids[onset]),
         "window_frames": [frame_id(ids[index]) for index in window],
@@ -508,6 +543,8 @@ def main() -> None:
         "num_candidates": args.num_candidates,
         "exact_candidates": int(len(exact_ids)),
         "selected_candidate": selected_id,
+        "feasible_candidates": int(len(candidate_pool)),
+        "feasible_nonzero_candidates": int(len(nonzero_feasible)),
         "selected_translation_object_mm": (
             selected_translation * 1000.0
         ).tolist(),
@@ -526,6 +563,28 @@ def main() -> None:
         "sampled_inside_score_frames": int(sampled_inside[selected_local]),
         "balanced_candidate_objective": float(
             balanced_objective[selected_local]
+        ),
+        "best_nonzero_candidate": (
+            None
+            if best_nonzero_local is None
+            else {
+                "candidate": int(exact_ids[best_nonzero_local]),
+                "translation_norm_mm": float(
+                    np.linalg.norm(translations[exact_ids[best_nonzero_local]])
+                    * 1000.0
+                ),
+                "rotation_norm_deg": float(
+                    np.linalg.norm(rotation_vectors[exact_ids[best_nonzero_local]])
+                    * 180.0
+                    / np.pi
+                ),
+                "contact_score_mm": float(exact_contact[best_nonzero_local]),
+                "sampled_inside": int(sampled_inside[best_nonzero_local]),
+                "reprojection_px": float(exact_reprojection[best_nonzero_local]),
+                "balanced_objective": float(
+                    balanced_objective[best_nonzero_local]
+                ),
+            }
         ),
         "containment": {
             "initial_total": int(initial_inside.sum()),
