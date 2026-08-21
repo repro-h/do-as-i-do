@@ -124,6 +124,23 @@ def main() -> None:
         f"{','.join(selected_regions)}",
         flush=True,
     )
+    translation_consistent = set(
+        str(value) for value in selection.get(
+            "translation_consistent_region_names", np.asarray([])
+        )
+    )
+    opposition_pairs = [
+        (str(pair[0]), str(pair[1]))
+        for pair in selection.get(
+            "automatic_opposition_region_pairs", np.empty((0, 2))
+        )
+    ]
+    print(
+        "[viser] translation-consistent regions: "
+        f"{','.join(sorted(translation_consistent)) or '-'}",
+        flush=True,
+    )
+    print(f"[viser] automatic opposition pairs: {opposition_pairs}", flush=True)
     patches = {
         name: np.asarray(
             selection[f"{name}_patch_vertices_canonical"], dtype=np.float32
@@ -137,6 +154,18 @@ def main() -> None:
         selection["observation_selected_vertex_ids"],
     ):
         observation_lookup[(str(observation_frame), str(observation_region))] = int(vertex_id)
+    vote_lookup: dict[tuple[str, str], tuple[np.ndarray, np.ndarray]] = {}
+    if "observation_translation_votes_camera" in selection:
+        for observation_frame, observation_region, center, vote in zip(
+            selection["observation_frame_ids"],
+            selection["observation_region_names"],
+            selection["observation_hand_region_centers_camera"],
+            selection["observation_translation_votes_camera"],
+        ):
+            vote_lookup[(str(observation_frame), str(observation_region))] = (
+                np.asarray(center, dtype=np.float32),
+                np.asarray(vote, dtype=np.float32),
+            )
 
     server = viser.ViserServer(port=args.port)
     server.scene.set_up_direction("-y")
@@ -157,6 +186,10 @@ def main() -> None:
     show_patches = server.gui.add_checkbox("Fixed object patches", initial_value=True)
     show_observations = server.gui.add_checkbox(
         "Sampled frame observations", initial_value=True
+    )
+    show_votes = server.gui.add_checkbox("Translation votes", initial_value=True)
+    show_opposition = server.gui.add_checkbox(
+        "Automatic opposition", initial_value=True
     )
     handles = []
     playing = {"value": False}
@@ -222,6 +255,34 @@ def main() -> None:
                     colors=colors(1, color),
                     point_size=float(point_size.value) * 1.8,
                 ))
+            vote = vote_lookup.get((requested, name))
+            if show_votes.value and vote is not None:
+                center, offset = vote
+                vote_color = color if name in translation_consistent else (255, 190, 30)
+                handles.append(server.scene.add_line_segments(
+                    f"/translation_vote/{name}",
+                    points=np.stack([center, center + offset])[None],
+                    colors=np.asarray([[vote_color, vote_color]], dtype=np.uint8),
+                    line_width=3.0,
+                ))
+        if show_opposition.value:
+            for first, second in opposition_pairs:
+                if first not in patches or second not in patches:
+                    continue
+                first_center = (
+                    patches[first] @ pose[:3, :3].T + pose[:3, 3]
+                ).mean(axis=0)
+                second_center = (
+                    patches[second] @ pose[:3, :3].T + pose[:3, 3]
+                ).mean(axis=0)
+                handles.append(server.scene.add_line_segments(
+                    f"/automatic_opposition/{first}_{second}",
+                    points=np.stack([first_center, second_center])[None],
+                    colors=np.asarray(
+                        [[[255, 235, 40], [255, 235, 40]]], dtype=np.uint8
+                    ),
+                    line_width=4.0,
+                ))
         print(
             f"frame={requested} index={index} "
             f"sampled={any(frame == requested for frame, _ in observation_lookup)}",
@@ -244,6 +305,8 @@ def main() -> None:
         show_haco,
         show_patches,
         show_observations,
+        show_votes,
+        show_opposition,
     ):
         control.on_update(lambda _: show_frame(int(frame_slider.value)))
 

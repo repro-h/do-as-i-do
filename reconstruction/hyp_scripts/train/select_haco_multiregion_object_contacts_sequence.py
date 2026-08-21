@@ -80,6 +80,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--onset-half-life-frames", type=float, default=24.0)
     parser.add_argument("--min-facing-cosine", type=float, default=0.15)
     parser.add_argument("--max-normal-dot", type=float, default=1.0)
+    parser.add_argument("--normal-fallback-max-dot", type=float, default=1.0)
+    parser.add_argument(
+        "--minimum-normal-compatible-candidates", type=int, default=8
+    )
     parser.add_argument("--visible-surface-only", action="store_true")
     parser.add_argument("--visibility-layers", type=int, default=1)
     parser.add_argument("--visibility-bin-px", type=float, default=3.0)
@@ -96,6 +100,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimum-dominant-observations", type=int, default=3)
     parser.add_argument("--patch-radius-mm", type=float, default=6.0)
     parser.add_argument("--patch-normal-cosine", type=float, default=0.8)
+    parser.add_argument("--translation-vote-cluster-mm", type=float, default=20.0)
+    parser.add_argument(
+        "--auto-opposition-max-normal-dot", type=float, default=-0.3
+    )
+    parser.add_argument(
+        "--auto-opposition-max-vote-difference-mm", type=float, default=15.0
+    )
     parser.add_argument("--out-npz", required=True)
     parser.add_argument("--out-json", required=True)
     return parser.parse_args()
@@ -524,13 +535,34 @@ def main() -> None:
                 object_normals[candidates] * matched_normals, axis=-1
             )
             minimum_distance = float(distance_mm.min())
-            candidate_valid = (
+            candidate_base_valid = (
                 (distance_mm <= args.max_contact_distance_mm)
                 & (distance_mm <= minimum_distance + args.distance_slack_mm)
                 & (depth_intrusion_mm <= args.max_depth_intrusion_mm)
                 & (facing >= args.min_facing_cosine)
-                & (normal_dot <= args.max_normal_dot)
             )
+            primary_normal = (
+                candidate_base_valid & (normal_dot <= args.max_normal_dot)
+            )
+            fallback_normal = (
+                candidate_base_valid
+                & (normal_dot <= args.normal_fallback_max_dot)
+            )
+            if (
+                int(primary_normal.sum())
+                >= args.minimum_normal_compatible_candidates
+            ):
+                candidate_valid = primary_normal
+                normal_filter_mode = "primary"
+            elif (
+                int(fallback_normal.sum())
+                >= args.minimum_normal_compatible_candidates
+            ):
+                candidate_valid = fallback_normal
+                normal_filter_mode = "fallback"
+            else:
+                candidate_valid = candidate_base_valid
+                normal_filter_mode = "ungated"
             if not candidate_valid.any():
                 skipped.append({
                     "frame_id": requested,
@@ -561,6 +593,12 @@ def main() -> None:
             selected_offset = int(np.argmin(score))
             selected_id = int(candidates[selected_offset])
             contact_vertices = np.flatnonzero(mask)
+            contact_weights = np.maximum(probability[contact_vertices], 1e-6)
+            hand_region_center = np.average(
+                hand[contact_vertices], axis=0, weights=contact_weights
+            )
+            selected_object_point = object_vertices[selected_id]
+            translation_vote = selected_object_point - hand_region_center
             haco_probability = float(probability[contact_vertices].mean())
             onset_reference = region_onset_indices.get(
                 region_name, contact_onset_index
@@ -596,11 +634,17 @@ def main() -> None:
                 ),
                 "facing_cosine": float(facing[selected_offset]),
                 "normal_dot": float(normal_dot[selected_offset]),
+                "normal_filter_mode": normal_filter_mode,
+                "primary_normal_candidates": int(primary_normal.sum()),
+                "fallback_normal_candidates": int(fallback_normal.sum()),
                 "haco_vertices": int(len(contact_vertices)),
                 "haco_probability": haco_probability,
                 "onset_weight": float(onset_weight),
                 "intrusion_weight": float(intrusion_weight),
                 "vote_weight": float(quality),
+                "hand_region_center_camera": hand_region_center.tolist(),
+                "selected_object_point_camera": selected_object_point.tolist(),
+                "translation_vote_camera": translation_vote.tolist(),
             })
             selected_this_frame.append(region_name)
         print(
@@ -647,8 +691,23 @@ def main() -> None:
         "observation_vote_weights": np.asarray(
             [row["vote_weight"] for row in observations], dtype=np.float32
         ),
+        "observation_hand_region_centers_camera": np.asarray(
+            [row["hand_region_center_camera"] for row in observations],
+            dtype=np.float32,
+        ),
+        "observation_selected_object_points_camera": np.asarray(
+            [row["selected_object_point_camera"] for row in observations],
+            dtype=np.float32,
+        ),
+        "observation_translation_votes_camera": np.asarray(
+            [row["translation_vote_camera"] for row in observations],
+            dtype=np.float32,
+        ),
     }
 
+    region_translation_votes: dict[str, np.ndarray] = {}
+    region_vote_weights: dict[str, float] = {}
+    region_center_ids: dict[str, int] = {}
     for region_name in region_names:
         region_observations = [
             row for row in observations if row["region"] == region_name
@@ -686,6 +745,19 @@ def main() -> None:
         )[:, dominant_ids]
         medoid_cost = (medoid_distances * weights[dominant][None]).sum(axis=1)
         center_id = int(dominant_ids[int(np.argmin(medoid_cost))])
+        dominant_votes = np.asarray([
+            region_observations[int(index)]["translation_vote_camera"]
+            for index in dominant
+        ], dtype=np.float32)
+        dominant_weights = weights[dominant]
+        translation_vote = np.average(
+            dominant_votes,
+            axis=0,
+            weights=np.maximum(dominant_weights, 1e-12),
+        ).astype(np.float32)
+        region_translation_votes[region_name] = translation_vote
+        region_vote_weights[region_name] = float(dominant_weights.sum())
+        region_center_ids[region_name] = center_id
         patch_ids = geodesic_patch(
             object_local,
             object_faces,
@@ -709,6 +781,7 @@ def main() -> None:
             ),
             "selected_vertex_id": center_id,
             "patch_vertices": int(len(patch_ids)),
+            "translation_vote_mm": (translation_vote * 1000.0).tolist(),
         })
         output_arrays[f"{region_name}_selected_vertex_id"] = np.asarray(
             center_id, dtype=np.int64
@@ -716,13 +789,70 @@ def main() -> None:
         output_arrays[f"{region_name}_patch_vertex_ids"] = patch_ids
         output_arrays[f"{region_name}_patch_vertices_canonical"] = object_local[patch_ids]
         output_arrays[f"{region_name}_patch_normals_canonical"] = object_normals_local[patch_ids]
+        output_arrays[f"{region_name}_translation_vote_camera"] = translation_vote
 
     selected_names = [str(row["region"]) for row in selected_regions]
     stable_names = [
         str(row["region"]) for row in selected_regions if bool(row["stable"])
     ]
+    translation_consistent_names: list[str] = []
+    if stable_names:
+        stable_votes = np.stack([
+            region_translation_votes[name] for name in stable_names
+        ])
+        vote_pairwise = np.linalg.norm(
+            stable_votes[:, None] - stable_votes[None], axis=-1
+        )
+        vote_clusters = clusters_from_distances(
+            vote_pairwise, args.translation_vote_cluster_mm / 1000.0
+        )
+        cluster_weights = np.asarray([
+            sum(region_vote_weights[stable_names[int(index)]] for index in cluster)
+            for cluster in vote_clusters
+        ])
+        dominant_vote_cluster = vote_clusters[int(np.argmax(cluster_weights))]
+        translation_consistent_names = [
+            stable_names[int(index)] for index in dominant_vote_cluster
+        ]
+
+    automatic_opposition_pairs: list[list[str]] = []
+    automatic_opposition_normal_dot: list[float] = []
+    automatic_opposition_vote_difference_mm: list[float] = []
+    for first_offset, first_name in enumerate(translation_consistent_names):
+        first_normal = object_normals_local[region_center_ids[first_name]]
+        first_vote = region_translation_votes[first_name]
+        for second_name in translation_consistent_names[first_offset + 1:]:
+            second_normal = object_normals_local[region_center_ids[second_name]]
+            second_vote = region_translation_votes[second_name]
+            normal_dot = float(first_normal @ second_normal)
+            vote_difference_mm = float(
+                np.linalg.norm(first_vote - second_vote) * 1000.0
+            )
+            if (
+                normal_dot <= args.auto_opposition_max_normal_dot
+                and vote_difference_mm
+                <= args.auto_opposition_max_vote_difference_mm
+            ):
+                automatic_opposition_pairs.append([first_name, second_name])
+                automatic_opposition_normal_dot.append(normal_dot)
+                automatic_opposition_vote_difference_mm.append(
+                    vote_difference_mm
+                )
+
     output_arrays["selected_region_names"] = np.asarray(selected_names)
     output_arrays["stable_region_names"] = np.asarray(stable_names)
+    output_arrays["translation_consistent_region_names"] = np.asarray(
+        translation_consistent_names
+    )
+    output_arrays["automatic_opposition_region_pairs"] = np.asarray(
+        automatic_opposition_pairs, dtype="U32"
+    ).reshape(-1, 2)
+    output_arrays["automatic_opposition_normal_dot"] = np.asarray(
+        automatic_opposition_normal_dot, dtype=np.float32
+    )
+    output_arrays["automatic_opposition_vote_difference_mm"] = np.asarray(
+        automatic_opposition_vote_difference_mm, dtype=np.float32
+    )
     summary = {
         "method": (
             "stage1_haco_multiregion_sequence_reselection_v3"
@@ -741,6 +871,17 @@ def main() -> None:
         "sampled_frames": int(len(eligible)),
         "successful_observations": len(observations),
         "selected_regions": selected_regions,
+        "translation_consistent_regions": translation_consistent_names,
+        "automatic_opposition_pairs": [
+            {
+                "regions": pair,
+                "normal_dot": automatic_opposition_normal_dot[index],
+                "translation_vote_difference_mm": (
+                    automatic_opposition_vote_difference_mm[index]
+                ),
+            }
+            for index, pair in enumerate(automatic_opposition_pairs)
+        ],
         "low_consensus_regions": [
             str(row["region"]) for row in selected_regions if not bool(row["stable"])
         ],
@@ -764,12 +905,23 @@ def main() -> None:
             "onset_half_life_frames": args.onset_half_life_frames,
             "min_facing_cosine": args.min_facing_cosine,
             "max_normal_dot": args.max_normal_dot,
+            "normal_fallback_max_dot": args.normal_fallback_max_dot,
+            "minimum_normal_compatible_candidates": (
+                args.minimum_normal_compatible_candidates
+            ),
             "visible_surface_only": args.visible_surface_only,
             "visibility_layers": args.visibility_layers,
             "cluster_radius_mm": args.cluster_radius_mm,
             "minimum_consensus": args.minimum_consensus,
             "minimum_dominant_observations": (
                 args.minimum_dominant_observations
+            ),
+            "translation_vote_cluster_mm": args.translation_vote_cluster_mm,
+            "auto_opposition_max_normal_dot": (
+                args.auto_opposition_max_normal_dot
+            ),
+            "auto_opposition_max_vote_difference_mm": (
+                args.auto_opposition_max_vote_difference_mm
             ),
             "weights": {
                 "pixel": args.w_pixel,
