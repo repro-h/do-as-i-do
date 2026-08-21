@@ -127,6 +127,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-chunk", type=int, default=4)
     parser.add_argument("--max-translation-mm", type=float, default=20.0)
     parser.add_argument("--max-rotation-deg", type=float, default=5.0)
+    parser.add_argument(
+        "--translation-only",
+        action="store_true",
+        help="Optimize camera-space translation while keeping rotation exactly zero.",
+    )
     parser.add_argument("--w-contact", type=float, default=1.0)
     parser.add_argument("--w-collision", type=float, default=5.0)
     parser.add_argument("--w-object-normal-pushout", type=float, default=0.0)
@@ -712,8 +717,15 @@ def main() -> None:
         contact_region_active = torch.from_numpy(contact_region_active_np).to(device)
 
     translation = torch.zeros((frame_count, 3), device=device, requires_grad=True)
-    angles = torch.zeros((frame_count, 3), device=device, requires_grad=True)
-    optimizer = torch.optim.Adam((translation, angles), lr=args.lr)
+    angles = torch.zeros(
+        (frame_count, 3),
+        device=device,
+        requires_grad=not args.translation_only,
+    )
+    optimized_parameters = [translation]
+    if not args.translation_only:
+        optimized_parameters.append(angles)
+    optimizer = torch.optim.Adam(optimized_parameters, lr=args.lr)
     max_translation = args.max_translation_mm / 1000.0
     max_angle = math.radians(args.max_rotation_deg)
     contact_target = args.contact_target_mm / 1000.0
@@ -1056,9 +1068,12 @@ def main() -> None:
         optimizer.step()
         with torch.no_grad():
             translation_norm = translation.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-            angle_norm = angles.norm(dim=-1, keepdim=True).clamp_min(1e-12)
             translation.mul_(torch.clamp(max_translation / translation_norm, max=1.0))
-            angles.mul_(torch.clamp(max_angle / angle_norm, max=1.0))
+            if args.translation_only:
+                angles.zero_()
+            else:
+                angle_norm = angles.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+                angles.mul_(torch.clamp(max_angle / angle_norm, max=1.0))
             translation[~correction_support] = 0
             angles[~correction_support] = 0
 
@@ -1252,6 +1267,11 @@ def main() -> None:
             else "joint_haco_contact_capped_mano_containment_rigid_stage1_v3"
         ),
         "stream_id": str(query["stream_id"].item()),
+        "degrees_of_freedom": (
+            "camera_translation_only"
+            if args.translation_only
+            else "camera_translation_and_rotation"
+        ),
         "initial_hand_source": initial_hand_source,
         "initial_hand_vertices_key": initial_vertices_key,
         "frames": frame_count,
