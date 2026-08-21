@@ -88,6 +88,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Hide the selected center and geodesic patch in Viser",
     )
+    parser.add_argument(
+        "--show-2d-candidates",
+        action="store_true",
+        help="Show object vertices selected by 2D projection before 3D gates",
+    )
     parser.add_argument("--port", type=int, default=8098)
     return parser.parse_args()
 
@@ -422,6 +427,10 @@ def main() -> None:
             raw_contact_mask
         )
         arrays[f"{prefix}_contact_vertices_camera"] = region_hand
+        arrays[f"{prefix}_pixel_candidate_vertex_ids"] = pixel_candidates
+        arrays[f"{prefix}_pixel_candidate_vertices_camera"] = object_vertices[
+            pixel_candidates
+        ]
         arrays[f"{prefix}_candidate_vertex_ids"] = valid_ids
         arrays[f"{prefix}_candidate_vertices_camera"] = object_vertices[valid_ids]
         arrays[f"{prefix}_candidate_shell_cosine"] = valid_shell_cosine.astype(
@@ -439,6 +448,7 @@ def main() -> None:
                 "name": region_name,
                 "raw_contact_mask": raw_contact_mask,
                 "contact_mask": contact_mask,
+                "pixel_candidate_ids": pixel_candidates,
                 "candidate_ids": valid_ids,
                 "candidate_shell_cosine": valid_shell_cosine,
                 "selected_id": selected_id,
@@ -508,6 +518,9 @@ def main() -> None:
         color = PALETTE[name]
         raw_contact_mask = np.asarray(visual["raw_contact_mask"], dtype=bool)
         contact_mask = np.asarray(visual["contact_mask"], dtype=bool)
+        pixel_candidate_ids = np.asarray(
+            visual["pixel_candidate_ids"], dtype=np.int64
+        )
         candidate_ids = np.asarray(visual["candidate_ids"], dtype=np.int64)
         candidate_shell_cosine = np.asarray(
             visual["candidate_shell_cosine"], dtype=np.float32
@@ -526,6 +539,13 @@ def main() -> None:
             colors=colors(int(contact_mask.sum()), color),
             point_size=0.004,
         )
+        if args.show_2d_candidates and len(pixel_candidate_ids):
+            server.scene.add_point_cloud(
+                f"/candidates_2d/{name}",
+                points=object_vertices[pixel_candidate_ids],
+                colors=colors(len(pixel_candidate_ids), (245, 245, 245)),
+                point_size=0.0015,
+            )
         outer = candidate_shell_cosine >= args.surface_side_cosine
         inner = candidate_shell_cosine <= -args.surface_side_cosine
         ambiguous = ~(outer | inner)
