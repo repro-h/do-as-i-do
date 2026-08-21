@@ -550,18 +550,30 @@ def main() -> None:
     )
     fixed_region_np: dict[str, np.ndarray] = {}
     fixed_patch_source = None
+    fixed_region_selection_key = None
     if args.fixed_patch_npz:
         fixed_patch = load_npz(
             Path(args.fixed_patch_npz).expanduser().resolve()
         )
         if (
+            "translation_consistent_region_names" in fixed_patch
+            and len(fixed_patch["translation_consistent_region_names"])
+        ):
+            fixed_region_selection_key = "translation_consistent_region_names"
+            fixed_region_names = [
+                str(value)
+                for value in fixed_patch["translation_consistent_region_names"]
+            ]
+        elif (
             args.fixed_contact_source == "candidate_surface"
             and "selected_region_names" in fixed_patch
         ):
+            fixed_region_selection_key = "selected_region_names"
             fixed_region_names = [
                 str(value) for value in fixed_patch["selected_region_names"]
             ]
         elif "stable_region_names" in fixed_patch:
+            fixed_region_selection_key = "stable_region_names"
             fixed_region_names = [
                 str(value) for value in fixed_patch["stable_region_names"]
             ]
@@ -570,10 +582,12 @@ def main() -> None:
                     "Fixed patch archive has no consensus-stable regions"
                 )
         elif "selected_region_names" in fixed_patch:
+            fixed_region_selection_key = "selected_region_names"
             fixed_region_names = [
                 str(value) for value in fixed_patch["selected_region_names"]
             ]
         else:
+            fixed_region_selection_key = "implicit_thumb_index"
             fixed_region_names = [
                 name for name in ("thumb", "index")
                 if f"{name}_patch_vertices_canonical" in fixed_patch
@@ -1399,6 +1413,7 @@ def main() -> None:
             else "mano_region_balanced" if args.region_balanced_contact else "global_vertex"
         ),
         "fixed_patch_source": fixed_patch_source,
+        "fixed_region_selection_key": fixed_region_selection_key,
         "fixed_contact_source": args.fixed_contact_source,
         "fixed_patch_regions": list(fixed_regions),
         "contact_regions": {
