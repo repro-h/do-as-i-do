@@ -42,6 +42,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--initial-frame", type=int, default=0)
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--port", type=int, default=8098)
+    parser.add_argument("--haco-anchor-topk", type=int, default=12)
+    parser.add_argument("--haco-anchor-min-vertices", type=int, default=3)
     return parser.parse_args()
 
 
@@ -194,6 +196,9 @@ def main() -> None:
     show_object = server.gui.add_checkbox("GT YCB object", initial_value=True)
     show_hand = server.gui.add_checkbox(hand_label, initial_value=True)
     show_haco = server.gui.add_checkbox("HACO components", initial_value=True)
+    show_anchors = server.gui.add_checkbox(
+        "Selected high-probability anchors", initial_value=True
+    )
     probability_heatmap = server.gui.add_checkbox(
         "HACO probability heatmap", initial_value=True
     )
@@ -288,6 +293,21 @@ def main() -> None:
                         f"p50={float(np.median(incompatible_probability)) if incompatible.any() else float('nan'):.3f}",
                         flush=True,
                     )
+            if (
+                show_anchors.value
+                and name in patches
+                and int(component.sum()) >= args.haco_anchor_min_vertices
+            ):
+                component_ids = np.flatnonzero(component)
+                anchor_count = min(args.haco_anchor_topk, len(component_ids))
+                order = np.argsort(probability[index, component_ids])[-anchor_count:]
+                anchor_ids = component_ids[order]
+                handles.append(server.scene.add_point_cloud(
+                    f"/haco_anchor/{name}",
+                    points=hand[index, anchor_ids],
+                    colors=colors(anchor_count, (255, 255, 255)),
+                    point_size=float(point_size.value) * 1.35,
+                ))
             if name not in patches:
                 continue
             patch_camera = patches[name] @ pose[:3, :3].T + pose[:3, 3]
@@ -354,6 +374,7 @@ def main() -> None:
         show_object,
         show_hand,
         show_haco,
+        show_anchors,
         probability_heatmap,
         patch_facing_only,
         show_patches,

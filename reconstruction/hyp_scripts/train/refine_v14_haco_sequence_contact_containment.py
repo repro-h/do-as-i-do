@@ -88,6 +88,15 @@ def parse_args() -> argparse.Namespace:
         help="Confidence bonus used when selecting fixed-patch contact vertices.",
     )
     parser.add_argument(
+        "--fixed-contact-selection",
+        choices=("distance_probability", "probability"),
+        default="distance_probability",
+        help=(
+            "Select each region's retained HACO vertices using the existing "
+            "distance/probability score or probability alone."
+        ),
+    )
+    parser.add_argument(
         "--opposition-frame-loss",
         action="store_true",
         help=(
@@ -279,6 +288,7 @@ def fixed_region_bottleneck_distance_mm(
     probability_power: float,
     weight_floor: float,
     selection_sigma_mm: float,
+    selection_mode: str,
 ) -> np.ndarray:
     """Maximum probability-aware soft-top-k region gap for every frame."""
     output = np.full(len(hand), np.nan, dtype=np.float32)
@@ -307,11 +317,14 @@ def fixed_region_bottleneck_distance_mm(
             weights = weight_floor + (1.0 - weight_floor) * (
                 normalized ** probability_power
             )
-            selection_score = distance_mm - selection_sigma_mm * np.log(
-                np.maximum(weights, 1e-6)
-            )
             count = min(max(1, vertex_topk), len(distance_mm))
-            chosen = np.argpartition(selection_score, count - 1)[:count]
+            if selection_mode == "probability":
+                chosen = np.argpartition(weights, -count)[-count:]
+            else:
+                selection_score = distance_mm - selection_sigma_mm * np.log(
+                    np.maximum(weights, 1e-6)
+                )
+                chosen = np.argpartition(selection_score, count - 1)[:count]
             gap = np.sqrt(np.average(
                 distance_mm[chosen] ** 2,
                 weights=weights[chosen],
@@ -466,6 +479,7 @@ def fixed_region_contact_loss(
     contact_target: float,
     selection_sigma: float,
     reduction: str,
+    selection_mode: str,
     excluded_regions: set[str] | None = None,
 ) -> torch.Tensor:
     frame_losses = []
@@ -490,14 +504,19 @@ def fixed_region_contact_loss(
             effective_distance - contact_target, min=0.0
         ).square()
         weights = contact_weight[:, selected]
-        selection_score = (
-            effective_distance
-            - selection_sigma * torch.log(weights.clamp_min(1e-6))
-        ).masked_fill(weights <= 0, torch.inf)
-        selected_count = min(max(1, vertex_topk), selection_score.shape[-1])
-        selected_vertices = torch.topk(
-            selection_score, selected_count, dim=-1, largest=False
-        ).indices
+        selected_count = min(max(1, vertex_topk), weights.shape[-1])
+        if selection_mode == "probability":
+            selected_vertices = torch.topk(
+                weights, selected_count, dim=-1, largest=True
+            ).indices
+        else:
+            selection_score = (
+                effective_distance
+                - selection_sigma * torch.log(weights.clamp_min(1e-6))
+            ).masked_fill(weights <= 0, torch.inf)
+            selected_vertices = torch.topk(
+                selection_score, selected_count, dim=-1, largest=False
+            ).indices
         selected_error = torch.gather(error, -1, selected_vertices)
         selected_weights = torch.gather(weights, -1, selected_vertices)
         region_weights = selected_weights.sum(dim=-1)
@@ -990,6 +1009,7 @@ def main() -> None:
                     args.contact_probability_power,
                     args.contact_weight_floor,
                     args.fixed_contact_selection_sigma_mm,
+                    args.fixed_contact_selection,
                 )
                 valid = np.isfinite(gap) & np.isfinite(auxiliary)
                 gap[valid] += (
@@ -1010,6 +1030,7 @@ def main() -> None:
             args.contact_probability_power,
             args.contact_weight_floor,
             args.fixed_contact_selection_sigma_mm,
+            args.fixed_contact_selection,
         )
 
     def update_phase_budget_state(
@@ -1166,6 +1187,7 @@ def main() -> None:
                         contact_target,
                         args.fixed_contact_selection_sigma_mm / 1000.0,
                         args.fixed_region_reduction,
+                        args.fixed_contact_selection,
                         set(opposition_pair),
                     )
                     chunk_contact = (
@@ -1198,20 +1220,26 @@ def main() -> None:
                     selection_sigma = (
                         args.fixed_contact_selection_sigma_mm / 1000.0
                     )
-                    selection_score = (
-                        effective_distance
-                        - selection_sigma * torch.log(weights.clamp_min(1e-6))
-                    ).masked_fill(weights <= 0, torch.inf)
                     vertex_topk = min(
                         max(1, args.fixed_contact_vertex_topk),
-                        selection_score.shape[-1],
+                        weights.shape[-1],
                     )
-                    selected_vertices = torch.topk(
-                        selection_score,
-                        vertex_topk,
-                        dim=-1,
-                        largest=False,
-                    ).indices
+                    if args.fixed_contact_selection == "probability":
+                        selected_vertices = torch.topk(
+                            weights, vertex_topk, dim=-1, largest=True
+                        ).indices
+                    else:
+                        selection_score = (
+                            effective_distance
+                            - selection_sigma
+                            * torch.log(weights.clamp_min(1e-6))
+                        ).masked_fill(weights <= 0, torch.inf)
+                        selected_vertices = torch.topk(
+                            selection_score,
+                            vertex_topk,
+                            dim=-1,
+                            largest=False,
+                        ).indices
                     selected_error = torch.gather(
                         error, -1, selected_vertices
                     )
@@ -1601,6 +1629,7 @@ def main() -> None:
             "selection_sigma_mm": args.fixed_contact_selection_sigma_mm,
             "probability_power": args.contact_probability_power,
             "weight_floor": args.contact_weight_floor,
+            "mode": args.fixed_contact_selection,
         },
         "opposition_frame": {
             "enabled": use_opposition_loss,
