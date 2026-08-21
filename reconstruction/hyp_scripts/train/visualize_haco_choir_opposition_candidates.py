@@ -48,6 +48,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--choir-sigma-mm", type=float, default=10.0)
     parser.add_argument("--w-opposition", type=float, default=20.0)
     parser.add_argument("--w-facing", type=float, default=20.0)
+    parser.add_argument(
+        "--hand-object-normal-max-dot",
+        type=float,
+        default=1.0,
+        help=(
+            "Primary candidate gate on dot(MANO outward normal, object outward "
+            "normal); negative values require opposing contact surfaces."
+        ),
+    )
+    parser.add_argument(
+        "--normal-fallback-max-dot",
+        type=float,
+        default=1.0,
+        help="Relaxed hand/object normal gate used when the primary set is too small.",
+    )
+    parser.add_argument(
+        "--minimum-normal-compatible-vertices", type=int, default=8
+    )
     parser.add_argument("--max-pair-width-mm", type=float, default=100.0)
     parser.add_argument("--max-midpoint-shift-mm", type=float, default=30.0)
     parser.add_argument("--max-width-change-mm", type=float, default=40.0)
@@ -101,6 +119,44 @@ def physical_pose(pose: np.ndarray, normalized_left: bool) -> np.ndarray:
         result[:3, :3] = MIRROR_X @ result[:3, :3] @ MIRROR_X
         result[:3, 3] = MIRROR_X @ result[:3, 3]
     return result
+
+
+def mesh_vertex_normals(
+    vertices: np.ndarray, faces: np.ndarray
+) -> np.ndarray:
+    triangles = vertices[faces]
+    triangle_normals = np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+    )
+    output = np.zeros_like(vertices, dtype=np.float32)
+    for corner in range(3):
+        np.add.at(output, faces[:, corner], triangle_normals)
+    output /= np.maximum(np.linalg.norm(output, axis=-1, keepdims=True), 1e-12)
+    return output
+
+
+def normal_filter_candidates(
+    candidate_ids: np.ndarray,
+    object_normals: np.ndarray,
+    hand_normal: np.ndarray,
+    primary_max_dot: float,
+    fallback_max_dot: float,
+    minimum_vertices: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+    dots = object_normals[candidate_ids] @ hand_normal
+    primary = dots <= primary_max_dot
+    fallback = dots <= fallback_max_dot
+    if int(primary.sum()) >= minimum_vertices:
+        accepted = primary
+        mode = "primary"
+    elif int(fallback.sum()) >= minimum_vertices:
+        accepted = fallback
+        mode = "fallback"
+    else:
+        accepted = np.ones(len(candidate_ids), dtype=bool)
+        mode = "ungated"
+    return candidate_ids[accepted], candidate_ids[~accepted], dots, mode
 
 
 def choir_distance(
@@ -300,14 +356,52 @@ def main() -> None:
         np.isfinite(index_pixel_distance)
         & (index_pixel_distance <= args.pixel_radius)
     )
-    thumb_candidates = thumb_eligible[
+    thumb_raw_candidates = thumb_eligible[
         np.argsort(thumb_pixel_distance[thumb_eligible])[:args.candidate_topk]
     ]
-    index_candidates = index_eligible[
+    index_raw_candidates = index_eligible[
         np.argsort(index_pixel_distance[index_eligible])[:args.candidate_topk]
     ]
-    if len(thumb_candidates) == 0 or len(index_candidates) == 0:
+    if len(thumb_raw_candidates) == 0 or len(index_raw_candidates) == 0:
         raise RuntimeError("Local candidate filtering removed every candidate")
+
+    hand_normals = mesh_vertex_normals(pair_hand, faces)
+    thumb_weight = probability[thumb_mask]
+    index_weight = probability[index_mask]
+    thumb_hand_normal = np.average(
+        hand_normals[thumb_mask], axis=0, weights=np.maximum(thumb_weight, 1e-6)
+    )
+    index_hand_normal = np.average(
+        hand_normals[index_mask], axis=0, weights=np.maximum(index_weight, 1e-6)
+    )
+    thumb_hand_normal /= max(float(np.linalg.norm(thumb_hand_normal)), 1e-12)
+    index_hand_normal /= max(float(np.linalg.norm(index_hand_normal)), 1e-12)
+    (
+        thumb_candidates,
+        thumb_rejected_candidates,
+        thumb_normal_dots,
+        thumb_normal_filter_mode,
+    ) = normal_filter_candidates(
+        thumb_raw_candidates,
+        normals,
+        thumb_hand_normal,
+        args.hand_object_normal_max_dot,
+        args.normal_fallback_max_dot,
+        args.minimum_normal_compatible_vertices,
+    )
+    (
+        index_candidates,
+        index_rejected_candidates,
+        index_normal_dots,
+        index_normal_filter_mode,
+    ) = normal_filter_candidates(
+        index_raw_candidates,
+        normals,
+        index_hand_normal,
+        args.hand_object_normal_max_dot,
+        args.normal_fallback_max_dot,
+        args.minimum_normal_compatible_vertices,
+    )
 
     thumb_points = surface[thumb_candidates]
     index_points = surface[index_candidates]
@@ -325,8 +419,6 @@ def main() -> None:
         1.0 - (direction * index_normals[None]).sum(axis=-1)
     )
     facing = thumb_facing + index_facing
-    thumb_weight = probability[thumb_mask]
-    index_weight = probability[index_mask]
     thumb_center = np.average(
         pair_hand[thumb_mask], axis=0, weights=np.maximum(thumb_weight, 1e-6)
     )
@@ -406,6 +498,23 @@ def main() -> None:
         "index_contact_vertices": int(index_mask.sum()),
         "thumb_candidate_count": int(len(thumb_candidates)),
         "index_candidate_count": int(len(index_candidates)),
+        "thumb_raw_candidate_count": int(len(thumb_raw_candidates)),
+        "index_raw_candidate_count": int(len(index_raw_candidates)),
+        "thumb_normal_filter_mode": thumb_normal_filter_mode,
+        "index_normal_filter_mode": index_normal_filter_mode,
+        "thumb_rejected_by_normal": int(len(thumb_rejected_candidates)),
+        "index_rejected_by_normal": int(len(index_rejected_candidates)),
+        "hand_object_normal_max_dot": args.hand_object_normal_max_dot,
+        "normal_fallback_max_dot": args.normal_fallback_max_dot,
+        "minimum_normal_compatible_vertices": (
+            args.minimum_normal_compatible_vertices
+        ),
+        "selected_thumb_hand_object_normal_dot": float(
+            thumb_normals[thumb_choice] @ thumb_hand_normal
+        ),
+        "selected_index_hand_object_normal_dot": float(
+            index_normals[index_choice] @ index_hand_normal
+        ),
         "thumb_pixel_distance_min": float(thumb_pixel_distance.min()),
         "index_pixel_distance_min": float(index_pixel_distance.min()),
         "selected_score": float(score[thumb_choice, index_choice]),
@@ -452,8 +561,16 @@ def main() -> None:
             frame_id=np.asarray(requested),
             thumb_contact_vertices=hand[thumb_mask],
             index_contact_vertices=hand[index_mask],
+            thumb_raw_candidates=surface[thumb_raw_candidates],
+            index_raw_candidates=surface[index_raw_candidates],
             thumb_candidates=thumb_points,
             index_candidates=index_points,
+            thumb_normal_rejected_candidates=surface[thumb_rejected_candidates],
+            index_normal_rejected_candidates=surface[index_rejected_candidates],
+            thumb_raw_candidate_hand_object_normal_dot=thumb_normal_dots,
+            index_raw_candidate_hand_object_normal_dot=index_normal_dots,
+            thumb_hand_contact_normal=thumb_hand_normal,
+            index_hand_contact_normal=index_hand_normal,
             thumb_candidate_choir_mm=thumb_distance[thumb_candidates] * 1000.0,
             index_candidate_choir_mm=index_distance[index_candidates] * 1000.0,
             thumb_candidate_pixel_distance=thumb_pixel_distance[thumb_candidates],
@@ -489,6 +606,26 @@ def main() -> None:
         "/haco/index", points=hand[index_mask],
         colors=colors(int(index_mask.sum()), (40, 255, 100)), point_size=0.004,
     )
+    server.scene.add_point_cloud(
+        "/candidates/raw_2d", points=np.concatenate([
+            surface[thumb_raw_candidates], surface[index_raw_candidates]
+        ]),
+        colors=colors(
+            len(thumb_raw_candidates) + len(index_raw_candidates),
+            (135, 135, 135),
+        ),
+        point_size=0.001,
+    )
+    rejected_points = np.concatenate([
+        surface[thumb_rejected_candidates],
+        surface[index_rejected_candidates],
+    ])
+    if len(rejected_points):
+        server.scene.add_point_cloud(
+            "/candidates/normal_rejected", points=rejected_points,
+            colors=colors(len(rejected_points), (255, 205, 35)),
+            point_size=0.003,
+        )
     server.scene.add_point_cloud(
         "/candidates/thumb", points=thumb_points,
         colors=colors(len(thumb_points), (255, 140, 220)), point_size=0.002,
