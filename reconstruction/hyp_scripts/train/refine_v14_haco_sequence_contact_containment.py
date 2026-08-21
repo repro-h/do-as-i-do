@@ -113,6 +113,15 @@ def parse_args() -> argparse.Namespace:
         default=20.0,
         help="Metric scale assigned to opposition-axis angular error.",
     )
+    parser.add_argument(
+        "--opposition-vertex-topk",
+        type=int,
+        default=0,
+        help=(
+            "Per opposition region, use only this many highest-probability "
+            "HACO vertices to form the hand contact center; 0 uses all."
+        ),
+    )
     parser.add_argument("--mano-data-dir")
     parser.add_argument("--fixed-patch-npz")
     parser.add_argument(
@@ -327,6 +336,7 @@ def opposition_frame_error_mm(
     weight_floor: float,
     axis_scale_mm: float,
     opposition_pair: tuple[str, str] = ("thumb", "index"),
+    vertex_topk: int = 0,
 ) -> np.ndarray:
     """Translation-compatible contact-pair midpoint and axis error."""
     output = np.full(len(hand), np.nan, dtype=np.float32)
@@ -355,8 +365,13 @@ def opposition_frame_error_mm(
             weights = weight_floor + (1.0 - weight_floor) * (
                 normalized ** probability_power
             )
+            points = hand[frame, selected]
+            if vertex_topk > 0 and len(weights) > vertex_topk:
+                chosen = np.argpartition(weights, -vertex_topk)[-vertex_topk:]
+                points = points[chosen]
+                weights = weights[chosen]
             centers[name] = np.average(
-                hand[frame, selected], axis=0, weights=weights
+                points, axis=0, weights=weights
             )
         if not valid_frame:
             continue
@@ -391,6 +406,7 @@ def opposition_frame_loss(
     minimum_vertices: int,
     axis_scale_mm: float,
     opposition_pair: tuple[str, str] = ("thumb", "index"),
+    vertex_topk: int = 0,
 ) -> torch.Tensor:
     centers: dict[str, torch.Tensor] = {}
     active: dict[str, torch.Tensor] = {}
@@ -399,8 +415,19 @@ def opposition_frame_loss(
         region = contact_region_names.index(name)
         selected = contact_region_mask[region]
         weights = contact_weight[:, selected]
+        points = hand[:, selected]
+        if vertex_topk > 0 and weights.shape[-1] > vertex_topk:
+            chosen = torch.topk(
+                weights, vertex_topk, dim=-1, largest=True
+            ).indices
+            weights = torch.gather(weights, -1, chosen)
+            points = torch.gather(
+                points,
+                1,
+                chosen[..., None].expand(-1, -1, points.shape[-1]),
+            )
         centers[name] = (
-            hand[:, selected] * weights[..., None]
+            points * weights[..., None]
         ).sum(dim=1) / weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
         active[name] = (
             (weights > 0).sum(dim=-1) >= minimum_vertices
@@ -946,6 +973,7 @@ def main() -> None:
                 args.contact_weight_floor,
                 args.opposition_axis_scale_mm,
                 opposition_pair,
+                args.opposition_vertex_topk,
             )
             if args.opposition_auxiliary_contact_weight > 0:
                 auxiliary = fixed_region_bottleneck_distance_mm(
@@ -1122,6 +1150,7 @@ def main() -> None:
                     args.contact_region_min_vertices,
                     args.opposition_axis_scale_mm,
                     opposition_pair,
+                    args.opposition_vertex_topk,
                 )
                 if args.opposition_auxiliary_contact_weight > 0:
                     auxiliary_contact = fixed_region_contact_loss(
@@ -1582,6 +1611,7 @@ def main() -> None:
             "pair": list(opposition_pair) if use_opposition_loss else None,
             "auxiliary_contact_weight": args.opposition_auxiliary_contact_weight,
             "axis_scale_mm": args.opposition_axis_scale_mm,
+            "vertex_topk": args.opposition_vertex_topk,
             "audit": opposition_summary,
         },
         "best_state_selection": args.best_state_selection,
