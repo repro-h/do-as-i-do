@@ -75,6 +75,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--softmax-sigma-mm", type=float, default=10.0)
     parser.add_argument("--contact-probability-power", type=float, default=2.0)
     parser.add_argument("--contact-weight-floor", type=float, default=0.05)
+    parser.add_argument(
+        "--fixed-contact-vertex-topk",
+        type=int,
+        default=16,
+        help="Per region, retain this many probability-aware MANO contact vertices.",
+    )
+    parser.add_argument(
+        "--fixed-contact-selection-sigma-mm",
+        type=float,
+        default=6.0,
+        help="Confidence bonus used when selecting fixed-patch contact vertices.",
+    )
     parser.add_argument("--mano-data-dir")
     parser.add_argument("--fixed-patch-npz")
     parser.add_argument(
@@ -198,12 +210,19 @@ def contact_region_distance_median_mm(
 def fixed_region_bottleneck_distance_mm(
     hand: np.ndarray,
     contact_mask: np.ndarray,
+    contact_probability: np.ndarray,
     region_ids: np.ndarray,
     region_names: list[str],
     fixed_regions: dict[str, np.ndarray],
     minimum_vertices: int,
+    patch_topk: int,
+    vertex_topk: int,
+    probability_threshold: float,
+    probability_power: float,
+    weight_floor: float,
+    selection_sigma_mm: float,
 ) -> np.ndarray:
-    """Maximum per-region median gap for every frame."""
+    """Maximum probability-aware soft-top-k region gap for every frame."""
     output = np.full(len(hand), np.nan, dtype=np.float32)
     for frame in range(len(hand)):
         gaps: list[float] = []
@@ -216,7 +235,30 @@ def fixed_region_bottleneck_distance_mm(
             pairwise = np.linalg.norm(
                 points[:, None] - targets[frame][None], axis=-1
             )
-            gaps.append(float(np.median(pairwise.min(axis=-1))) * 1000.0)
+            patch_count = min(max(1, patch_topk), pairwise.shape[-1])
+            nearest = np.partition(
+                pairwise, patch_count - 1, axis=-1
+            )[:, :patch_count]
+            distance_mm = np.sqrt(np.mean(nearest ** 2, axis=-1)) * 1000.0
+            normalized = np.clip(
+                (contact_probability[frame, selected] - probability_threshold)
+                / max(1.0 - probability_threshold, 1e-6),
+                0.0,
+                1.0,
+            )
+            weights = weight_floor + (1.0 - weight_floor) * (
+                normalized ** probability_power
+            )
+            selection_score = distance_mm - selection_sigma_mm * np.log(
+                np.maximum(weights, 1e-6)
+            )
+            count = min(max(1, vertex_topk), len(distance_mm))
+            chosen = np.argpartition(selection_score, count - 1)[:count]
+            gap = np.sqrt(np.average(
+                distance_mm[chosen] ** 2,
+                weights=weights[chosen],
+            ))
+            gaps.append(float(gap))
         if gaps:
             output[frame] = max(gaps)
     return output
@@ -587,10 +629,17 @@ def main() -> None:
                 current_contact_gap = fixed_region_bottleneck_distance_mm(
                     current_np,
                     contact_mask_np,
+                    probability_np,
                     contact_region_ids_np,
                     contact_region_names,
                     fixed_region_np,
                     args.contact_region_min_vertices,
+                    args.topk,
+                    args.fixed_contact_vertex_topk,
+                    threshold,
+                    args.contact_probability_power,
+                    args.contact_weight_floor,
+                    args.fixed_contact_selection_sigma_mm,
                 )
                 feasible = inside_count <= (
                     baseline_inside_count + args.best_state_inside_allowance
@@ -683,16 +732,45 @@ def main() -> None:
                     nearest = torch.topk(
                         distances, patch_topk, dim=-1, largest=False
                     ).values
+                    effective_distance = torch.sqrt(
+                        nearest.square().mean(dim=-1) + 1e-12
+                    )
                     error = torch.clamp(
-                        nearest - contact_target, min=0.0
-                    ).square().mean(dim=-1)
+                        effective_distance - contact_target, min=0.0
+                    ).square()
                     weights = contact_weight[indices][:, selected]
-                    region_weights = weights.sum(dim=-1)
+                    selection_sigma = (
+                        args.fixed_contact_selection_sigma_mm / 1000.0
+                    )
+                    selection_score = (
+                        effective_distance
+                        - selection_sigma * torch.log(weights.clamp_min(1e-6))
+                    ).masked_fill(weights <= 0, torch.inf)
+                    vertex_topk = min(
+                        max(1, args.fixed_contact_vertex_topk),
+                        selection_score.shape[-1],
+                    )
+                    selected_vertices = torch.topk(
+                        selection_score,
+                        vertex_topk,
+                        dim=-1,
+                        largest=False,
+                    ).indices
+                    selected_error = torch.gather(
+                        error, -1, selected_vertices
+                    )
+                    selected_weights = torch.gather(
+                        weights, -1, selected_vertices
+                    )
+                    region_weights = selected_weights.sum(dim=-1)
                     region_frame_losses.append(
-                        (error * weights).sum(dim=-1)
+                        (selected_error * selected_weights).sum(dim=-1)
                         / region_weights.clamp_min(1e-6)
                     )
-                    region_frame_active.append(region_weights > 1e-6)
+                    region_frame_active.append(
+                        (selected_weights > 0).sum(dim=-1)
+                        >= args.contact_region_min_vertices
+                    )
                 if region_frame_losses:
                     frame_losses = torch.stack(region_frame_losses, dim=-1)
                     frame_active = torch.stack(region_frame_active, dim=-1)
@@ -874,10 +952,17 @@ def main() -> None:
         candidate_contact_gap = fixed_region_bottleneck_distance_mm(
             final_candidate_np,
             contact_mask_np,
+            probability_np,
             contact_region_ids_np,
             contact_region_names,
             fixed_region_np,
             args.contact_region_min_vertices,
+            args.topk,
+            args.fixed_contact_vertex_topk,
+            threshold,
+            args.contact_probability_power,
+            args.contact_weight_floor,
+            args.fixed_contact_selection_sigma_mm,
         )
         improved_state = (
             (candidate_inside_count <= (
@@ -1008,6 +1093,13 @@ def main() -> None:
         "containment_refresh": args.containment_refresh,
         "containment_best_state": args.containment_best_state,
         "fixed_region_reduction": args.fixed_region_reduction,
+        "fixed_contact_vertex_selection": {
+            "vertex_topk": args.fixed_contact_vertex_topk,
+            "patch_topk": args.topk,
+            "selection_sigma_mm": args.fixed_contact_selection_sigma_mm,
+            "probability_power": args.contact_probability_power,
+            "weight_floor": args.contact_weight_floor,
+        },
         "best_state_selection": args.best_state_selection,
         "best_state_inside_allowance": args.best_state_inside_allowance,
         "best_fixed_region_bottleneck_gap_mm": distribution(
