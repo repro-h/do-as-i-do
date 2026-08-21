@@ -119,6 +119,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--correction-full-mm", type=float, default=18.0)
     parser.add_argument("--collision-margin-mm", type=float, default=0.5)
     parser.add_argument("--collision-stop-count", type=int, default=10)
+    parser.add_argument(
+        "--phase-average-inside-limit",
+        type=float,
+        help=(
+            "Select the best whole-sequence contact state whose mean number "
+            "of inside object vertices over phase-active frames stays within "
+            "this budget. Collision loss may remain disabled."
+        ),
+    )
     parser.add_argument("--correspondence-topk", type=int, default=8)
     parser.add_argument("--containment-refresh", type=int, default=25)
     parser.add_argument("--point-chunk", type=int, default=1024)
@@ -747,6 +756,73 @@ def main() -> None:
     best_contact_gap = np.full(frame_count, np.inf, dtype=np.float32)
     best_translation = torch.zeros((frame_count, 3), device=device)
     best_angles = torch.zeros((frame_count, 3), device=device)
+    phase_budget_mask = valid_np & (phase_gate_np > 0)
+    if args.phase_average_inside_limit is not None and not phase_budget_mask.any():
+        raise RuntimeError(
+            "--phase-average-inside-limit requires phase-active valid frames"
+        )
+    if args.phase_average_inside_limit is not None and not fixed_region_np:
+        raise RuntimeError(
+            "--phase-average-inside-limit requires --fixed-patch-npz"
+        )
+    best_phase_budget_score = math.inf
+    best_phase_budget_average = math.inf
+    best_phase_budget_translation: torch.Tensor | None = None
+    best_phase_budget_angles: torch.Tensor | None = None
+
+    def update_phase_budget_state(
+        hand_np: np.ndarray,
+        current_inside_count: np.ndarray,
+    ) -> None:
+        nonlocal best_phase_budget_score
+        nonlocal best_phase_budget_average
+        nonlocal best_phase_budget_translation
+        nonlocal best_phase_budget_angles
+        if args.phase_average_inside_limit is None:
+            return
+        average_inside = float(current_inside_count[phase_budget_mask].mean())
+        if average_inside > args.phase_average_inside_limit:
+            return
+        if args.opposition_frame_loss:
+            current_gap = opposition_frame_error_mm(
+                hand_np,
+                contact_mask_np,
+                probability_np,
+                contact_region_ids_np,
+                contact_region_names,
+                fixed_region_np,
+                args.contact_region_min_vertices,
+                threshold,
+                args.contact_probability_power,
+                args.contact_weight_floor,
+                args.opposition_axis_scale_mm,
+            )
+        else:
+            current_gap = fixed_region_bottleneck_distance_mm(
+                hand_np,
+                contact_mask_np,
+                probability_np,
+                contact_region_ids_np,
+                contact_region_names,
+                fixed_region_np,
+                args.contact_region_min_vertices,
+                args.topk,
+                args.fixed_contact_vertex_topk,
+                threshold,
+                args.contact_probability_power,
+                args.contact_weight_floor,
+                args.fixed_contact_selection_sigma_mm,
+            )
+        evaluated = phase_budget_mask & np.isfinite(current_gap)
+        if not evaluated.any():
+            return
+        score = float(current_gap[evaluated].mean())
+        if score >= best_phase_budget_score:
+            return
+        best_phase_budget_score = score
+        best_phase_budget_average = average_inside
+        best_phase_budget_translation = translation.detach().clone()
+        best_phase_budget_angles = angles.detach().clone()
 
     for step in range(1, args.steps + 1):
         if (step - 1) % args.containment_refresh == 0:
@@ -761,6 +837,7 @@ def main() -> None:
             inside_count = inside_mask.sum(axis=1).astype(np.int32)
             if baseline_inside_count is None:
                 baseline_inside_count = inside_count.copy()
+            update_phase_budget_state(current_np, inside_count)
             if args.best_state_selection == "contact_feasible":
                 if not fixed_region_np:
                     raise ValueError(
@@ -836,6 +913,11 @@ def main() -> None:
                 "frames_with_inside": int((inside_count > 0).sum()),
                 "collision_active_frames": int(
                     (inside_count > args.collision_stop_count).sum()
+                ),
+                "phase_average_inside": (
+                    float(inside_count[phase_budget_mask].mean())
+                    if phase_budget_mask.any()
+                    else None
                 ),
             }
             refresh_history.append(refresh)
@@ -1116,6 +1198,7 @@ def main() -> None:
     )
     candidate_inside_mask &= valid_np[:, None]
     candidate_inside_count = candidate_inside_mask.sum(axis=1).astype(np.int32)
+    update_phase_budget_state(final_candidate_np, candidate_inside_count)
     if args.best_state_selection == "contact_feasible":
         if baseline_inside_count is None:
             baseline_inside_count = candidate_inside_count.copy()
@@ -1171,7 +1254,17 @@ def main() -> None:
     initial_inside_count = initial_inside_mask.sum(axis=1).astype(np.int32)
     selected_translation = translation.detach().clone()
     selected_angles = angles.detach().clone()
-    if args.containment_best_state:
+    if args.phase_average_inside_limit is not None:
+        if (
+            best_phase_budget_translation is None
+            or best_phase_budget_angles is None
+        ):
+            raise RuntimeError(
+                "No optimization state satisfied --phase-average-inside-limit"
+            )
+        selected_translation = best_phase_budget_translation
+        selected_angles = best_phase_budget_angles
+    elif args.containment_best_state:
         protected = correction_support_np & valid_np
         protected_tensor = torch.from_numpy(protected).to(device)
         selected_translation[protected_tensor] = best_translation[
@@ -1335,6 +1428,21 @@ def main() -> None:
         },
         "best_state_selection": args.best_state_selection,
         "best_state_inside_allowance": args.best_state_inside_allowance,
+        "phase_average_inside_budget": {
+            "enabled": args.phase_average_inside_limit is not None,
+            "limit": args.phase_average_inside_limit,
+            "selected_average": (
+                float(final_inside_count[phase_budget_mask].mean())
+                if phase_budget_mask.any()
+                else None
+            ),
+            "selected_contact_score_mm": (
+                best_phase_budget_score
+                if math.isfinite(best_phase_budget_score)
+                else None
+            ),
+            "selected_phase_frames": int(phase_budget_mask.sum()),
+        },
         "best_fixed_region_bottleneck_gap_mm": distribution(
             best_contact_gap[np.isfinite(best_contact_gap)]
         ),
