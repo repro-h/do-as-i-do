@@ -305,8 +305,8 @@ def main() -> None:
                 handles.append(server.scene.add_point_cloud(
                     f"/haco_anchor/{name}",
                     points=hand[index, anchor_ids],
-                    colors=colors(anchor_count, (255, 255, 255)),
-                    point_size=float(point_size.value) * 1.35,
+                    colors=colors(anchor_count, (20, 20, 20)),
+                    point_size=float(point_size.value) * 1.5,
                 ))
             if name not in patches:
                 continue
