@@ -44,6 +44,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8098)
     parser.add_argument("--haco-anchor-topk", type=int, default=12)
     parser.add_argument("--haco-anchor-min-vertices", type=int, default=3)
+    parser.add_argument(
+        "--region-selection",
+        choices=("auto", "selected", "stable", "translation_consistent"),
+        default="auto",
+        help="Choose which region-name set from the selection archive to display.",
+    )
     return parser.parse_args()
 
 
@@ -125,12 +131,22 @@ def main() -> None:
         )
         for supervision_index in supervision_indices
     ]
-    region_key = (
-        "stable_region_names"
-        if "stable_region_names" in selection
-        and len(selection["stable_region_names"])
-        else "selected_region_names"
-    )
+    requested_region_key = {
+        "selected": "selected_region_names",
+        "stable": "stable_region_names",
+        "translation_consistent": "translation_consistent_region_names",
+    }.get(args.region_selection)
+    if requested_region_key is not None:
+        if requested_region_key not in selection:
+            raise KeyError(f"Selection archive lacks {requested_region_key!r}")
+        region_key = requested_region_key
+    else:
+        region_key = (
+            "stable_region_names"
+            if "stable_region_names" in selection
+            and len(selection["stable_region_names"])
+            else "selected_region_names"
+        )
     selected_regions = [str(value) for value in selection[region_key]]
     print(
         f"[viser] fixed patch regions ({region_key}): "
