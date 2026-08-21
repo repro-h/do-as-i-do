@@ -104,6 +104,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mano-data-dir")
     parser.add_argument("--fixed-patch-npz")
     parser.add_argument(
+        "--fixed-region-selection",
+        choices=("auto", "translation_consistent", "stable", "selected"),
+        default="auto",
+        help=(
+            "Choose which region-name set to consume from the fixed-patch "
+            "archive. Auto prefers translation-consistent regions."
+        ),
+    )
+    parser.add_argument(
         "--fixed-contact-source",
         choices=("patch", "candidate_surface"),
         default="patch",
@@ -555,7 +564,40 @@ def main() -> None:
         fixed_patch = load_npz(
             Path(args.fixed_patch_npz).expanduser().resolve()
         )
-        if (
+        if args.fixed_region_selection == "translation_consistent":
+            if (
+                "translation_consistent_region_names" not in fixed_patch
+                or not len(fixed_patch["translation_consistent_region_names"])
+            ):
+                raise RuntimeError(
+                    "Fixed patch archive has no translation-consistent regions"
+                )
+            fixed_region_selection_key = "translation_consistent_region_names"
+            fixed_region_names = [
+                str(value)
+                for value in fixed_patch["translation_consistent_region_names"]
+            ]
+        elif args.fixed_region_selection == "stable":
+            if (
+                "stable_region_names" not in fixed_patch
+                or not len(fixed_patch["stable_region_names"])
+            ):
+                raise RuntimeError("Fixed patch archive has no stable regions")
+            fixed_region_selection_key = "stable_region_names"
+            fixed_region_names = [
+                str(value) for value in fixed_patch["stable_region_names"]
+            ]
+        elif args.fixed_region_selection == "selected":
+            if (
+                "selected_region_names" not in fixed_patch
+                or not len(fixed_patch["selected_region_names"])
+            ):
+                raise RuntimeError("Fixed patch archive has no selected regions")
+            fixed_region_selection_key = "selected_region_names"
+            fixed_region_names = [
+                str(value) for value in fixed_patch["selected_region_names"]
+            ]
+        elif (
             "translation_consistent_region_names" in fixed_patch
             and len(fixed_patch["translation_consistent_region_names"])
         ):
