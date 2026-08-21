@@ -428,6 +428,9 @@ def main() -> None:
     object_local = np.asarray(mesh.vertices, dtype=np.float32)
     object_faces = np.asarray(mesh.faces, dtype=np.int64)
     object_normals_local = np.asarray(mesh.vertex_normals, dtype=np.float32)
+    object_normals_local /= np.maximum(
+        np.linalg.norm(object_normals_local, axis=-1, keepdims=True), 1e-12
+    )
     object_sparse_graph = mesh_graph(object_local, object_faces)
     normalized_left = bool(
         np.asarray(supervision.get("normalized_left", False)).item()
@@ -796,6 +799,7 @@ def main() -> None:
         str(row["region"]) for row in selected_regions if bool(row["stable"])
     ]
     translation_consistent_names: list[str] = []
+    stable_opposition_pairs: list[tuple[int, int, float, float]] = []
     if stable_names:
         stable_votes = np.stack([
             region_translation_votes[name] for name in stable_names
@@ -803,14 +807,51 @@ def main() -> None:
         vote_pairwise = np.linalg.norm(
             stable_votes[:, None] - stable_votes[None], axis=-1
         )
-        vote_clusters = clusters_from_distances(
-            vote_pairwise, args.translation_vote_cluster_mm / 1000.0
-        )
-        cluster_weights = np.asarray([
-            sum(region_vote_weights[stable_names[int(index)]] for index in cluster)
-            for cluster in vote_clusters
-        ])
-        dominant_vote_cluster = vote_clusters[int(np.argmax(cluster_weights))]
+        vote_limit = args.translation_vote_cluster_mm / 1000.0
+        for first in range(len(stable_names)):
+            first_normal = object_normals_local[
+                region_center_ids[stable_names[first]]
+            ]
+            for second in range(first + 1, len(stable_names)):
+                second_normal = object_normals_local[
+                    region_center_ids[stable_names[second]]
+                ]
+                normal_dot = float(first_normal @ second_normal)
+                vote_difference_mm = float(
+                    vote_pairwise[first, second] * 1000.0
+                )
+                if (
+                    normal_dot <= args.auto_opposition_max_normal_dot
+                    and vote_difference_mm
+                    <= args.auto_opposition_max_vote_difference_mm
+                ):
+                    stable_opposition_pairs.append((
+                        first, second, normal_dot, vote_difference_mm
+                    ))
+
+        candidate_clusters: list[np.ndarray] = []
+        for bits in range(1, 1 << len(stable_names)):
+            cluster = np.asarray([
+                index for index in range(len(stable_names))
+                if bits & (1 << index)
+            ], dtype=np.int64)
+            pairwise = vote_pairwise[np.ix_(cluster, cluster)]
+            if np.all(pairwise <= vote_limit + 1e-12):
+                candidate_clusters.append(cluster)
+
+        def cluster_score(cluster: np.ndarray) -> tuple[int, float, int]:
+            members = set(int(index) for index in cluster)
+            opposition_count = sum(
+                first in members and second in members
+                for first, second, _, _ in stable_opposition_pairs
+            )
+            weight = sum(
+                region_vote_weights[stable_names[int(index)]]
+                for index in cluster
+            )
+            return opposition_count, float(weight), len(cluster)
+
+        dominant_vote_cluster = max(candidate_clusters, key=cluster_score)
         translation_consistent_names = [
             stable_names[int(index)] for index in dominant_vote_cluster
         ]
@@ -818,26 +859,15 @@ def main() -> None:
     automatic_opposition_pairs: list[list[str]] = []
     automatic_opposition_normal_dot: list[float] = []
     automatic_opposition_vote_difference_mm: list[float] = []
-    for first_offset, first_name in enumerate(translation_consistent_names):
-        first_normal = object_normals_local[region_center_ids[first_name]]
-        first_vote = region_translation_votes[first_name]
-        for second_name in translation_consistent_names[first_offset + 1:]:
-            second_normal = object_normals_local[region_center_ids[second_name]]
-            second_vote = region_translation_votes[second_name]
-            normal_dot = float(first_normal @ second_normal)
-            vote_difference_mm = float(
-                np.linalg.norm(first_vote - second_vote) * 1000.0
-            )
-            if (
-                normal_dot <= args.auto_opposition_max_normal_dot
-                and vote_difference_mm
-                <= args.auto_opposition_max_vote_difference_mm
-            ):
-                automatic_opposition_pairs.append([first_name, second_name])
-                automatic_opposition_normal_dot.append(normal_dot)
-                automatic_opposition_vote_difference_mm.append(
-                    vote_difference_mm
-                )
+    consistent_lookup = set(translation_consistent_names)
+    for first, second, normal_dot, vote_difference_mm in stable_opposition_pairs:
+        first_name = stable_names[first]
+        second_name = stable_names[second]
+        if first_name not in consistent_lookup or second_name not in consistent_lookup:
+            continue
+        automatic_opposition_pairs.append([first_name, second_name])
+        automatic_opposition_normal_dot.append(normal_dot)
+        automatic_opposition_vote_difference_mm.append(vote_difference_mm)
 
     output_arrays["selected_region_names"] = np.asarray(selected_names)
     output_arrays["stable_region_names"] = np.asarray(stable_names)
