@@ -17,6 +17,7 @@ from select_haco_multiregion_object_contacts_sequence import (
     adjacency,
     select_hand_vertices_key,
     strongest_components,
+    vertex_normals,
 )
 from visualize_haco_choir_opposition_candidates import (
     frame_id,
@@ -42,6 +43,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--port", type=int, default=8098)
     return parser.parse_args()
+
+
+def probability_colors(values: np.ndarray, threshold: float) -> np.ndarray:
+    normalized = np.clip(
+        (values - threshold) / max(1.0 - threshold, 1e-6), 0.0, 1.0
+    )
+    red = np.clip(2.0 * normalized, 0.0, 1.0)
+    green = np.clip(2.0 - 2.0 * np.abs(normalized - 0.5), 0.0, 1.0)
+    blue = np.clip(2.0 * (1.0 - normalized), 0.0, 1.0)
+    return np.rint(np.stack([red, green, blue], axis=-1) * 255).astype(np.uint8)
 
 
 def main() -> None:
@@ -183,6 +194,12 @@ def main() -> None:
     show_object = server.gui.add_checkbox("GT YCB object", initial_value=True)
     show_hand = server.gui.add_checkbox(hand_label, initial_value=True)
     show_haco = server.gui.add_checkbox("HACO components", initial_value=True)
+    probability_heatmap = server.gui.add_checkbox(
+        "HACO probability heatmap", initial_value=True
+    )
+    patch_facing_only = server.gui.add_checkbox(
+        "Patch-facing HACO only", initial_value=False
+    )
     show_patches = server.gui.add_checkbox("Fixed object patches", initial_value=True)
     show_observations = server.gui.add_checkbox(
         "Sampled frame observations", initial_value=True
@@ -204,6 +221,7 @@ def main() -> None:
         clear()
         pose = poses[index]
         object_vertices = object_local @ pose[:3, :3].T + pose[:3, 3]
+        hand_normals = vertex_normals(hand[index], hand_faces)
         requested = frame_id(ids[index])
         if show_object.value:
             handles.append(server.scene.add_mesh_simple(
@@ -230,13 +248,46 @@ def main() -> None:
             component = strongest_components(
                 raw_mask, mano_graph, probability[index], 1
             ) if raw_mask.any() else raw_mask
+            displayed_component = component.copy()
+            compatibility = np.full(len(hand[index]), np.nan, dtype=np.float32)
+            if name in patches and component.any():
+                patch_normals_key = f"{name}_patch_normals_canonical"
+                if patch_normals_key in selection:
+                    patch_normal = np.asarray(
+                        selection[patch_normals_key], dtype=np.float32
+                    ).mean(axis=0) @ pose[:3, :3].T
+                    patch_normal /= max(float(np.linalg.norm(patch_normal)), 1e-12)
+                    compatibility[component] = (
+                        hand_normals[component] @ patch_normal
+                    )
+                    if patch_facing_only.value:
+                        displayed_component &= compatibility <= -0.2
             if show_haco.value and component.any():
-                handles.append(server.scene.add_point_cloud(
-                    f"/haco/{name}",
-                    points=hand[index, component],
-                    colors=colors(int(component.sum()), lighter(color)),
-                    point_size=float(point_size.value) * 0.75,
-                ))
+                displayed_probability = probability[index, displayed_component]
+                point_colors = (
+                    probability_colors(displayed_probability, threshold)
+                    if probability_heatmap.value
+                    else colors(int(displayed_component.sum()), lighter(color))
+                )
+                if displayed_component.any():
+                    handles.append(server.scene.add_point_cloud(
+                        f"/haco/{name}",
+                        points=hand[index, displayed_component],
+                        colors=point_colors,
+                        point_size=float(point_size.value) * 0.75,
+                    ))
+                compatible = component & (compatibility <= -0.2)
+                incompatible = component & np.isfinite(compatibility) & ~compatible
+                if compatible.any() or incompatible.any():
+                    compatible_probability = probability[index, compatible]
+                    incompatible_probability = probability[index, incompatible]
+                    print(
+                        f"  {name}: facing={int(compatible.sum())} "
+                        f"p50={float(np.median(compatible_probability)) if compatible.any() else float('nan'):.3f} "
+                        f"other={int(incompatible.sum())} "
+                        f"p50={float(np.median(incompatible_probability)) if incompatible.any() else float('nan'):.3f}",
+                        flush=True,
+                    )
             if name not in patches:
                 continue
             patch_camera = patches[name] @ pose[:3, :3].T + pose[:3, 3]
@@ -303,6 +354,8 @@ def main() -> None:
         show_object,
         show_hand,
         show_haco,
+        probability_heatmap,
+        patch_facing_only,
         show_patches,
         show_observations,
         show_votes,
