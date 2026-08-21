@@ -64,6 +64,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-correction-mm", type=float, default=60.0)
     parser.add_argument("--contact-target-mm", type=float, default=6.0)
     parser.add_argument("--contact-tolerance-mm", type=float, default=1.0)
+    parser.add_argument("--contact-probability-power", type=float, default=2.0)
+    parser.add_argument("--region-support-power", type=float, default=0.5)
+    parser.add_argument("--minimum-region-weight", type=float, default=0.25)
     parser.add_argument(
         "--region-reduction",
         choices=("median", "max"),
@@ -76,6 +79,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inside-low-fraction", type=float, default=0.002)
     parser.add_argument("--inside-high-fraction", type=float, default=0.01)
     parser.add_argument("--collision-object-samples", type=int, default=2048)
+    parser.add_argument(
+        "--inside-allowance-count",
+        type=int,
+        default=8,
+        help=(
+            "Per-frame sampled containment budget. States within max(initial, "
+            "allowance) may improve contact; above it collision dominates."
+        ),
+    )
     parser.add_argument("--temporal-step-weight", type=float, default=0.2)
     parser.add_argument("--contact-step-scale", type=float, default=0.5)
     parser.add_argument("--minimum-contact-vertices", type=int, default=3)
@@ -106,71 +118,94 @@ def smoothstep(low: float, high: float, values: np.ndarray) -> np.ndarray:
     return scaled * scaled * (3.0 - 2.0 * scaled)
 
 
+def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+    order = np.argsort(values)
+    ordered_values = values[order]
+    ordered_weights = weights[order]
+    cutoff = 0.5 * float(ordered_weights.sum())
+    index = int(np.searchsorted(np.cumsum(ordered_weights), cutoff, side="left"))
+    return float(ordered_values[min(index, len(ordered_values) - 1)])
+
+
 def region_contact_feedback(
     hand: np.ndarray,
     contact_mask: np.ndarray,
+    contact_probability: np.ndarray,
     region_ids: np.ndarray,
     fixed_regions: dict[str, np.ndarray],
     region_names: list[str],
     target_mm: float,
     minimum_vertices: int,
     ray: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
+    probability_power: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     gaps = np.full(len(region_names), np.nan, dtype=np.float32)
     projected = np.full(len(region_names), np.nan, dtype=np.float32)
+    support = np.zeros(len(region_names), dtype=np.float32)
     for name, patch in fixed_regions.items():
         region_index = region_names.index(name)
         selected = contact_mask & (region_ids == region_index)
         if int(selected.sum()) < minimum_vertices or not len(patch):
             continue
         points = hand[selected]
+        probability = np.clip(contact_probability[selected], 1e-6, 1.0)
+        weights = probability ** probability_power
         pairwise = np.linalg.norm(
             points[:, None] - patch[None], axis=-1
         )
         nearest_index = pairwise.argmin(axis=1)
         nearest = patch[nearest_index]
         distance_mm = pairwise[np.arange(len(points)), nearest_index] * 1000.0
-        gap = float(np.median(distance_mm))
+        gap = weighted_median(distance_mm, weights)
         gaps[region_index] = gap
         ray_delta_mm = (nearest - points) @ ray * 1000.0
-        projected[region_index] = float(np.median(ray_delta_mm))
-    return gaps, projected
+        projected[region_index] = weighted_median(ray_delta_mm, weights)
+        support[region_index] = float(weights.sum())
+    return gaps, projected, support
 
 
 def feedback_all_frames(
     hand: np.ndarray,
     contact_mask: np.ndarray,
+    contact_probability: np.ndarray,
     region_ids: np.ndarray,
     fixed_region_camera: dict[str, np.ndarray],
     region_names: list[str],
     rays: np.ndarray,
     target_mm: float,
     minimum_vertices: int,
-) -> tuple[np.ndarray, np.ndarray]:
+    probability_power: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     gaps = np.full((len(hand), len(region_names)), np.nan, dtype=np.float32)
     projected = np.full_like(gaps, np.nan)
+    support = np.zeros_like(gaps)
     for index in range(len(hand)):
         patches = {
             name: values[index] for name, values in fixed_region_camera.items()
         }
-        gaps[index], projected[index] = region_contact_feedback(
+        gaps[index], projected[index], support[index] = region_contact_feedback(
             hand[index],
             contact_mask[index],
+            contact_probability[index],
             region_ids,
             patches,
             region_names,
             target_mm,
             minimum_vertices,
             rays[index],
+            probability_power,
         )
-    return gaps, projected
+    return gaps, projected, support
 
 
 def reduce_region_feedback(
     gaps: np.ndarray,
     projected: np.ndarray,
+    support: np.ndarray,
     target_mm: float,
     reduction: str,
+    support_power: float,
+    minimum_region_weight: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     valid = np.isfinite(gaps)
     active = valid.sum(axis=1).astype(np.int32)
@@ -179,7 +214,13 @@ def reduce_region_feedback(
     for index in np.flatnonzero(active):
         values = gaps[index, valid[index]]
         if reduction == "max":
-            local = int(np.argmax(values))
+            strengths = support[index, valid[index]]
+            strengths /= max(float(strengths.max()), 1e-12)
+            strengths = np.maximum(
+                strengths ** support_power, minimum_region_weight
+            )
+            violation = np.maximum(values - target_mm, 0.0) * strengths
+            local = int(np.argmax(violation))
             region_index = np.flatnonzero(valid[index])[local]
             aggregate[index] = values[local]
             if values[local] > target_mm:
@@ -259,6 +300,9 @@ def main() -> None:
     contact_mask = np.asarray(
         contact["contact_mask"][contact_indices]
     ).astype(bool)
+    contact_probability = np.asarray(
+        contact["contact_probability"][contact_indices], dtype=np.float32
+    )
     valid = (
         np.asarray(query["model_valid"]).astype(bool)
         & np.asarray(trajectory["prediction_valid"][trajectory_indices]).astype(bool)
@@ -349,47 +393,79 @@ def main() -> None:
     probe_m = args.probe_mm / 1000.0
     history: list[dict[str, object]] = []
 
-    initial_region_gaps, initial_region_projected = feedback_all_frames(
+    initial_region_gaps, initial_region_projected, initial_region_support = feedback_all_frames(
         hand,
         contact_mask,
+        contact_probability,
         region_ids,
         fixed_region_camera,
         region_names,
         rays,
         args.contact_target_mm,
         args.minimum_contact_vertices,
+        args.contact_probability_power,
     )
     initial_gaps, _, active_regions = reduce_region_feedback(
         initial_region_gaps,
         initial_region_projected,
+        initial_region_support,
         args.contact_target_mm,
         args.region_reduction,
+        args.region_support_power,
+        args.minimum_region_weight,
     )
     initial_sampled_inside = sampled_inside_counts(
         hand, faces, object_sample_camera, boundary, device, args.point_chunk
     )
+    inside_budget = np.maximum(
+        initial_sampled_inside,
+        np.full(len(ids), args.inside_allowance_count, dtype=np.int32),
+    )
+    best_offsets_mm = offsets_mm.copy()
+    best_gap = initial_gaps.copy()
+    best_inside = initial_sampled_inside.copy()
 
     for iteration in range(1, args.iterations + 1):
         current = shifted_hand(hand, rays, offsets_mm / 1000.0)
-        current_region_gap, current_region_projected = feedback_all_frames(
+        current_region_gap, current_region_projected, current_region_support = feedback_all_frames(
             current,
             contact_mask,
+            contact_probability,
             region_ids,
             fixed_region_camera,
             region_names,
             rays,
             args.contact_target_mm,
             args.minimum_contact_vertices,
+            args.contact_probability_power,
         )
         current_gap, contact_delta, active_regions = reduce_region_feedback(
             current_region_gap,
             current_region_projected,
+            current_region_support,
             args.contact_target_mm,
             args.region_reduction,
+            args.region_support_power,
+            args.minimum_region_weight,
         )
         current_inside = sampled_inside_counts(
             current, faces, object_sample_camera, boundary, device, args.point_chunk
         )
+        feasible = active & (current_inside <= inside_budget)
+        better_contact = feasible & np.isfinite(current_gap) & (
+            ~np.isfinite(best_gap) | (current_gap < best_gap - 1e-4)
+        )
+        equal_contact = (
+            feasible
+            & np.isfinite(current_gap)
+            & np.isfinite(best_gap)
+            & (np.abs(current_gap - best_gap) <= 1e-4)
+            & (current_inside < best_inside)
+        )
+        update_best = better_contact | equal_contact
+        best_offsets_mm[update_best] = offsets_mm[update_best]
+        best_gap[update_best] = current_gap[update_best]
+        best_inside[update_best] = current_inside[update_best]
         plus = shifted_hand(
             hand, rays, (offsets_mm / 1000.0) + probe_m
         )
@@ -402,37 +478,47 @@ def main() -> None:
         minus_inside = sampled_inside_counts(
             minus, faces, object_sample_camera, boundary, device, args.point_chunk
         )
-        plus_region_gap, plus_region_projected = feedback_all_frames(
+        plus_region_gap, plus_region_projected, plus_region_support = feedback_all_frames(
             plus,
             contact_mask,
+            contact_probability,
             region_ids,
             fixed_region_camera,
             region_names,
             rays,
             args.contact_target_mm,
             args.minimum_contact_vertices,
+            args.contact_probability_power,
         )
-        minus_region_gap, minus_region_projected = feedback_all_frames(
+        minus_region_gap, minus_region_projected, minus_region_support = feedback_all_frames(
             minus,
             contact_mask,
+            contact_probability,
             region_ids,
             fixed_region_camera,
             region_names,
             rays,
             args.contact_target_mm,
             args.minimum_contact_vertices,
+            args.contact_probability_power,
         )
         plus_gap, _, _ = reduce_region_feedback(
             plus_region_gap,
             plus_region_projected,
+            plus_region_support,
             args.contact_target_mm,
             args.region_reduction,
+            args.region_support_power,
+            args.minimum_region_weight,
         )
         minus_gap, _, _ = reduce_region_feedback(
             minus_region_gap,
             minus_region_projected,
+            minus_region_support,
             args.contact_target_mm,
             args.region_reduction,
+            args.region_support_power,
+            args.minimum_region_weight,
         )
 
         collision_direction = np.zeros(len(ids), dtype=np.float32)
@@ -507,30 +593,72 @@ def main() -> None:
             "collision_dominant_frames": int(
                 (active & (collision_gate >= 0.5)).sum()
             ),
+            "budget_feasible_frames": int(feasible.sum()),
         }
         history.append(row)
         if iteration == 1 or iteration % 5 == 0 or iteration == args.iterations:
             print(row, flush=True)
 
+    final = shifted_hand(hand, rays, offsets_mm / 1000.0)
+    final_region_gap, final_region_projected, final_region_support = (
+        feedback_all_frames(
+            final,
+            contact_mask,
+            contact_probability,
+            region_ids,
+            fixed_region_camera,
+            region_names,
+            rays,
+            args.contact_target_mm,
+            args.minimum_contact_vertices,
+            args.contact_probability_power,
+        )
+    )
+    final_gap, _, _ = reduce_region_feedback(
+        final_region_gap,
+        final_region_projected,
+        final_region_support,
+        args.contact_target_mm,
+        args.region_reduction,
+        args.region_support_power,
+        args.minimum_region_weight,
+    )
+    final_inside = sampled_inside_counts(
+        final, faces, object_sample_camera, boundary, device, args.point_chunk
+    )
+    final_feasible = active & (final_inside <= inside_budget)
+    final_better = final_feasible & np.isfinite(final_gap) & (
+        ~np.isfinite(best_gap) | (final_gap < best_gap - 1e-4)
+    )
+    best_offsets_mm[final_better] = offsets_mm[final_better]
+    best_gap[final_better] = final_gap[final_better]
+    best_inside[final_better] = final_inside[final_better]
+    offsets_mm = best_offsets_mm
+
     refined = shifted_hand(hand, rays, offsets_mm / 1000.0).astype(np.float32)
     refined_wrist = (
         wrist + offsets_mm[:, None] / 1000.0 * rays
     ).astype(np.float32)
-    refined_region_gaps, refined_region_projected = feedback_all_frames(
+    refined_region_gaps, refined_region_projected, refined_region_support = feedback_all_frames(
         refined,
         contact_mask,
+        contact_probability,
         region_ids,
         fixed_region_camera,
         region_names,
         rays,
         args.contact_target_mm,
         args.minimum_contact_vertices,
+        args.contact_probability_power,
     )
     refined_gaps, _, refined_active_regions = reduce_region_feedback(
         refined_region_gaps,
         refined_region_projected,
+        refined_region_support,
         args.contact_target_mm,
         args.region_reduction,
+        args.region_support_power,
+        args.minimum_region_weight,
     )
     initial_inside_mask, initial_inside = exact_inside_counts(
         hand, faces, object_full_camera, boundary, device, args.point_chunk
@@ -611,6 +739,10 @@ def main() -> None:
             "contact_tolerance_mm": args.contact_tolerance_mm,
             "region_reduction": args.region_reduction,
             "collision_object_samples": sample_count,
+            "inside_allowance_count": args.inside_allowance_count,
+            "contact_probability_power": args.contact_probability_power,
+            "region_support_power": args.region_support_power,
+            "minimum_region_weight": args.minimum_region_weight,
         },
         "history": history,
         "warning": (
