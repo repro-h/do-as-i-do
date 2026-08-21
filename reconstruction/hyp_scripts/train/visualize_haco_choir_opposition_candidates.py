@@ -54,6 +54,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-axis-cosine", type=float, default=0.35)
     parser.add_argument("--w-midpoint", type=float, default=2.0)
     parser.add_argument("--w-axis", type=float, default=20.0)
+    parser.add_argument("--w-width", type=float, default=0.5)
+    parser.add_argument(
+        "--translation-invariant",
+        action="store_true",
+        help=(
+            "Select the pair from relative finger geometry, 2D evidence and "
+            "surface normals without using unreliable absolute hand depth."
+        ),
+    )
+    parser.add_argument(
+        "--max-pair-normal-dot",
+        type=float,
+        default=1.0,
+        help="Reject pairs whose object surface normals are not opposed enough.",
+    )
     parser.add_argument("--patch-radius-mm", type=float, default=8.0)
     parser.add_argument("--patch-normal-cosine", type=float, default=0.7)
     parser.add_argument("--out-npz")
@@ -338,23 +353,31 @@ def main() -> None:
         thumb_pixel_distance[thumb_candidates, None]
         + index_pixel_distance[index_candidates][None]
     )
+    width_change_mm = np.abs(width - hand_width) * 1000.0
     score = (
-        distance_mm
-        + args.w_pixel * pixel_distance
+        args.w_pixel * pixel_distance
         + args.w_opposition * opposition
-        + args.w_facing * facing
-        + args.w_midpoint * midpoint_shift * 1000.0
+        + args.w_facing * (2.0 - facing)
         + args.w_axis * axis_error
+        + args.w_width * width_change_mm
     )
+    if not args.translation_invariant:
+        score = (
+            score
+            + distance_mm
+            + args.w_midpoint * midpoint_shift * 1000.0
+        )
     invalid_width = (width <= 1e-4) | (
         width * 1000.0 > args.max_pair_width_mm
     )
     invalid = (
         invalid_width
-        | (midpoint_shift * 1000.0 > args.max_midpoint_shift_mm)
-        | (np.abs(width - hand_width) * 1000.0 > args.max_width_change_mm)
+        | (normal_dot > args.max_pair_normal_dot)
+        | (width_change_mm > args.max_width_change_mm)
         | (axis_cosine < args.min_axis_cosine)
     )
+    if not args.translation_invariant:
+        invalid |= midpoint_shift * 1000.0 > args.max_midpoint_shift_mm
     score[invalid] = np.inf
     flat = int(np.argmin(score))
     thumb_choice, index_choice = np.unravel_index(flat, score.shape)
@@ -398,6 +421,10 @@ def main() -> None:
             midpoint_shift[thumb_choice, index_choice] * 1000.0
         ),
         "selected_axis_cosine": float(axis_cosine[thumb_choice, index_choice]),
+        "translation_invariant": args.translation_invariant,
+        "selected_width_change_mm": float(
+            width_change_mm[thumb_choice, index_choice]
+        ),
         "hand_contact_width_mm": float(hand_width * 1000.0),
         "selected_thumb_choir_mm": float(
             thumb_distance[thumb_candidates[thumb_choice]] * 1000.0
