@@ -117,6 +117,14 @@ def parse_args() -> argparse.Namespace:
         "--opposition-auxiliary-contact-weight", type=float, default=0.25
     )
     parser.add_argument(
+        "--opposition-include-pair-contact",
+        action="store_true",
+        help=(
+            "Also apply direct fixed-patch distance loss to the opposition "
+            "pair endpoints instead of constraining only their midpoint/axis."
+        ),
+    )
+    parser.add_argument(
         "--opposition-axis-scale-mm",
         type=float,
         default=20.0,
@@ -1188,7 +1196,11 @@ def main() -> None:
                         args.fixed_contact_selection_sigma_mm / 1000.0,
                         args.fixed_region_reduction,
                         args.fixed_contact_selection,
-                        set(opposition_pair),
+                        (
+                            set()
+                            if args.opposition_include_pair_contact
+                            else set(opposition_pair)
+                        ),
                     )
                     chunk_contact = (
                         chunk_contact
@@ -1639,6 +1651,7 @@ def main() -> None:
             ),
             "pair": list(opposition_pair) if use_opposition_loss else None,
             "auxiliary_contact_weight": args.opposition_auxiliary_contact_weight,
+            "include_pair_contact": args.opposition_include_pair_contact,
             "axis_scale_mm": args.opposition_axis_scale_mm,
             "vertex_topk": args.opposition_vertex_topk,
             "audit": opposition_summary,
