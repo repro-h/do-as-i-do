@@ -63,6 +63,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-step-mm", type=float, default=3.0)
     parser.add_argument("--max-correction-mm", type=float, default=60.0)
     parser.add_argument("--contact-target-mm", type=float, default=6.0)
+    parser.add_argument("--contact-tolerance-mm", type=float, default=1.0)
+    parser.add_argument(
+        "--region-reduction",
+        choices=("median", "max"),
+        default="max",
+        help=(
+            "Aggregate active HACO regions per frame. 'max' makes the most "
+            "distant region drive wrist-ray correction."
+        ),
+    )
     parser.add_argument("--inside-low-fraction", type=float, default=0.002)
     parser.add_argument("--inside-high-fraction", type=float, default=0.01)
     parser.add_argument("--collision-object-samples", type=int, default=2048)
@@ -105,10 +115,9 @@ def region_contact_feedback(
     target_mm: float,
     minimum_vertices: int,
     ray: np.ndarray,
-) -> tuple[float, float, int]:
-    gaps: list[float] = []
-    projected: list[float] = []
-    active_regions = 0
+) -> tuple[np.ndarray, np.ndarray]:
+    gaps = np.full(len(region_names), np.nan, dtype=np.float32)
+    projected = np.full(len(region_names), np.nan, dtype=np.float32)
     for name, patch in fixed_regions.items():
         region_index = region_names.index(name)
         selected = contact_mask & (region_ids == region_index)
@@ -122,15 +131,10 @@ def region_contact_feedback(
         nearest = patch[nearest_index]
         distance_mm = pairwise[np.arange(len(points)), nearest_index] * 1000.0
         gap = float(np.median(distance_mm))
-        gaps.append(gap)
-        active_regions += 1
-        if gap > target_mm:
-            ray_delta_mm = (nearest - points) @ ray * 1000.0
-            projected.append(float(np.median(ray_delta_mm)))
-    if not gaps:
-        return float("nan"), 0.0, 0
-    contact_delta = float(np.median(projected)) if projected else 0.0
-    return float(np.median(gaps)), contact_delta, active_regions
+        gaps[region_index] = gap
+        ray_delta_mm = (nearest - points) @ ray * 1000.0
+        projected[region_index] = float(np.median(ray_delta_mm))
+    return gaps, projected
 
 
 def feedback_all_frames(
@@ -142,15 +146,14 @@ def feedback_all_frames(
     rays: np.ndarray,
     target_mm: float,
     minimum_vertices: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    gaps = np.full(len(hand), np.nan, dtype=np.float32)
-    deltas = np.zeros(len(hand), dtype=np.float32)
-    active = np.zeros(len(hand), dtype=np.int32)
+) -> tuple[np.ndarray, np.ndarray]:
+    gaps = np.full((len(hand), len(region_names)), np.nan, dtype=np.float32)
+    projected = np.full_like(gaps, np.nan)
     for index in range(len(hand)):
         patches = {
             name: values[index] for name, values in fixed_region_camera.items()
         }
-        gaps[index], deltas[index], active[index] = region_contact_feedback(
+        gaps[index], projected[index] = region_contact_feedback(
             hand[index],
             contact_mask[index],
             region_ids,
@@ -160,7 +163,33 @@ def feedback_all_frames(
             minimum_vertices,
             rays[index],
         )
-    return gaps, deltas, active
+    return gaps, projected
+
+
+def reduce_region_feedback(
+    gaps: np.ndarray,
+    projected: np.ndarray,
+    target_mm: float,
+    reduction: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    valid = np.isfinite(gaps)
+    active = valid.sum(axis=1).astype(np.int32)
+    aggregate = np.full(len(gaps), np.nan, dtype=np.float32)
+    delta = np.zeros(len(gaps), dtype=np.float32)
+    for index in np.flatnonzero(active):
+        values = gaps[index, valid[index]]
+        if reduction == "max":
+            local = int(np.argmax(values))
+            region_index = np.flatnonzero(valid[index])[local]
+            aggregate[index] = values[local]
+            if values[local] > target_mm:
+                delta[index] = projected[index, region_index]
+        else:
+            aggregate[index] = float(np.median(values))
+            pulling = valid[index] & (gaps[index] > target_mm)
+            if pulling.any():
+                delta[index] = float(np.nanmedian(projected[index, pulling]))
+    return aggregate, delta, active
 
 
 def sampled_inside_counts(
@@ -320,7 +349,7 @@ def main() -> None:
     probe_m = args.probe_mm / 1000.0
     history: list[dict[str, object]] = []
 
-    initial_gaps, _, active_regions = feedback_all_frames(
+    initial_region_gaps, initial_region_projected = feedback_all_frames(
         hand,
         contact_mask,
         region_ids,
@@ -330,13 +359,19 @@ def main() -> None:
         args.contact_target_mm,
         args.minimum_contact_vertices,
     )
+    initial_gaps, _, active_regions = reduce_region_feedback(
+        initial_region_gaps,
+        initial_region_projected,
+        args.contact_target_mm,
+        args.region_reduction,
+    )
     initial_sampled_inside = sampled_inside_counts(
         hand, faces, object_sample_camera, boundary, device, args.point_chunk
     )
 
     for iteration in range(1, args.iterations + 1):
         current = shifted_hand(hand, rays, offsets_mm / 1000.0)
-        current_gap, contact_delta, active_regions = feedback_all_frames(
+        current_region_gap, current_region_projected = feedback_all_frames(
             current,
             contact_mask,
             region_ids,
@@ -345,6 +380,12 @@ def main() -> None:
             rays,
             args.contact_target_mm,
             args.minimum_contact_vertices,
+        )
+        current_gap, contact_delta, active_regions = reduce_region_feedback(
+            current_region_gap,
+            current_region_projected,
+            args.contact_target_mm,
+            args.region_reduction,
         )
         current_inside = sampled_inside_counts(
             current, faces, object_sample_camera, boundary, device, args.point_chunk
@@ -360,6 +401,38 @@ def main() -> None:
         )
         minus_inside = sampled_inside_counts(
             minus, faces, object_sample_camera, boundary, device, args.point_chunk
+        )
+        plus_region_gap, plus_region_projected = feedback_all_frames(
+            plus,
+            contact_mask,
+            region_ids,
+            fixed_region_camera,
+            region_names,
+            rays,
+            args.contact_target_mm,
+            args.minimum_contact_vertices,
+        )
+        minus_region_gap, minus_region_projected = feedback_all_frames(
+            minus,
+            contact_mask,
+            region_ids,
+            fixed_region_camera,
+            region_names,
+            rays,
+            args.contact_target_mm,
+            args.minimum_contact_vertices,
+        )
+        plus_gap, _, _ = reduce_region_feedback(
+            plus_region_gap,
+            plus_region_projected,
+            args.contact_target_mm,
+            args.region_reduction,
+        )
+        minus_gap, _, _ = reduce_region_feedback(
+            minus_region_gap,
+            minus_region_projected,
+            args.contact_target_mm,
+            args.region_reduction,
         )
 
         collision_direction = np.zeros(len(ids), dtype=np.float32)
@@ -389,6 +462,19 @@ def main() -> None:
             -args.max_step_mm,
             args.max_step_mm,
         )
+        plus_contact_better = np.isfinite(plus_gap) & (
+            (~np.isfinite(minus_gap)) | (plus_gap < minus_gap)
+        )
+        minus_contact_better = np.isfinite(minus_gap) & (
+            (~np.isfinite(plus_gap)) | (minus_gap < plus_gap)
+        )
+        contact_step[plus_contact_better] = args.probe_mm
+        contact_step[minus_contact_better] = -args.probe_mm
+        contact_satisfied = (
+            np.isfinite(current_gap)
+            & (current_gap <= args.contact_target_mm + args.contact_tolerance_mm)
+        )
+        contact_step[contact_satisfied] = 0.0
         collision_step = np.clip(
             collision_direction, -args.max_step_mm, args.max_step_mm
         )
@@ -430,7 +516,7 @@ def main() -> None:
     refined_wrist = (
         wrist + offsets_mm[:, None] / 1000.0 * rays
     ).astype(np.float32)
-    refined_gaps, _, refined_active_regions = feedback_all_frames(
+    refined_region_gaps, refined_region_projected = feedback_all_frames(
         refined,
         contact_mask,
         region_ids,
@@ -439,6 +525,12 @@ def main() -> None:
         rays,
         args.contact_target_mm,
         args.minimum_contact_vertices,
+    )
+    refined_gaps, _, refined_active_regions = reduce_region_feedback(
+        refined_region_gaps,
+        refined_region_projected,
+        args.contact_target_mm,
+        args.region_reduction,
     )
     initial_inside_mask, initial_inside = exact_inside_counts(
         hand, faces, object_full_camera, boundary, device, args.point_chunk
@@ -482,6 +574,24 @@ def main() -> None:
             "initial": distribution(initial_gaps[evaluated]),
             "refined": distribution(refined_gaps[evaluated]),
         },
+        "per_region_contact_gap_mm": {
+            name: {
+                "initial": distribution(
+                    initial_region_gaps[
+                        active & np.isfinite(initial_region_gaps[:, region_index]),
+                        region_index,
+                    ]
+                ),
+                "refined": distribution(
+                    refined_region_gaps[
+                        active & np.isfinite(refined_region_gaps[:, region_index]),
+                        region_index,
+                    ]
+                ),
+            }
+            for region_index, name in enumerate(region_names)
+            if name in fixed_names
+        },
         "containment": {
             "initial_total": int(initial_inside.sum()),
             "refined_total": int(refined_inside.sum()),
@@ -498,6 +608,8 @@ def main() -> None:
             "inside_low_fraction": args.inside_low_fraction,
             "inside_high_fraction": args.inside_high_fraction,
             "contact_target_mm": args.contact_target_mm,
+            "contact_tolerance_mm": args.contact_tolerance_mm,
+            "region_reduction": args.region_reduction,
             "collision_object_samples": sample_count,
         },
         "history": history,
@@ -522,6 +634,9 @@ def main() -> None:
         "prediction_valid": valid,
         "initial_fixed_contact_gap_mm": initial_gaps,
         "refined_fixed_contact_gap_mm": refined_gaps,
+        "contact_region_names": np.asarray(region_names),
+        "initial_fixed_contact_gap_by_region_mm": initial_region_gaps,
+        "refined_fixed_contact_gap_by_region_mm": refined_region_gaps,
         "fixed_patch_region_names": np.asarray(fixed_names),
         "contact_target_source": np.asarray(args.contact_target_source),
         "initial_object_vertex_inside_capped_mano": initial_inside_mask,
