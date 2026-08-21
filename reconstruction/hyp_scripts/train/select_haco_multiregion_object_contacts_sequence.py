@@ -52,6 +52,15 @@ def parse_args() -> argparse.Namespace:
             "frame; zero keeps the full contact segment"
         ),
     )
+    parser.add_argument(
+        "--per-region-onset-window-frames",
+        type=int,
+        default=0,
+        help=(
+            "Use an independent first-touch window for each HACO region. This "
+            "keeps later-arriving fingers without using their late penetrated frames."
+        ),
+    )
     parser.add_argument("--supervision-npz", required=True)
     parser.add_argument("--object-mesh", required=True)
     parser.add_argument("--mano-data-dir", required=True)
@@ -276,7 +285,10 @@ def clusters_from_distances(distances: np.ndarray, radius: float) -> list[np.nda
 
 def main() -> None:
     args = parse_args()
-    if args.selection_frame and args.onset_window_frames > 0:
+    if args.selection_frame and (
+        args.onset_window_frames > 0
+        or args.per_region_onset_window_frames > 0
+    ):
         raise ValueError(
             "--selection-frame and --onset-window-frames are mutually exclusive"
         )
@@ -292,6 +304,14 @@ def main() -> None:
         raise ValueError("--visibility-layers must be positive")
     if args.onset_window_frames < 0:
         raise ValueError("--onset-window-frames must be non-negative")
+    if args.per_region_onset_window_frames < 0:
+        raise ValueError(
+            "--per-region-onset-window-frames must be non-negative"
+        )
+    if args.onset_window_frames and args.per_region_onset_window_frames:
+        raise ValueError(
+            "Global and per-region onset windows are mutually exclusive"
+        )
     trajectory = load_npz(Path(args.trajectory_npz).expanduser().resolve())
     query = load_npz(Path(args.query_npz).expanduser().resolve())
     contact = load_npz(Path(args.contact_sequence_npz).expanduser().resolve())
@@ -408,6 +428,7 @@ def main() -> None:
     observations: list[dict[str, object]] = []
     skipped: list[dict[str, object]] = []
     contact_onset_index = int(np.flatnonzero(valid)[0])
+    region_onset_indices: dict[str, int] = {}
     for progress, index in enumerate(eligible, start=1):
         requested = frame_id(ids[index])
         hand = hand_vertices[index]
@@ -441,6 +462,14 @@ def main() -> None:
             )
             if int(raw_mask.sum()) < args.minimum_contact_vertices:
                 continue
+            if args.per_region_onset_window_frames > 0:
+                region_onset = region_onset_indices.setdefault(
+                    region_name, int(index)
+                )
+                if int(index) >= (
+                    region_onset + args.per_region_onset_window_frames
+                ):
+                    continue
             mask = strongest_components(
                 raw_mask,
                 mano_graph,
@@ -533,8 +562,11 @@ def main() -> None:
             selected_id = int(candidates[selected_offset])
             contact_vertices = np.flatnonzero(mask)
             haco_probability = float(probability[contact_vertices].mean())
+            onset_reference = region_onset_indices.get(
+                region_name, contact_onset_index
+            )
             onset_weight = 0.5 ** (
-                max(int(index) - contact_onset_index, 0)
+                max(int(index) - onset_reference, 0)
                 / args.onset_half_life_frames
             )
             intrusion_weight = np.exp(
@@ -717,6 +749,13 @@ def main() -> None:
             "selection_frame": args.selection_frame,
             "minimum_phase_gate": args.minimum_phase_gate,
             "onset_window_frames": args.onset_window_frames,
+            "per_region_onset_window_frames": (
+                args.per_region_onset_window_frames
+            ),
+            "region_onset_frames": {
+                name: frame_id(ids[index])
+                for name, index in region_onset_indices.items()
+            },
             "pixel_radius": args.pixel_radius,
             "distance_slack_mm": args.distance_slack_mm,
             "max_contact_distance_mm": args.max_contact_distance_mm,
