@@ -87,6 +87,20 @@ def parse_args() -> argparse.Namespace:
         default=6.0,
         help="Confidence bonus used when selecting fixed-patch contact vertices.",
     )
+    parser.add_argument(
+        "--opposition-frame-loss",
+        action="store_true",
+        help=(
+            "For fixed thumb/index patches, align their midpoint and axis "
+            "instead of forcing the current rigid hand to close both contacts."
+        ),
+    )
+    parser.add_argument(
+        "--opposition-axis-scale-mm",
+        type=float,
+        default=20.0,
+        help="Metric scale assigned to opposition-axis angular error.",
+    )
     parser.add_argument("--mano-data-dir")
     parser.add_argument("--fixed-patch-npz")
     parser.add_argument(
@@ -262,6 +276,115 @@ def fixed_region_bottleneck_distance_mm(
         if gaps:
             output[frame] = max(gaps)
     return output
+
+
+@torch.no_grad()
+def opposition_frame_error_mm(
+    hand: np.ndarray,
+    contact_mask: np.ndarray,
+    contact_probability: np.ndarray,
+    region_ids: np.ndarray,
+    region_names: list[str],
+    fixed_regions: dict[str, np.ndarray],
+    minimum_vertices: int,
+    probability_threshold: float,
+    probability_power: float,
+    weight_floor: float,
+    axis_scale_mm: float,
+) -> np.ndarray:
+    """Translation-compatible thumb/index midpoint and axis error."""
+    output = np.full(len(hand), np.nan, dtype=np.float32)
+    if "thumb" not in fixed_regions or "index" not in fixed_regions:
+        return output
+    thumb_region = region_names.index("thumb")
+    index_region = region_names.index("index")
+    for frame in range(len(hand)):
+        centers: dict[str, np.ndarray] = {}
+        valid_frame = True
+        for name, region in (
+            ("thumb", thumb_region),
+            ("index", index_region),
+        ):
+            selected = contact_mask[frame] & (region_ids == region)
+            if int(selected.sum()) < minimum_vertices:
+                valid_frame = False
+                break
+            normalized = np.clip(
+                (contact_probability[frame, selected] - probability_threshold)
+                / max(1.0 - probability_threshold, 1e-6),
+                0.0,
+                1.0,
+            )
+            weights = weight_floor + (1.0 - weight_floor) * (
+                normalized ** probability_power
+            )
+            centers[name] = np.average(
+                hand[frame, selected], axis=0, weights=weights
+            )
+        if not valid_frame:
+            continue
+        hand_axis = centers["index"] - centers["thumb"]
+        target_thumb = fixed_regions["thumb"][frame].mean(axis=0)
+        target_index = fixed_regions["index"][frame].mean(axis=0)
+        target_axis = target_index - target_thumb
+        hand_norm = float(np.linalg.norm(hand_axis))
+        target_norm = float(np.linalg.norm(target_axis))
+        if hand_norm <= 1e-8 or target_norm <= 1e-8:
+            continue
+        cosine = float(
+            np.dot(hand_axis, target_axis) / (hand_norm * target_norm)
+        )
+        midpoint = 0.5 * (centers["thumb"] + centers["index"])
+        target_midpoint = 0.5 * (target_thumb + target_index)
+        midpoint_mm = float(np.linalg.norm(midpoint - target_midpoint) * 1000.0)
+        axis_error = max(1.0 - np.clip(cosine, -1.0, 1.0), 0.0)
+        output[frame] = np.sqrt(
+            midpoint_mm ** 2 + axis_scale_mm ** 2 * axis_error
+        )
+    return output
+
+
+def opposition_frame_loss(
+    hand: torch.Tensor,
+    contact_weight: torch.Tensor,
+    contact_region_mask: torch.Tensor,
+    contact_region_names: list[str],
+    fixed_regions: dict[str, torch.Tensor],
+    frame_indices: torch.Tensor,
+    minimum_vertices: int,
+    axis_scale_mm: float,
+) -> torch.Tensor:
+    centers: dict[str, torch.Tensor] = {}
+    active: dict[str, torch.Tensor] = {}
+    for name in ("thumb", "index"):
+        region = contact_region_names.index(name)
+        selected = contact_region_mask[region]
+        weights = contact_weight[:, selected]
+        centers[name] = (
+            hand[:, selected] * weights[..., None]
+        ).sum(dim=1) / weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        active[name] = (
+            (weights > 0).sum(dim=-1) >= minimum_vertices
+        )
+    valid = active["thumb"] & active["index"]
+    if not valid.any():
+        return torch.zeros((), device=hand.device, dtype=hand.dtype)
+    target_thumb = fixed_regions["thumb"][frame_indices].mean(dim=1)
+    target_index = fixed_regions["index"][frame_indices].mean(dim=1)
+    hand_midpoint = 0.5 * (centers["thumb"] + centers["index"])
+    target_midpoint = 0.5 * (target_thumb + target_index)
+    midpoint_error = (hand_midpoint - target_midpoint).square().sum(dim=-1)
+    hand_axis = functional.normalize(
+        centers["index"] - centers["thumb"], dim=-1
+    )
+    target_axis = functional.normalize(target_index - target_thumb, dim=-1)
+    axis_error = torch.clamp(
+        1.0 - (hand_axis * target_axis).sum(dim=-1), min=0.0
+    )
+    axis_scale = axis_scale_mm / 1000.0
+    return (
+        midpoint_error[valid] + axis_scale * axis_scale * axis_error[valid]
+    ).mean()
 
 
 @torch.no_grad()
@@ -475,6 +598,12 @@ def main() -> None:
         fixed_patch_source = str(
             Path(args.fixed_patch_npz).expanduser().resolve()
         )
+    if args.opposition_frame_loss and not {
+        "thumb", "index"
+    }.issubset(fixed_region_np):
+        raise ValueError(
+            "--opposition-frame-loss requires fixed thumb and index patches"
+        )
     boundary = directed_boundary_loop(faces_np)
 
     vertices = torch.from_numpy(vertices_np).to(device)
@@ -626,21 +755,36 @@ def main() -> None:
                         "contact_feasible best-state selection requires "
                         "--fixed-patch-npz"
                     )
-                current_contact_gap = fixed_region_bottleneck_distance_mm(
-                    current_np,
-                    contact_mask_np,
-                    probability_np,
-                    contact_region_ids_np,
-                    contact_region_names,
-                    fixed_region_np,
-                    args.contact_region_min_vertices,
-                    args.topk,
-                    args.fixed_contact_vertex_topk,
-                    threshold,
-                    args.contact_probability_power,
-                    args.contact_weight_floor,
-                    args.fixed_contact_selection_sigma_mm,
-                )
+                if args.opposition_frame_loss:
+                    current_contact_gap = opposition_frame_error_mm(
+                        current_np,
+                        contact_mask_np,
+                        probability_np,
+                        contact_region_ids_np,
+                        contact_region_names,
+                        fixed_region_np,
+                        args.contact_region_min_vertices,
+                        threshold,
+                        args.contact_probability_power,
+                        args.contact_weight_floor,
+                        args.opposition_axis_scale_mm,
+                    )
+                else:
+                    current_contact_gap = fixed_region_bottleneck_distance_mm(
+                        current_np,
+                        contact_mask_np,
+                        probability_np,
+                        contact_region_ids_np,
+                        contact_region_names,
+                        fixed_region_np,
+                        args.contact_region_min_vertices,
+                        args.topk,
+                        args.fixed_contact_vertex_topk,
+                        threshold,
+                        args.contact_probability_power,
+                        args.contact_weight_floor,
+                        args.fixed_contact_selection_sigma_mm,
+                    )
                 feasible = inside_count <= (
                     baseline_inside_count + args.best_state_inside_allowance
                 )
@@ -717,7 +861,18 @@ def main() -> None:
             refined = transform_batch(
                 vertices[indices], wrists[indices], translation[indices], angles[indices]
             )
-            if args.fixed_patch_npz:
+            if args.fixed_patch_npz and args.opposition_frame_loss:
+                chunk_contact = opposition_frame_loss(
+                    refined,
+                    contact_weight[indices],
+                    contact_region_mask,
+                    contact_region_names,
+                    fixed_regions,
+                    indices,
+                    args.contact_region_min_vertices,
+                    args.opposition_axis_scale_mm,
+                )
+            elif args.fixed_patch_npz:
                 region_frame_losses = []
                 region_frame_active = []
                 for region_name, region_patch in fixed_regions.items():
@@ -949,21 +1104,36 @@ def main() -> None:
     if args.best_state_selection == "contact_feasible":
         if baseline_inside_count is None:
             baseline_inside_count = candidate_inside_count.copy()
-        candidate_contact_gap = fixed_region_bottleneck_distance_mm(
-            final_candidate_np,
-            contact_mask_np,
-            probability_np,
-            contact_region_ids_np,
-            contact_region_names,
-            fixed_region_np,
-            args.contact_region_min_vertices,
-            args.topk,
-            args.fixed_contact_vertex_topk,
-            threshold,
-            args.contact_probability_power,
-            args.contact_weight_floor,
-            args.fixed_contact_selection_sigma_mm,
-        )
+        if args.opposition_frame_loss:
+            candidate_contact_gap = opposition_frame_error_mm(
+                final_candidate_np,
+                contact_mask_np,
+                probability_np,
+                contact_region_ids_np,
+                contact_region_names,
+                fixed_region_np,
+                args.contact_region_min_vertices,
+                threshold,
+                args.contact_probability_power,
+                args.contact_weight_floor,
+                args.opposition_axis_scale_mm,
+            )
+        else:
+            candidate_contact_gap = fixed_region_bottleneck_distance_mm(
+                final_candidate_np,
+                contact_mask_np,
+                probability_np,
+                contact_region_ids_np,
+                contact_region_names,
+                fixed_region_np,
+                args.contact_region_min_vertices,
+                args.topk,
+                args.fixed_contact_vertex_topk,
+                threshold,
+                args.contact_probability_power,
+                args.contact_weight_floor,
+                args.fixed_contact_selection_sigma_mm,
+            )
         improved_state = (
             (candidate_inside_count <= (
                 baseline_inside_count + args.best_state_inside_allowance
@@ -1009,6 +1179,40 @@ def main() -> None:
         refined, contact_mask, object_points, object_normals, phase_gate,
         args.penetration_tolerance_mm, args.penetration_trust_mm, args.frame_chunk,
     )
+    initial_opposition_error = np.full(frame_count, np.nan, dtype=np.float32)
+    refined_opposition_error = np.full(frame_count, np.nan, dtype=np.float32)
+    opposition_summary = None
+    if args.opposition_frame_loss:
+        initial_opposition_error = opposition_frame_error_mm(
+            vertices_np, contact_mask_np, probability_np,
+            contact_region_ids_np, contact_region_names, fixed_region_np,
+            args.contact_region_min_vertices, threshold,
+            args.contact_probability_power, args.contact_weight_floor,
+            args.opposition_axis_scale_mm,
+        )
+        refined_opposition_error = opposition_frame_error_mm(
+            refined_np, contact_mask_np, probability_np,
+            contact_region_ids_np, contact_region_names, fixed_region_np,
+            args.contact_region_min_vertices, threshold,
+            args.contact_probability_power, args.contact_weight_floor,
+            args.opposition_axis_scale_mm,
+        )
+        evaluated_opposition = (
+            np.isfinite(initial_opposition_error)
+            & np.isfinite(refined_opposition_error)
+        )
+        opposition_summary = {
+            "initial_error_mm": distribution(
+                initial_opposition_error[evaluated_opposition]
+            ),
+            "refined_error_mm": distribution(
+                refined_opposition_error[evaluated_opposition]
+            ),
+            "improved_frames": int((
+                refined_opposition_error[evaluated_opposition]
+                < initial_opposition_error[evaluated_opposition]
+            ).sum()),
+        }
     collision_summary = containment_metrics(initial_inside_count, final_inside_count)
     gt_summary, initial_gt_frame, refined_gt_frame = gt_audit(
         args.gt_hand_npz, query, valid_np, vertices_np, refined_np
@@ -1029,7 +1233,9 @@ def main() -> None:
 
     summary = {
         "method": (
-            "iterative_multiregion_containment_first_rigid_stage1_v5"
+            "v14_opposition_midpoint_axis_rigid_stage1_v1"
+            if args.opposition_frame_loss
+            else "iterative_multiregion_containment_first_rigid_stage1_v5"
             if args.initial_hand_npz
             and args.fixed_patch_npz
             and args.containment_best_state
@@ -1073,7 +1279,9 @@ def main() -> None:
             "rotation_anchor": args.w_rotation_anchor,
         },
         "contact_aggregation": (
-            "fixed_multiregion_canonical_patches"
+            "opposition_midpoint_axis"
+            if args.opposition_frame_loss
+            else "fixed_multiregion_canonical_patches"
             if args.fixed_patch_npz
             else "mano_region_balanced" if args.region_balanced_contact else "global_vertex"
         ),
@@ -1099,6 +1307,11 @@ def main() -> None:
             "selection_sigma_mm": args.fixed_contact_selection_sigma_mm,
             "probability_power": args.contact_probability_power,
             "weight_floor": args.contact_weight_floor,
+        },
+        "opposition_frame": {
+            "enabled": args.opposition_frame_loss,
+            "axis_scale_mm": args.opposition_axis_scale_mm,
+            "audit": opposition_summary,
         },
         "best_state_selection": args.best_state_selection,
         "best_state_inside_allowance": args.best_state_inside_allowance,
@@ -1134,6 +1347,8 @@ def main() -> None:
         ).astype(np.float32),
         "initial_contact_distance_median_mm": initial_per_frame["contact_distance_median_mm"],
         "refined_contact_distance_median_mm": refined_per_frame["contact_distance_median_mm"],
+        "initial_opposition_frame_error_mm": initial_opposition_error,
+        "refined_opposition_frame_error_mm": refined_opposition_error,
         "initial_object_vertex_inside_capped_mano": initial_inside_mask,
         "refined_object_vertex_inside_capped_mano": final_inside_mask,
         "initial_inside_object_vertices": initial_inside_count,
