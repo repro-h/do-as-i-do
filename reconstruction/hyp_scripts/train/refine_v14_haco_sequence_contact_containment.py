@@ -184,6 +184,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-translation-mm", type=float, default=20.0)
     parser.add_argument("--max-rotation-deg", type=float, default=5.0)
     parser.add_argument(
+        "--translation-mode",
+        choices=("full", "camera_z"),
+        default="full",
+        help=(
+            "Optimize full camera XYZ translation, or only camera-axis Z. "
+            "camera_z also keeps rigid rotation exactly zero."
+        ),
+    )
+    parser.add_argument(
         "--translation-only",
         action="store_true",
         help="Optimize camera-space translation while keeping rotation exactly zero.",
@@ -941,13 +950,14 @@ def main() -> None:
         contact_region_active = torch.from_numpy(contact_region_active_np).to(device)
 
     translation = torch.zeros((frame_count, 3), device=device, requires_grad=True)
+    optimize_rotation = not args.translation_only and args.translation_mode == "full"
     angles = torch.zeros(
         (frame_count, 3),
         device=device,
-        requires_grad=not args.translation_only,
+        requires_grad=optimize_rotation,
     )
     optimized_parameters = [translation]
-    if not args.translation_only:
+    if optimize_rotation:
         optimized_parameters.append(angles)
     optimizer = torch.optim.Adam(optimized_parameters, lr=args.lr)
     max_translation = args.max_translation_mm / 1000.0
@@ -1396,9 +1406,17 @@ def main() -> None:
         regularization.backward()
         optimizer.step()
         with torch.no_grad():
-            translation_norm = translation.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-            translation.mul_(torch.clamp(max_translation / translation_norm, max=1.0))
-            if args.translation_only:
+            if args.translation_mode == "camera_z":
+                translation[:, :2].zero_()
+                translation[:, 2].clamp_(-max_translation, max_translation)
+            else:
+                translation_norm = translation.norm(
+                    dim=-1, keepdim=True
+                ).clamp_min(1e-12)
+                translation.mul_(
+                    torch.clamp(max_translation / translation_norm, max=1.0)
+                )
+            if not optimize_rotation:
                 angles.zero_()
             else:
                 angle_norm = angles.norm(dim=-1, keepdim=True).clamp_min(1e-12)
@@ -1561,6 +1579,9 @@ def main() -> None:
 
     summary = {
         "method": (
+            "v14_fixed_contact_camera_z_stage1_v1"
+            if args.translation_mode == "camera_z"
+            else
             "v14_opposition_midpoint_axis_rigid_stage1_v1"
             if use_opposition_loss
             else "iterative_multiregion_containment_first_rigid_stage1_v5"
@@ -1581,10 +1602,13 @@ def main() -> None:
         ),
         "stream_id": str(query["stream_id"].item()),
         "degrees_of_freedom": (
-            "camera_translation_only"
+            "camera_z_translation_only"
+            if args.translation_mode == "camera_z"
+            else "camera_translation_only"
             if args.translation_only
             else "camera_translation_and_rotation"
         ),
+        "translation_mode": args.translation_mode,
         "initial_hand_source": initial_hand_source,
         "initial_hand_vertices_key": initial_vertices_key,
         "frames": frame_count,
