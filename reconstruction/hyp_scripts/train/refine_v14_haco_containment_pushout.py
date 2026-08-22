@@ -67,6 +67,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-weight-floor", type=float, default=0.05)
     parser.add_argument("--region-balanced-contact", action="store_true")
     parser.add_argument("--contact-region-min-vertices", type=int, default=3)
+    parser.add_argument(
+        "--contact-point-selection",
+        choices=("adaptive_filtered", "stage1_probability"),
+        default="adaptive_filtered",
+        help=(
+            "Select contact vertices using the existing adaptive filter or "
+            "the per-region high-probability rule used by fixed-patch Stage1."
+        ),
+    )
+    parser.add_argument(
+        "--stage1-contact-vertex-topk",
+        type=int,
+        default=16,
+        help=(
+            "With stage1_probability selection, retain this many HACO "
+            "vertices per Stage1 fixed-patch region and frame."
+        ),
+    )
     parser.add_argument("--filter-contact-points", action="store_true")
     parser.add_argument("--filtered-contact-topk", type=int, default=48)
     parser.add_argument("--filtered-component-topk", type=int, default=8)
@@ -411,6 +429,15 @@ def main() -> None:
         raise ValueError("--adaptive-contact-floor must be in [0, 1]")
     if args.filtered_contact_topk <= 0:
         raise ValueError("--filtered-contact-topk must be positive")
+    if args.stage1_contact_vertex_topk <= 0:
+        raise ValueError("--stage1-contact-vertex-topk must be positive")
+    if (
+        args.contact_point_selection == "stage1_probability"
+        and not args.region_balanced_contact
+    ):
+        raise ValueError(
+            "stage1_probability selection requires --region-balanced-contact"
+        )
     if args.filtered_component_topk <= 0:
         raise ValueError("--filtered-component-topk must be positive")
     if args.filtered_maximum_total < args.filtered_contact_topk:
@@ -723,6 +750,10 @@ def main() -> None:
         max=1.0,
     )
     confidence = normalized_confidence.pow(args.contact_probability_power)
+    probability_contact_weight = (
+        args.contact_weight_floor
+        + (1.0 - args.contact_weight_floor) * confidence
+    ) * contact_mask * (contact_gate[:, None] > 0)
     initial_plausible_contact = (
         contact_mask
         & (initial_distance <= args.contact_activation_mm / 1000.0)
@@ -810,12 +841,74 @@ def main() -> None:
     frame_contact_scale, frame_collision_scale = adaptive_scales()
     hand_edges_np = mesh_edges(mano_faces_np)
 
+    contact_region_names: list[str] = []
+    contact_region_ids_np = np.full(reconstructed.shape[1], -1, dtype=np.int64)
+    contact_region_mask = None
+    stage1_contact_region_indices: list[int] = []
+    if args.region_balanced_contact:
+        if "contact_region_id" not in stage1 or "contact_region_names" not in stage1:
+            raise KeyError(
+                "--region-balanced-contact requires a region-balanced Stage1 archive"
+            )
+        contact_region_ids_np = np.asarray(
+            stage1["contact_region_id"], dtype=np.int64
+        )
+        contact_region_names = [
+            value.decode() if isinstance(value, bytes) else str(value)
+            for value in np.asarray(stage1["contact_region_names"])
+        ]
+        if contact_region_ids_np.shape != (reconstructed.shape[1],):
+            raise ValueError(
+                "Stage1 contact_region_id does not match MANO vertex count"
+            )
+        contact_region_mask = torch.from_numpy(np.stack([
+            contact_region_ids_np == index
+            for index in range(len(contact_region_names))
+        ])).to(device)
+        if args.contact_point_selection == "stage1_probability":
+            if "fixed_patch_region_names" not in stage1:
+                raise KeyError(
+                    "stage1_probability selection requires Stage1 "
+                    "fixed_patch_region_names"
+                )
+            fixed_names = [
+                value.decode() if isinstance(value, bytes) else str(value)
+                for value in np.asarray(stage1["fixed_patch_region_names"])
+            ]
+            unknown = sorted(set(fixed_names).difference(contact_region_names))
+            if unknown:
+                raise KeyError(f"Unknown Stage1 fixed-patch regions: {unknown}")
+            stage1_contact_region_indices = [
+                contact_region_names.index(name) for name in fixed_names
+            ]
+
     def build_contact_weights(
         hand: torch.Tensor,
         distance: torch.Tensor,
         collision_faces: list[torch.Tensor | None],
     ) -> tuple[torch.Tensor, int, float]:
-        if not args.filter_contact_points:
+        if args.contact_point_selection == "stage1_probability":
+            assert contact_region_mask is not None
+            weights = torch.zeros_like(probability_contact_weight)
+            for frame_index in range(frame_count):
+                for region_index in stage1_contact_region_indices:
+                    candidates = torch.nonzero(
+                        contact_mask[frame_index]
+                        & contact_region_mask[region_index]
+                        & (contact_gate[frame_index] > 0),
+                        as_tuple=False,
+                    ).flatten()
+                    if not len(candidates):
+                        continue
+                    count = min(args.stage1_contact_vertex_topk, len(candidates))
+                    chosen = candidates[torch.topk(
+                        probability_contact_weight[frame_index, candidates],
+                        count,
+                    ).indices]
+                    weights[frame_index, chosen] = (
+                        probability_contact_weight[frame_index, chosen]
+                    )
+        elif not args.filter_contact_points:
             weights = unfiltered_contact_weight
         else:
             geodesic_gate_np = np.ones(
@@ -969,30 +1062,6 @@ def main() -> None:
         )
     )
     total_contact_weight = contact_weight.sum().clamp_min(1e-6)
-    contact_region_names: list[str] = []
-    contact_region_ids_np = np.full(reconstructed.shape[1], -1, dtype=np.int64)
-    contact_region_mask = None
-    if args.region_balanced_contact:
-        if "contact_region_id" not in stage1 or "contact_region_names" not in stage1:
-            raise KeyError(
-                "--region-balanced-contact requires a region-balanced Stage1 archive"
-            )
-        contact_region_ids_np = np.asarray(
-            stage1["contact_region_id"], dtype=np.int64
-        )
-        contact_region_names = [
-            value.decode() if isinstance(value, bytes) else str(value)
-            for value in np.asarray(stage1["contact_region_names"])
-        ]
-        if contact_region_ids_np.shape != (reconstructed.shape[1],):
-            raise ValueError(
-                "Stage1 contact_region_id does not match MANO vertex count"
-            )
-        contact_region_mask = torch.from_numpy(np.stack([
-            contact_region_ids_np == index
-            for index in range(len(contact_region_names))
-        ])).to(device)
-
     delta = torch.zeros(
         (frame_count, 15, 3), device=device, requires_grad=True
     )
@@ -1574,6 +1643,12 @@ def main() -> None:
             },
         },
         "contact_filter": {
+            "point_selection": args.contact_point_selection,
+            "stage1_region_topk": args.stage1_contact_vertex_topk,
+            "stage1_regions": [
+                contact_region_names[index]
+                for index in stage1_contact_region_indices
+            ],
             "enabled": args.filter_contact_points,
             "global_topk": args.filtered_contact_topk,
             "component_topk": args.filtered_component_topk,
