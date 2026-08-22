@@ -195,6 +195,18 @@ def main() -> None:
         )
         else None
     )
+    stage2_contact_targets = (
+        np.asarray(
+            stage2["contact_target_point_camera"][stage2_indices],
+            dtype=np.float32,
+        )
+        if (
+            stage2 is not None
+            and stage2_indices is not None
+            and "contact_target_point_camera" in stage2
+        )
+        else None
+    )
     hand_faces = np.asarray(query["mano_faces"], dtype=np.int64)
     probability = np.asarray(
         contact["contact_probability"][contact_indices], dtype=np.float32
@@ -298,6 +310,10 @@ def main() -> None:
         "stage2_filtered_contact": server.gui.add_checkbox(
             "Stage2 optimization contacts",
             initial_value=stage2_filtered_mask is not None,
+        ),
+        "stage2_contact_targets": server.gui.add_checkbox(
+            "Stage2 object contact targets",
+            initial_value=stage2_contact_targets is not None,
         ),
         "collision_seeds": server.gui.add_checkbox(
             "Collision seed MANO vertices",
@@ -507,6 +523,31 @@ def main() -> None:
                     colors=colors,
                     point_size=float(point_size.value) * 1.4,
                 ))
+                if (
+                    controls["stage2_contact_targets"].value
+                    and stage2_contact_targets is not None
+                ):
+                    targets = stage2_contact_targets[index, stage2_selected]
+                    sources = stage2_vertices[index, stage2_selected]
+                    handles.append(server.scene.add_point_cloud(
+                        "/stage2_object_contact_targets",
+                        points=targets,
+                        colors=np.tile(
+                            np.asarray([[40, 255, 80]], dtype=np.uint8),
+                            (len(targets), 1),
+                        ),
+                        point_size=float(point_size.value) * 1.6,
+                    ))
+                    handles.append(server.scene.add_line_segments(
+                        "/stage2_contact_correspondences",
+                        points=np.stack((sources, targets), axis=1),
+                        colors=np.tile(
+                            np.asarray([[[255, 210, 30], [255, 210, 30]]],
+                                       dtype=np.uint8),
+                            (len(targets), 1, 1),
+                        ),
+                        line_width=2.0,
+                    ))
         if controls["collision_seeds"].value and len(collision_seeds):
             handles.append(server.scene.add_point_cloud(
                 "/collision_seed_mano_vertices",

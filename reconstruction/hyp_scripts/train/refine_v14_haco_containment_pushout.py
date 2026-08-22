@@ -203,6 +203,15 @@ def parse_args() -> argparse.Namespace:
         "--reprojection-tolerance-px", type=float, default=2.0
     )
     parser.add_argument("--w-reprojection", type=float, default=0.0)
+    parser.add_argument(
+        "--contact-correspondence-mode",
+        choices=("nearest", "wrist_ray_first_surface"),
+        default="nearest",
+    )
+    parser.add_argument("--contact-ray-radius-mm", type=float, default=15.0)
+    parser.add_argument("--contact-pixel-radius", type=float, default=35.0)
+    parser.add_argument("--contact-ray-depth-slack-mm", type=float, default=20.0)
+    parser.add_argument("--contact-facing-min-cosine", type=float, default=0.05)
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--lr", type=float, default=3e-3)
     parser.add_argument("--max-grad-norm", type=float, default=10.0)
@@ -240,6 +249,95 @@ def nearest_object_correspondences(
         distances.append(distance)
         points.append(nearest_point)
         normals.append(nearest_normal)
+    return torch.cat(distances), torch.cat(points), torch.cat(normals)
+
+
+@torch.no_grad()
+def wrist_ray_first_surface_correspondences(
+    hand: torch.Tensor,
+    object_points: torch.Tensor,
+    object_normals: torch.Tensor,
+    wrist_origin: torch.Tensor,
+    frame_chunk: int,
+    fx: float,
+    fy: float,
+    ray_radius_mm: float,
+    pixel_radius: float,
+    depth_slack_mm: float,
+    facing_min_cosine: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    distances = []
+    points = []
+    normals = []
+    ray_radius = ray_radius_mm / 1000.0
+    depth_slack = depth_slack_mm / 1000.0
+    for start in range(0, len(hand), frame_chunk):
+        end = min(start + frame_chunk, len(hand))
+        current_hand = hand[start:end]
+        current_object = object_points[start:end]
+        current_normals = object_normals[start:end]
+        origin = wrist_origin[start:end]
+
+        hand_ray = current_hand - origin[:, None]
+        hand_ray_length = hand_ray.norm(dim=-1).clamp_min(1e-8)
+        hand_ray_direction = hand_ray / hand_ray_length[..., None]
+        object_from_origin = current_object - origin[:, None]
+        ray_depth = torch.einsum(
+            "bvc,bnc->bvn", hand_ray_direction, object_from_origin
+        )
+        object_radius_squared = object_from_origin.square().sum(dim=-1)
+        perpendicular = torch.sqrt(torch.clamp(
+            object_radius_squared[:, None] - ray_depth.square(), min=0.0
+        ))
+
+        hand_depth = current_hand[..., 2].clamp_min(1e-4)
+        object_depth = current_object[..., 2].clamp_min(1e-4)
+        hand_uv = torch.stack((
+            fx * current_hand[..., 0] / hand_depth,
+            fy * current_hand[..., 1] / hand_depth,
+        ), dim=-1)
+        object_uv = torch.stack((
+            fx * current_object[..., 0] / object_depth,
+            fy * current_object[..., 1] / object_depth,
+        ), dim=-1)
+        pixel_distance = torch.cdist(hand_uv, object_uv)
+
+        toward_wrist = functional.normalize(
+            origin[:, None] - current_object, dim=-1
+        )
+        facing = (
+            current_normals * toward_wrist
+        ).sum(dim=-1) >= facing_min_cosine
+        valid = (
+            (ray_depth > 0)
+            & (ray_depth <= hand_ray_length[..., None] + depth_slack)
+            & (perpendicular <= ray_radius)
+            & (pixel_distance <= pixel_radius)
+            & facing[:, None]
+        )
+        score = ray_depth + 2.0 * perpendicular
+        score = score.masked_fill(~valid, torch.inf)
+        selected = score.argmin(dim=-1)
+        has_valid = valid.any(dim=-1)
+
+        nearest_distance = torch.cdist(current_hand, current_object)
+        nearest_selected = nearest_distance.argmin(dim=-1)
+        selected = torch.where(has_valid, selected, nearest_selected)
+        selected_point = torch.gather(
+            current_object,
+            1,
+            selected[..., None].expand(-1, -1, 3),
+        )
+        selected_normal = torch.gather(
+            current_normals,
+            1,
+            selected[..., None].expand(-1, -1, 3),
+        )
+        distances.append(torch.linalg.norm(
+            current_hand - selected_point, dim=-1
+        ))
+        points.append(selected_point)
+        normals.append(selected_normal)
     return torch.cat(distances), torch.cat(points), torch.cat(normals)
 
 
@@ -537,6 +635,13 @@ def main() -> None:
         raise ValueError("Reprojection focal lengths must be positive")
     if args.reprojection_tolerance_px < 0 or args.w_reprojection < 0:
         raise ValueError("Invalid reprojection constraint")
+    if (
+        args.contact_ray_radius_mm <= 0
+        or args.contact_pixel_radius <= 0
+        or args.contact_ray_depth_slack_mm < 0
+        or not -1.0 <= args.contact_facing_min_cosine <= 1.0
+    ):
+        raise ValueError("Invalid wrist-ray contact correspondence settings")
     joint_limits = [
         args.mcp_max_joint_delta_deg,
         args.pip_max_joint_delta_deg,
@@ -808,10 +913,31 @@ def main() -> None:
             f"{float(roundtrip_rmse.max().cpu()):.6f} mm"
         )
 
-    initial_distance, fixed_contact_point, fixed_contact_normal = (
-        nearest_object_correspondences(
-            reconstructed, object_points, object_normals, args.frame_chunk
+    wrist_origin = wrist + stage1_translation
+
+    def contact_correspondences(
+        hand_vertices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if args.contact_correspondence_mode == "wrist_ray_first_surface":
+            return wrist_ray_first_surface_correspondences(
+                hand_vertices,
+                object_points,
+                object_normals,
+                wrist_origin,
+                args.frame_chunk,
+                args.reprojection_fx,
+                args.reprojection_fy,
+                args.contact_ray_radius_mm,
+                args.contact_pixel_radius,
+                args.contact_ray_depth_slack_mm,
+                args.contact_facing_min_cosine,
+            )
+        return nearest_object_correspondences(
+            hand_vertices, object_points, object_normals, args.frame_chunk
         )
+
+    initial_distance, fixed_contact_point, fixed_contact_normal = (
+        contact_correspondences(reconstructed)
     )
     initial_normal_inside = (
         (fixed_contact_point - reconstructed) * fixed_contact_normal
@@ -1307,12 +1433,7 @@ def main() -> None:
                         current_contact_distance,
                         fixed_contact_point,
                         fixed_contact_normal,
-                    ) = nearest_object_correspondences(
-                        current_hand,
-                        object_points,
-                        object_normals,
-                        args.frame_chunk,
-                    )
+                    ) = contact_correspondences(current_hand)
                 (
                     contact_weight,
                     selected_contact_count,
@@ -1960,6 +2081,14 @@ def main() -> None:
             "collision_region_floor": args.collision_region_floor,
             "metrics": filtered_contact_metrics,
         },
+        "contact_correspondence": {
+            "mode": args.contact_correspondence_mode,
+            "frozen": args.freeze_contact_correspondences,
+            "ray_radius_mm": args.contact_ray_radius_mm,
+            "pixel_radius": args.contact_pixel_radius,
+            "ray_depth_slack_mm": args.contact_ray_depth_slack_mm,
+            "facing_min_cosine": args.contact_facing_min_cosine,
+        },
         "contact_aggregation": (
             "mano_region_balanced"
             if args.region_balanced_contact else "global_vertex"
@@ -2031,6 +2160,12 @@ def main() -> None:
         "adaptive_contact_gate": adaptive_gate.cpu().numpy().astype(np.float32),
         "filtered_contact_mask": filtered_contact_mask_np,
         "filtered_contact_weight": filtered_contact_weight_np.astype(np.float16),
+        "contact_target_point_camera": (
+            fixed_contact_point.cpu().numpy().astype(np.float32)
+        ),
+        "contact_target_normal_camera": (
+            fixed_contact_normal.cpu().numpy().astype(np.float32)
+        ),
         "contact_region_names": np.asarray(contact_region_names),
         "contact_region_id": contact_region_ids_np.astype(np.int16),
         "contact_region_vertex_count": contact_region_count_np,
