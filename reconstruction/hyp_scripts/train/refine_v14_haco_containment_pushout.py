@@ -208,7 +208,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-reprojection", type=float, default=0.0)
     parser.add_argument(
         "--contact-correspondence-mode",
-        choices=("nearest", "wrist_ray_first_surface"),
+        choices=("nearest", "wrist_ray_first_surface", "stage1_fixed_patch"),
         default="nearest",
     )
     parser.add_argument("--contact-ray-radius-mm", type=float, default=15.0)
@@ -342,6 +342,47 @@ def wrist_ray_first_surface_correspondences(
         points.append(selected_point)
         normals.append(selected_normal)
     return torch.cat(distances), torch.cat(points), torch.cat(normals)
+
+
+@torch.no_grad()
+def stage1_fixed_patch_correspondences(
+    hand: torch.Tensor,
+    object_points: torch.Tensor,
+    object_normals: torch.Tensor,
+    contact_region_ids: np.ndarray,
+    region_patches: dict[int, torch.Tensor],
+    frame_chunk: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    distance, point, normal = nearest_object_correspondences(
+        hand, object_points, object_normals, frame_chunk
+    )
+    for region_index, patch in region_patches.items():
+        selected_np = np.flatnonzero(contact_region_ids == region_index)
+        if not len(selected_np):
+            continue
+        selected = torch.from_numpy(selected_np).to(hand.device)
+        for start in range(0, len(hand), frame_chunk):
+            end = min(start + frame_chunk, len(hand))
+            current_hand = hand[start:end][:, selected]
+            current_patch = patch[start:end]
+            pairwise = torch.cdist(current_hand, current_patch)
+            current_distance, nearest_index = pairwise.min(dim=-1)
+            target = torch.gather(
+                current_patch,
+                1,
+                nearest_index[..., None].expand(-1, -1, 3),
+            )
+            object_pairwise = torch.cdist(target, object_points[start:end])
+            object_index = object_pairwise.argmin(dim=-1)
+            target_normal = torch.gather(
+                object_normals[start:end],
+                1,
+                object_index[..., None].expand(-1, -1, 3),
+            )
+            distance[start:end, selected] = current_distance
+            point[start:end, selected] = target
+            normal[start:end, selected] = target_normal
+    return distance, point, normal
 
 
 @torch.no_grad()
@@ -920,10 +961,50 @@ def main() -> None:
         )
 
     wrist_origin = wrist + stage1_translation
+    fixed_patch_contact_region_ids = np.asarray(
+        stage1.get("contact_region_id", np.full(reconstructed.shape[1], -1)),
+        dtype=np.int64,
+    )
+    fixed_patch_contact_region_names = [
+        value.decode() if isinstance(value, bytes) else str(value)
+        for value in np.asarray(stage1.get("contact_region_names", []))
+    ]
+    fixed_patch_correspondence_regions: dict[int, torch.Tensor] = {}
+    if args.contact_correspondence_mode == "stage1_fixed_patch":
+        if "fixed_patch_region_names" not in stage1:
+            raise KeyError(
+                "stage1_fixed_patch correspondence requires Stage1 "
+                "fixed_patch_region_names"
+            )
+        if fixed_patch_contact_region_ids.shape != (reconstructed.shape[1],):
+            raise ValueError("Stage1 contact region IDs do not match MANO vertices")
+        fixed_names = [
+            value.decode() if isinstance(value, bytes) else str(value)
+            for value in np.asarray(stage1["fixed_patch_region_names"])
+        ]
+        for region_name in fixed_names:
+            if region_name not in fixed_patch_contact_region_names:
+                raise KeyError(f"Unknown Stage1 fixed-patch region: {region_name}")
+            key = f"fixed_{region_name}_patch_vertices_camera"
+            if key not in stage1:
+                raise KeyError(f"Stage1 archive lacks {key}")
+            region_index = fixed_patch_contact_region_names.index(region_name)
+            fixed_patch_correspondence_regions[region_index] = torch.from_numpy(
+                np.asarray(stage1[key][stage1_indices], dtype=np.float32)
+            ).to(device)
 
     def contact_correspondences(
         hand_vertices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if args.contact_correspondence_mode == "stage1_fixed_patch":
+            return stage1_fixed_patch_correspondences(
+                hand_vertices,
+                object_points,
+                object_normals,
+                fixed_patch_contact_region_ids,
+                fixed_patch_correspondence_regions,
+                args.frame_chunk,
+            )
         if args.contact_correspondence_mode == "wrist_ray_first_surface":
             return wrist_ray_first_surface_correspondences(
                 hand_vertices,
