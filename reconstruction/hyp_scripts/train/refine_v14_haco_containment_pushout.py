@@ -102,6 +102,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--collision-region-floor", type=float, default=0.05)
     parser.add_argument("--w-contact", type=float, default=1.0)
+    parser.add_argument("--w-contact-facing", type=float, default=0.0)
+    parser.add_argument(
+        "--contact-facing-min-cosine",
+        type=float,
+        default=0.2,
+        help=(
+            "Require selected HACO vertex normals to point toward their fixed "
+            "object-patch correspondences. Only active when "
+            "--w-contact-facing is positive."
+        ),
+    )
     parser.add_argument("--w-collision", type=float, default=5.0)
     parser.add_argument("--w-object-normal-pushout", type=float, default=0.0)
     parser.add_argument("--w-tangential", type=float, default=2.0)
@@ -253,6 +264,29 @@ def nearest_object_correspondences(
         points.append(nearest_point)
         normals.append(nearest_normal)
     return torch.cat(distances), torch.cat(points), torch.cat(normals)
+
+
+def mano_vertex_normals(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    mirror_left: bool,
+) -> torch.Tensor:
+    triangles = vertices[:, faces]
+    face_normals = torch.cross(
+        triangles[:, :, 1] - triangles[:, :, 0],
+        triangles[:, :, 2] - triangles[:, :, 0],
+        dim=-1,
+    )
+    normals = torch.zeros_like(vertices)
+    for corner in range(3):
+        indices = faces[:, corner].view(1, -1, 1).expand(
+            vertices.shape[0], -1, 3
+        )
+        normals.scatter_add_(1, indices, face_normals)
+    normals = functional.normalize(normals, dim=-1)
+    if mirror_left:
+        normals = -normals
+    return normals
 
 
 @torch.no_grad()
@@ -624,6 +658,10 @@ def main() -> None:
         raise ValueError("--filtered-contact-topk must be positive")
     if args.stage1_contact_vertex_topk <= 0:
         raise ValueError("--stage1-contact-vertex-topk must be positive")
+    if args.w_contact_facing < 0:
+        raise ValueError("--w-contact-facing must be non-negative")
+    if not -1.0 <= args.contact_facing_min_cosine <= 1.0:
+        raise ValueError("--contact-facing-min-cosine must be in [-1, 1]")
     if (
         args.contact_point_selection == "stage1_probability"
         and not args.region_balanced_contact
@@ -1590,6 +1628,7 @@ def main() -> None:
                 contact_region_active * frame_contact_scale[:, None]
             ).sum().clamp_min(1e-6)
         contact_value = 0.0
+        contact_facing_value = 0.0
         collision_value = 0.0
         object_normal_pushout_value = 0.0
         tangential_value = 0.0
@@ -1618,6 +1657,24 @@ def main() -> None:
             contact_error = torch.clamp(
                 fixed_distance - contact_target, min=0.0
             ).square()
+            hand_normals = mano_vertex_normals(
+                refined, mano_faces, mirror_left
+            )
+            patch_direction = functional.normalize(
+                fixed_contact_point[indices] - refined, dim=-1
+            )
+            contact_facing_cosine = (
+                hand_normals * patch_direction
+            ).sum(dim=-1)
+            contact_facing_error = torch.clamp(
+                args.contact_facing_min_cosine - contact_facing_cosine,
+                min=0.0,
+            ).square()
+            chunk_contact_facing = (
+                contact_facing_error
+                * contact_weight[indices]
+                * frame_contact_scale[indices, None]
+            ).sum() / total_contact_weight
             if args.region_balanced_contact:
                 region_weight = (
                     contact_weight[indices, None]
@@ -1718,6 +1775,7 @@ def main() -> None:
             )
             chunk_loss = (
                 args.w_contact * chunk_contact
+                + args.w_contact_facing * chunk_contact_facing
                 + args.w_collision * chunk_collision
                 + args.w_object_normal_pushout
                 * chunk_object_normal_pushout
@@ -1727,6 +1785,7 @@ def main() -> None:
             )
             chunk_loss.backward()
             contact_value += float(chunk_contact.detach())
+            contact_facing_value += float(chunk_contact_facing.detach())
             collision_value += float(chunk_collision.detach())
             object_normal_pushout_value += float(
                 chunk_object_normal_pushout.detach()
@@ -1773,6 +1832,7 @@ def main() -> None:
         regularization.backward()
         total_value = (
             args.w_contact * contact_value
+            + args.w_contact_facing * contact_facing_value
             + args.w_collision * collision_value
             + args.w_object_normal_pushout * object_normal_pushout_value
             + args.w_tangential * tangential_value
@@ -1862,6 +1922,7 @@ def main() -> None:
                 "alternating_phase": alternating_phase,
                 "total": total_value,
                 "contact": contact_value,
+                "contact_facing": contact_facing_value,
                 "collision": collision_value,
                 "object_normal_pushout": object_normal_pushout_value,
                 "tangential": tangential_value,
@@ -1998,6 +2059,20 @@ def main() -> None:
         contact_weight > 0
     ).cpu().numpy()
     filtered_contact_weight_np = contact_weight.cpu().numpy().astype(np.float32)
+    with torch.no_grad():
+        _, refined_contact_point, _ = contact_correspondences(refined)
+        refined_hand_normals = mano_vertex_normals(
+            refined, mano_faces, mirror_left
+        )
+        refined_patch_direction = functional.normalize(
+            refined_contact_point - refined, dim=-1
+        )
+        refined_contact_facing_cosine = (
+            refined_hand_normals * refined_patch_direction
+        ).sum(dim=-1)
+    selected_facing_cosine = (
+        refined_contact_facing_cosine.cpu().numpy()[filtered_contact_mask_np]
+    )
     selected_initial_mm = (
         initial_distance.cpu().numpy()[filtered_contact_mask_np] * 1000.0
     )
@@ -2015,6 +2090,10 @@ def main() -> None:
         "refined_within_5mm_fraction": float(
             np.mean(selected_refined_mm <= 5.0)
         ) if len(selected_refined_mm) else None,
+        "refined_facing_cosine": distribution(selected_facing_cosine),
+        "refined_facing_pass_fraction": float(np.mean(
+            selected_facing_cosine >= args.contact_facing_min_cosine
+        )) if len(selected_facing_cosine) else None,
     }
     contact_region_count_np = np.zeros(
         (frame_count, len(contact_region_names)), dtype=np.int32
@@ -2144,6 +2223,7 @@ def main() -> None:
         "collision_margin_mm": args.collision_margin_mm,
         "weights": {
             "contact": args.w_contact,
+            "contact_facing": args.w_contact_facing,
             "collision": args.w_collision,
             "object_normal_pushout": args.w_object_normal_pushout,
             "tangential": args.w_tangential,
@@ -2162,6 +2242,14 @@ def main() -> None:
                 args.w_residual_rotation_velocity
             ),
             "reprojection": args.w_reprojection,
+        },
+        "contact_facing": {
+            "enabled": args.w_contact_facing > 0,
+            "minimum_cosine": args.contact_facing_min_cosine,
+            "interpretation": (
+                "MANO outward normal dot normalized direction from the "
+                "selected HACO vertex to its object-patch target"
+            ),
         },
         "contact_pivot_residual_se3": {
             "enabled": optimize_residual_se3,
@@ -2320,6 +2408,9 @@ def main() -> None:
         "adaptive_contact_gate": adaptive_gate.cpu().numpy().astype(np.float32),
         "filtered_contact_mask": filtered_contact_mask_np,
         "filtered_contact_weight": filtered_contact_weight_np.astype(np.float16),
+        "refined_contact_facing_cosine": (
+            refined_contact_facing_cosine.cpu().numpy().astype(np.float32)
+        ),
         "contact_target_point_camera": (
             fixed_contact_point.cpu().numpy().astype(np.float32)
         ),
