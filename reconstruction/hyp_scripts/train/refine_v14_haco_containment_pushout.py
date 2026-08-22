@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-sequence-npz")
     parser.add_argument("--phase-npz")
     parser.add_argument(
-        "--base-mode", choices=("local", "stage1"), default="local"
+        "--base-mode", choices=("local", "stage1", "v14"), default="local"
     )
     parser.add_argument("--containment-npz", required=True)
     parser.add_argument("--supervision-npz", required=True)
@@ -782,8 +782,8 @@ def main() -> None:
     else:
         if not args.contact_sequence_npz or not args.phase_npz:
             raise ValueError(
-                "--base-mode stage1 requires --contact-sequence-npz and "
-                "--phase-npz"
+                f"--base-mode {args.base_mode} requires "
+                "--contact-sequence-npz and --phase-npz"
             )
         contact_source = load_npz(
             Path(args.contact_sequence_npz).expanduser().resolve()
@@ -808,12 +808,16 @@ def main() -> None:
     wrist_np = np.asarray(
         trajectory["predicted_wrist_camera"][trajectory_indices], dtype=np.float32
     )
-    stage1_translation_np = np.asarray(
-        stage1["translation_camera"][stage1_indices], dtype=np.float32
-    )
-    stage1_angles_np = np.asarray(
-        stage1["rotation_euler_xyz"][stage1_indices], dtype=np.float32
-    )
+    if args.base_mode == "v14":
+        stage1_translation_np = np.zeros((frame_count, 3), dtype=np.float32)
+        stage1_angles_np = np.zeros((frame_count, 3), dtype=np.float32)
+    else:
+        stage1_translation_np = np.asarray(
+            stage1["translation_camera"][stage1_indices], dtype=np.float32
+        )
+        stage1_angles_np = np.asarray(
+            stage1["rotation_euler_xyz"][stage1_indices], dtype=np.float32
+        )
     global_orient_np = np.asarray(
         query["mano_global_orient_canonical_right"], dtype=np.float32
     )
@@ -849,10 +853,16 @@ def main() -> None:
     else:
         assert contact_source is not None and contact_indices is not None
         assert phase is not None and phase_indices is not None
-        base_vertices_np = np.asarray(
-            stage1["refined_hand_vertices_camera"][stage1_indices],
-            dtype=np.float32,
-        )
+        if args.base_mode == "v14":
+            base_vertices_np = np.asarray(
+                query["vertices_3d_root_relative_original"],
+                dtype=np.float32,
+            ) + wrist_np[:, None]
+        else:
+            base_vertices_np = np.asarray(
+                stage1["refined_hand_vertices_camera"][stage1_indices],
+                dtype=np.float32,
+            )
         base_pose_np = np.asarray(
             query["mano_hand_pose_canonical_right"], dtype=np.float32
         )
@@ -895,13 +905,22 @@ def main() -> None:
         contact_gate_np, nan=0.0, posinf=0.0, neginf=0.0
     )
     contact_gate_np[~contact_valid_np] = 0.0
+    containment_candidates = (
+        (
+            "initial_object_vertex_inside_capped_mano",
+            "object_vertex_inside_capped_mano",
+            "refined_object_vertex_inside_capped_mano",
+        )
+        if args.base_mode == "v14"
+        else (
+            "object_vertex_inside_capped_mano",
+            "refined_object_vertex_inside_capped_mano",
+            "initial_object_vertex_inside_capped_mano",
+        )
+    )
     containment_key = next(
         (
-            key for key in (
-                "object_vertex_inside_capped_mano",
-                "refined_object_vertex_inside_capped_mano",
-                "initial_object_vertex_inside_capped_mano",
-            )
+            key for key in containment_candidates
             if key in containment
         ),
         None,
@@ -1614,6 +1633,11 @@ def main() -> None:
                 total_contact_weight = contact_weight.sum().clamp_min(1e-6)
                 if args.adaptive_reset_optimizer_on_refresh:
                     optimizer.state.clear()
+        contact_facing_phase_scale = (
+            0.0
+            if alternating_mode and alternating_phase == "camera_z"
+            else 1.0
+        )
         optimizer.zero_grad(set_to_none=True)
         contact_region_active = None
         total_contact_region_scale = None
@@ -1778,7 +1802,9 @@ def main() -> None:
             )
             chunk_loss = (
                 args.w_contact * chunk_contact
-                + args.w_contact_facing * chunk_contact_facing
+                + contact_facing_phase_scale
+                * args.w_contact_facing
+                * chunk_contact_facing
                 + args.w_collision * chunk_collision
                 + args.w_object_normal_pushout
                 * chunk_object_normal_pushout
@@ -1835,7 +1861,9 @@ def main() -> None:
         regularization.backward()
         total_value = (
             args.w_contact * contact_value
-            + args.w_contact_facing * contact_facing_value
+            + contact_facing_phase_scale
+            * args.w_contact_facing
+            * contact_facing_value
             + args.w_collision * collision_value
             + args.w_object_normal_pushout * object_normal_pushout_value
             + args.w_tangential * tangential_value
@@ -1926,6 +1954,7 @@ def main() -> None:
                 "total": total_value,
                 "contact": contact_value,
                 "contact_facing": contact_facing_value,
+                "contact_facing_active": bool(contact_facing_phase_scale),
                 "collision": collision_value,
                 "object_normal_pushout": object_normal_pushout_value,
                 "tangential": tangential_value,
@@ -2196,7 +2225,9 @@ def main() -> None:
     delta_deg = effective_delta.norm(dim=-1).cpu().numpy() * 180.0 / math.pi
     summary = {
         "method": (
-            "object_normal_adaptive_collision_contact_local_mano_pushout_v1"
+            "v14_camera_z_pose_alternating_contact_facing_v1"
+            if args.base_mode == "v14" and alternating_mode
+            else "object_normal_adaptive_collision_contact_local_mano_pushout_v1"
             if args.adaptive_balance and args.w_object_normal_pushout > 0
             else "filtered_adaptive_collision_contact_local_mano_pushout_v2"
             if args.adaptive_balance and args.filter_contact_points
