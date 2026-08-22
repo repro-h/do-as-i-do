@@ -111,6 +111,11 @@ def parse_args() -> argparse.Namespace:
         "--adaptive-reset-optimizer-on-refresh", action="store_true"
     )
     parser.add_argument("--max-joint-delta-deg", type=float, default=4.0)
+    parser.add_argument(
+        "--thumb-max-joint-delta-deg",
+        type=float,
+        help="Optional shared delta limit for the thumb MCP/PIP/DIP joints.",
+    )
     parser.add_argument("--mcp-max-joint-delta-deg", type=float)
     parser.add_argument("--pip-max-joint-delta-deg", type=float)
     parser.add_argument("--dip-max-joint-delta-deg", type=float)
@@ -433,6 +438,11 @@ def main() -> None:
     ]
     if any(value is not None and value <= 0 for value in joint_limits):
         raise ValueError("Joint-group delta limits must be positive")
+    if (
+        args.thumb_max_joint_delta_deg is not None
+        and args.thumb_max_joint_delta_deg <= 0
+    ):
+        raise ValueError("Thumb joint delta limit must be positive")
     regularization_scales = [
         args.mcp_regularization_scale,
         args.pip_regularization_scale,
@@ -974,6 +984,10 @@ def main() -> None:
     max_delta = torch.tensor(
         group_limit_deg * 5, device=device, dtype=delta.dtype
     ).view(1, 15, 1) * (math.pi / 180.0)
+    if args.thumb_max_joint_delta_deg is not None:
+        max_delta[:, 12:15] = (
+            args.thumb_max_joint_delta_deg * math.pi / 180.0
+        )
     joint_regularization_scale = torch.tensor(
         regularization_scales * 5, device=device, dtype=delta.dtype
     ).view(1, 15, 1)
@@ -1504,6 +1518,7 @@ def main() -> None:
             "pose_acceleration": args.w_pose_acceleration,
         },
         "max_joint_delta_deg": args.max_joint_delta_deg,
+        "thumb_max_joint_delta_deg": args.thumb_max_joint_delta_deg,
         "joint_group_constraints": {
             "order": ["mcp", "pip", "dip"],
             "max_delta_deg": {
