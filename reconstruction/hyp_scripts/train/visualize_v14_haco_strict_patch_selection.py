@@ -210,8 +210,6 @@ def main() -> None:
             ))
         print(f"frame={frame_id(ids[index])}", flush=True)
         for region_index, region_name in enumerate(region_names):
-            if region_name not in patches:
-                continue
             raw = (
                 (region_ids == region_index)
                 & (probability[index] >= threshold)
@@ -228,16 +226,6 @@ def main() -> None:
             )[-topk:]]
             hand_points = current_hand[top_ids]
             hand_normals = current_hand_normals[top_ids]
-            patch_points = patches[region_name] @ pose[:3, :3].T + pose[:3, 3]
-            normals = patch_normals[region_name] @ pose[:3, :3].T
-            normals /= np.maximum(np.linalg.norm(normals, axis=-1, keepdims=True), 1e-8)
-            pairwise = np.linalg.norm(
-                hand_points[:, None] - patch_points[None], axis=-1
-            )
-            nearest = pairwise.argmin(axis=-1)
-            target_points = patch_points[nearest]
-            target_normals = normals[nearest]
-            normal_dot = np.sum(hand_normals * target_normals, axis=-1)
             color = COLORS.get(region_name, (220, 190, 30))
             if show_topk.value:
                 handles.append(server.scene.add_point_cloud(
@@ -246,6 +234,29 @@ def main() -> None:
                     colors=repeated_color(color, len(hand_points)),
                     point_size=float(point_size.value) * 1.5,
                 ))
+            if show_hand_normals.value:
+                add_normals(
+                    f"/regions/{region_name}/hand_normals",
+                    hand_points, hand_normals, color,
+                )
+            if region_name not in patches:
+                print(
+                    f"  {region_name}: topk={topk} object_patch=unselected",
+                    flush=True,
+                )
+                continue
+            patch_points = patches[region_name] @ pose[:3, :3].T + pose[:3, 3]
+            normals = patch_normals[region_name] @ pose[:3, :3].T
+            normals /= np.maximum(
+                np.linalg.norm(normals, axis=-1, keepdims=True), 1e-8
+            )
+            pairwise = np.linalg.norm(
+                hand_points[:, None] - patch_points[None], axis=-1
+            )
+            nearest = pairwise.argmin(axis=-1)
+            target_points = patch_points[nearest]
+            target_normals = normals[nearest]
+            normal_dot = np.sum(hand_normals * target_normals, axis=-1)
             if show_patches.value:
                 handles.append(server.scene.add_point_cloud(
                     f"/regions/{region_name}/object_patch",
@@ -253,11 +264,6 @@ def main() -> None:
                     colors=repeated_color(color, len(patch_points)),
                     point_size=float(point_size.value),
                 ))
-            if show_hand_normals.value:
-                add_normals(
-                    f"/regions/{region_name}/hand_normals",
-                    hand_points, hand_normals, color,
-                )
             if show_object_normals.value:
                 sample = np.linspace(
                     0, len(patch_points) - 1,
