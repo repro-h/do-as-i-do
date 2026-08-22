@@ -152,6 +152,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--thumb-mcp-regularization-scale", type=float)
     parser.add_argument("--thumb-pip-regularization-scale", type=float)
     parser.add_argument("--thumb-dip-regularization-scale", type=float)
+    parser.add_argument(
+        "--contact-pivot-residual-se3",
+        action="store_true",
+        help=(
+            "Jointly optimize a small camera-space rigid correction whose "
+            "rotation pivot is the Stage1-selected HACO contact centroid."
+        ),
+    )
+    parser.add_argument(
+        "--max-residual-translation-mm", type=float, default=5.0
+    )
+    parser.add_argument(
+        "--max-residual-rotation-deg", type=float, default=4.0
+    )
+    parser.add_argument(
+        "--w-residual-translation-anchor", type=float, default=0.1
+    )
+    parser.add_argument(
+        "--w-residual-rotation-anchor", type=float, default=1e-3
+    )
+    parser.add_argument(
+        "--w-residual-translation-velocity", type=float, default=0.1
+    )
+    parser.add_argument(
+        "--w-residual-rotation-velocity", type=float, default=1e-3
+    )
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--lr", type=float, default=3e-3)
     parser.add_argument("--max-grad-norm", type=float, default=10.0)
@@ -464,6 +490,18 @@ def main() -> None:
         raise ValueError("--w-object-normal-pushout must be non-negative")
     if args.max_grad_norm <= 0:
         raise ValueError("--max-grad-norm must be positive")
+    if args.max_residual_translation_mm <= 0:
+        raise ValueError("--max-residual-translation-mm must be positive")
+    if args.max_residual_rotation_deg <= 0:
+        raise ValueError("--max-residual-rotation-deg must be positive")
+    residual_weights = [
+        args.w_residual_translation_anchor,
+        args.w_residual_rotation_anchor,
+        args.w_residual_translation_velocity,
+        args.w_residual_rotation_velocity,
+    ]
+    if any(value < 0 for value in residual_weights):
+        raise ValueError("Residual SE3 regularization weights must be non-negative")
     joint_limits = [
         args.mcp_max_joint_delta_deg,
         args.pip_max_joint_delta_deg,
@@ -1065,7 +1103,29 @@ def main() -> None:
     delta = torch.zeros(
         (frame_count, 15, 3), device=device, requires_grad=True
     )
-    optimizer = torch.optim.Adam([delta], lr=args.lr)
+    pivot_weight = contact_weight.detach()
+    pivot_denominator = pivot_weight.sum(dim=-1, keepdim=True)
+    fallback_pivot = wrist + stage1_translation
+    contact_pivot = torch.where(
+        pivot_denominator > 0,
+        (
+            reconstructed * pivot_weight[..., None]
+        ).sum(dim=1) / pivot_denominator.clamp_min(1e-6),
+        fallback_pivot,
+    ).detach()
+    residual_translation = torch.zeros(
+        (frame_count, 3), device=device, requires_grad=True
+    )
+    residual_rotation = torch.zeros(
+        (frame_count, 3), device=device, requires_grad=True
+    )
+    optimized_parameters = [delta]
+    if args.contact_pivot_residual_se3:
+        optimized_parameters.extend([
+            residual_translation,
+            residual_rotation,
+        ])
+    optimizer = torch.optim.Adam(optimized_parameters, lr=args.lr)
     active_indices = torch.from_numpy(active_indices_np).to(device)
     contact_target = args.contact_target_mm / 1000.0
     collision_margin = args.collision_margin_mm / 1000.0
@@ -1097,7 +1157,29 @@ def main() -> None:
         return (value.square() * weights).sum() / weights.sum()
     best_total = float("inf")
     best_delta = torch.zeros_like(delta)
+    best_residual_translation = torch.zeros_like(residual_translation)
+    best_residual_rotation = torch.zeros_like(residual_rotation)
     history = []
+
+    def apply_residual_se3(
+        vertices: torch.Tensor,
+        indices: torch.Tensor | slice,
+    ) -> torch.Tensor:
+        if not args.contact_pivot_residual_se3:
+            return vertices
+        gate = optimization_gate[indices, None]
+        translation = residual_translation[indices] * gate
+        rotation_vector = residual_rotation[indices] * gate
+        rotation = axis_angle_to_matrix(rotation_vector)
+        pivot = contact_pivot[indices]
+        return (
+            torch.bmm(
+                vertices - pivot[:, None],
+                rotation.transpose(1, 2),
+            )
+            + pivot[:, None]
+            + translation[:, None]
+        )
 
     for step in range(1, args.steps + 1):
         if (
@@ -1120,7 +1202,7 @@ def main() -> None:
                         axis_angle_to_matrix(current_delta)
                         @ base_pose[frame_start:frame_end]
                     )
-                    current_parts.append(mano_camera_vertices(
+                    current_vertices = mano_camera_vertices(
                         mano,
                         global_orient[frame_start:frame_end],
                         current_pose,
@@ -1129,6 +1211,9 @@ def main() -> None:
                         stage1_translation[frame_start:frame_end],
                         stage1_rotation[frame_start:frame_end],
                         mirror_left,
+                    )
+                    current_parts.append(apply_residual_se3(
+                        current_vertices, slice(frame_start, frame_end)
                     ))
                 current_hand = torch.cat(current_parts)
                 current_inside_mask_np, current_inside_count_np = (
@@ -1225,6 +1310,7 @@ def main() -> None:
                 stage1_rotation[indices],
                 mirror_left,
             )
+            refined = apply_residual_se3(refined, indices)
             fixed_distance = torch.linalg.norm(
                 refined - fixed_contact_point[indices], dim=-1
             )
@@ -1337,6 +1423,31 @@ def main() -> None:
             + args.w_pose_velocity * weighted_joint_mean(velocity)
             + args.w_pose_acceleration * weighted_joint_mean(acceleration)
         )
+        if args.contact_pivot_residual_se3:
+            residual_translation_effective = (
+                residual_translation * optimization_gate[:, None]
+            )
+            residual_rotation_effective = (
+                residual_rotation * optimization_gate[:, None]
+            )
+            translation_velocity = (
+                residual_translation_effective[1:]
+                - residual_translation_effective[:-1]
+            )
+            rotation_velocity = (
+                residual_rotation_effective[1:]
+                - residual_rotation_effective[:-1]
+            )
+            regularization = regularization + (
+                args.w_residual_translation_anchor
+                * residual_translation_effective[active].square().mean()
+                + args.w_residual_rotation_anchor
+                * residual_rotation_effective[active].square().mean()
+                + args.w_residual_translation_velocity
+                * translation_velocity.square().mean()
+                + args.w_residual_rotation_velocity
+                * rotation_velocity.square().mean()
+            )
         regularization.backward()
         total_value = (
             args.w_contact * contact_value
@@ -1350,16 +1461,29 @@ def main() -> None:
             raise FloatingPointError(
                 f"Non-finite Stage2 loss at optimization step {step}"
             )
-        if delta.grad is None or not torch.isfinite(delta.grad).all():
+        gradients = [
+            parameter.grad
+            for parameter in optimized_parameters
+            if parameter.grad is not None
+        ]
+        if len(gradients) != len(optimized_parameters) or any(
+            not torch.isfinite(gradient).all() for gradient in gradients
+        ):
             raise FloatingPointError(
                 f"Non-finite Stage2 gradient at optimization step {step}"
             )
-        gradient_norm = torch.linalg.vector_norm(delta.grad)
+        gradient_norm = torch.sqrt(sum(
+            gradient.square().sum() for gradient in gradients
+        ))
         if gradient_norm > args.max_grad_norm:
-            delta.grad.mul_(args.max_grad_norm / gradient_norm)
+            scale = args.max_grad_norm / gradient_norm
+            for gradient in gradients:
+                gradient.mul_(scale)
         if total_value < best_total:
             best_total = total_value
             best_delta = delta.detach().clone()
+            best_residual_translation = residual_translation.detach().clone()
+            best_residual_rotation = residual_rotation.detach().clone()
         optimizer.step()
         with torch.no_grad():
             if not torch.isfinite(delta).all():
@@ -1369,6 +1493,22 @@ def main() -> None:
             norm = delta.norm(dim=-1, keepdim=True).clamp_min(1e-12)
             delta.mul_(torch.clamp(max_delta / norm, max=1.0))
             delta[~optimization_gate] = 0
+            translation_limit = args.max_residual_translation_mm / 1000.0
+            translation_norm = residual_translation.norm(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-12)
+            residual_translation.mul_(torch.clamp(
+                translation_limit / translation_norm, max=1.0
+            ))
+            rotation_limit = math.radians(args.max_residual_rotation_deg)
+            rotation_norm = residual_rotation.norm(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-12)
+            residual_rotation.mul_(torch.clamp(
+                rotation_limit / rotation_norm, max=1.0
+            ))
+            residual_translation[~optimization_gate] = 0
+            residual_rotation[~optimization_gate] = 0
         if step == 1 or step % 25 == 0 or step == args.steps:
             row = {
                 "step": step,
@@ -1399,12 +1539,22 @@ def main() -> None:
                     delta.detach()[active].norm(dim=-1).max().cpu()
                     * 180.0 / math.pi
                 ),
+                "residual_translation_median_mm": float(
+                    residual_translation.detach()[active]
+                    .norm(dim=-1).median().cpu() * 1000.0
+                ),
+                "residual_rotation_median_deg": float(
+                    residual_rotation.detach()[active]
+                    .norm(dim=-1).median().cpu() * 180.0 / math.pi
+                ),
             }
             history.append(row)
             print(row)
 
     if args.adaptive_balance:
         best_delta = delta.detach().clone()
+        best_residual_translation = residual_translation.detach().clone()
+        best_residual_rotation = residual_rotation.detach().clone()
 
     refined_parts = []
     refined_pose_parts = []
@@ -1416,7 +1566,7 @@ def main() -> None:
             ]
             refined_pose = axis_angle_to_matrix(effective_delta) @ base_pose[start:end]
             refined_pose_parts.append(refined_pose)
-            refined_parts.append(mano_camera_vertices(
+            refined_vertices = mano_camera_vertices(
                 mano,
                 global_orient[start:end],
                 refined_pose,
@@ -1425,7 +1575,23 @@ def main() -> None:
                 stage1_translation[start:end],
                 stage1_rotation[start:end],
                 mirror_left,
-            ))
+            )
+            if args.contact_pivot_residual_se3:
+                rotation = axis_angle_to_matrix(
+                    best_residual_rotation[start:end]
+                    * optimization_gate[start:end, None]
+                )
+                pivot = contact_pivot[start:end]
+                refined_vertices = (
+                    torch.bmm(
+                        refined_vertices - pivot[:, None],
+                        rotation.transpose(1, 2),
+                    )
+                    + pivot[:, None]
+                    + best_residual_translation[start:end, None]
+                    * optimization_gate[start:end, None, None]
+                )
+            refined_parts.append(refined_vertices)
         refined = torch.cat(refined_parts)
         refined_pose = torch.cat(refined_pose_parts)
     refined_np = refined.cpu().numpy().astype(np.float32)
@@ -1614,6 +1780,33 @@ def main() -> None:
             "pose_anchor": args.w_pose_anchor,
             "pose_velocity": args.w_pose_velocity,
             "pose_acceleration": args.w_pose_acceleration,
+            "residual_translation_anchor": (
+                args.w_residual_translation_anchor
+            ),
+            "residual_rotation_anchor": args.w_residual_rotation_anchor,
+            "residual_translation_velocity": (
+                args.w_residual_translation_velocity
+            ),
+            "residual_rotation_velocity": (
+                args.w_residual_rotation_velocity
+            ),
+        },
+        "contact_pivot_residual_se3": {
+            "enabled": args.contact_pivot_residual_se3,
+            "max_translation_mm": args.max_residual_translation_mm,
+            "max_rotation_deg": args.max_residual_rotation_deg,
+            "translation_norm_mm": distribution(
+                np.linalg.norm(
+                    best_residual_translation.cpu().numpy()[optimization_gate_np],
+                    axis=-1,
+                ) * 1000.0
+            ),
+            "rotation_norm_deg": distribution(
+                np.linalg.norm(
+                    best_residual_rotation.cpu().numpy()[optimization_gate_np],
+                    axis=-1,
+                ) * 180.0 / math.pi
+            ),
         },
         "max_joint_delta_deg": args.max_joint_delta_deg,
         "thumb_max_joint_delta_deg": args.thumb_max_joint_delta_deg,
@@ -1716,6 +1909,13 @@ def main() -> None:
         "initial_hand_pose_canonical_right": base_pose_np,
         "refined_hand_pose_canonical_right": refined_pose.cpu().numpy().astype(np.float32),
         "joint_rotation_delta_rotvec": effective_delta.cpu().numpy().astype(np.float32),
+        "contact_pivot_camera": contact_pivot.cpu().numpy().astype(np.float32),
+        "residual_translation_camera": (
+            best_residual_translation.cpu().numpy().astype(np.float32)
+        ),
+        "residual_rotation_rotvec": (
+            best_residual_rotation.cpu().numpy().astype(np.float32)
+        ),
         "initial_object_vertex_inside_capped_mano": inside_mask_np,
         "refined_object_vertex_inside_capped_mano": refined_inside_mask,
         "initial_inside_object_vertices": inside_count_np,
