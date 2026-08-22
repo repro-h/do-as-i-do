@@ -41,6 +41,23 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    triangles = vertices[faces]
+    face_normals = np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+    )
+    output = np.zeros_like(vertices, dtype=np.float32)
+    for corner in range(3):
+        np.add.at(output, faces[:, corner], face_normals)
+    output /= np.maximum(np.linalg.norm(output, axis=-1, keepdims=True), 1e-8)
+    center = np.median(vertices, axis=0)
+    radial_alignment = np.sum(output * (vertices - center), axis=-1)
+    if float(np.median(radial_alignment)) < 0.0:
+        output = -output
+    return output
+
+
 def load_npz(path: Path) -> dict[str, np.ndarray]:
     with np.load(path, allow_pickle=False) as data:
         return {key: np.asarray(data[key]) for key in data.files}
@@ -352,6 +369,10 @@ def main() -> None:
             "Stage2 object patch normals",
             initial_value=stage2_contact_normals is not None,
         ),
+        "stage2_hand_normals": server.gui.add_checkbox(
+            "Stage2 HACO hand normals",
+            initial_value=stage2_vertices is not None,
+        ),
         "collision_seeds": server.gui.add_checkbox(
             "Collision seed MANO vertices",
             initial_value=not args.lightweight_single_frame,
@@ -598,6 +619,9 @@ def main() -> None:
                     and stage2_contact_targets is not None
                     and stage2_contact_region_id is not None
                 ):
+                    current_hand_normals = vertex_normals(
+                        stage2_vertices[index], hand_faces
+                    )
                     for region_index, region_name in enumerate(
                         stage2_contact_region_names
                     ):
@@ -636,6 +660,31 @@ def main() -> None:
                             colors=line_colors,
                             line_width=3.0,
                         ))
+                        if controls["stage2_hand_normals"].value:
+                            hand_normals = current_hand_normals[region_selected]
+                            hand_endpoints = sources + (
+                                hand_normals * float(normal_length.value)
+                            )
+                            handles.append(server.scene.add_line_segments(
+                                f"{prefix}/hand_normals",
+                                points=np.stack(
+                                    (sources, hand_endpoints), axis=1
+                                ),
+                                colors=line_colors,
+                                line_width=4.0,
+                            ))
+                            hand_endpoint_color = np.minimum(
+                                color.astype(np.int16) + 55, 255
+                            ).astype(np.uint8)
+                            handles.append(server.scene.add_point_cloud(
+                                f"{prefix}/hand_normal_endpoints",
+                                points=hand_endpoints,
+                                colors=np.tile(
+                                    hand_endpoint_color[None],
+                                    (len(hand_endpoints), 1),
+                                ),
+                                point_size=float(point_size.value) * 1.25,
+                            ))
                         if (
                             controls["stage2_patch_normals"].value
                             and stage2_contact_normals is not None
