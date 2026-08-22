@@ -207,6 +207,31 @@ def main() -> None:
         )
         else None
     )
+    stage2_contact_normals = (
+        np.asarray(
+            stage2["contact_target_normal_camera"][stage2_indices],
+            dtype=np.float32,
+        )
+        if (
+            stage2 is not None
+            and stage2_indices is not None
+            and "contact_target_normal_camera" in stage2
+        )
+        else None
+    )
+    stage2_contact_region_id = (
+        np.asarray(stage2["contact_region_id"], dtype=np.int64)
+        if stage2 is not None and "contact_region_id" in stage2
+        else None
+    )
+    stage2_contact_region_names = (
+        [
+            value.decode() if isinstance(value, bytes) else str(value)
+            for value in np.asarray(stage2["contact_region_names"])
+        ]
+        if stage2 is not None and "contact_region_names" in stage2
+        else []
+    )
     hand_faces = np.asarray(query["mano_faces"], dtype=np.int64)
     probability = np.asarray(
         contact["contact_probability"][contact_indices], dtype=np.float32
@@ -290,6 +315,10 @@ def main() -> None:
         "Point size", min=0.001, max=0.015, step=0.001,
         initial_value=0.005,
     )
+    normal_length = server.gui.add_slider(
+        "Patch normal length", min=0.002, max=0.040, step=0.002,
+        initial_value=0.014,
+    )
     controls = {
         "object": server.gui.add_checkbox("GT YCB object", initial_value=True),
         "v14": server.gui.add_checkbox("V14 WiLoR hand", initial_value=False),
@@ -315,6 +344,14 @@ def main() -> None:
             "Stage2 object contact targets",
             initial_value=stage2_contact_targets is not None,
         ),
+        "stage2_region_contacts": server.gui.add_checkbox(
+            "Stage2 contacts by HACO region",
+            initial_value=stage2_contact_region_id is not None,
+        ),
+        "stage2_patch_normals": server.gui.add_checkbox(
+            "Stage2 object patch normals",
+            initial_value=stage2_contact_normals is not None,
+        ),
         "collision_seeds": server.gui.add_checkbox(
             "Collision seed MANO vertices",
             initial_value=not args.lightweight_single_frame,
@@ -335,6 +372,14 @@ def main() -> None:
     playing = {"value": False}
     suppress = {"value": False}
     filter_geometry_cache: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    region_colors = {
+        "palm": np.asarray([245, 70, 55], dtype=np.uint8),
+        "index": np.asarray([35, 190, 255], dtype=np.uint8),
+        "middle": np.asarray([255, 145, 35], dtype=np.uint8),
+        "pinky": np.asarray([90, 225, 75], dtype=np.uint8),
+        "ring": np.asarray([145, 90, 245], dtype=np.uint8),
+        "thumb": np.asarray([245, 45, 175], dtype=np.uint8),
+    }
 
     def clear() -> None:
         while handles:
@@ -548,6 +593,80 @@ def main() -> None:
                         ),
                         line_width=2.0,
                     ))
+                if (
+                    controls["stage2_region_contacts"].value
+                    and stage2_contact_targets is not None
+                    and stage2_contact_region_id is not None
+                ):
+                    for region_index, region_name in enumerate(
+                        stage2_contact_region_names
+                    ):
+                        region_selected = (
+                            stage2_selected
+                            & (stage2_contact_region_id == region_index)
+                        )
+                        if not region_selected.any():
+                            continue
+                        color = region_colors.get(
+                            region_name,
+                            np.asarray([230, 210, 40], dtype=np.uint8),
+                        )
+                        sources = stage2_vertices[index, region_selected]
+                        targets = stage2_contact_targets[index, region_selected]
+                        point_colors = np.tile(color[None], (len(sources), 1))
+                        line_colors = np.tile(
+                            color[None, None], (len(sources), 2, 1)
+                        )
+                        prefix = f"/stage2_regions/{region_name}"
+                        handles.append(server.scene.add_point_cloud(
+                            f"{prefix}/haco_topk_hand",
+                            points=sources,
+                            colors=point_colors,
+                            point_size=float(point_size.value) * 1.8,
+                        ))
+                        handles.append(server.scene.add_point_cloud(
+                            f"{prefix}/object_patch_targets",
+                            points=targets,
+                            colors=point_colors,
+                            point_size=float(point_size.value) * 2.0,
+                        ))
+                        handles.append(server.scene.add_line_segments(
+                            f"{prefix}/correspondences",
+                            points=np.stack((sources, targets), axis=1),
+                            colors=line_colors,
+                            line_width=3.0,
+                        ))
+                        if (
+                            controls["stage2_patch_normals"].value
+                            and stage2_contact_normals is not None
+                        ):
+                            normals = stage2_contact_normals[
+                                index, region_selected
+                            ]
+                            normal_norm = np.linalg.norm(
+                                normals, axis=-1, keepdims=True
+                            )
+                            normals = normals / np.maximum(normal_norm, 1e-8)
+                            endpoints = targets + (
+                                normals * float(normal_length.value)
+                            )
+                            handles.append(server.scene.add_line_segments(
+                                f"{prefix}/patch_normals",
+                                points=np.stack((targets, endpoints), axis=1),
+                                colors=line_colors,
+                                line_width=4.0,
+                            ))
+                            endpoint_color = np.maximum(
+                                color.astype(np.int16) - 80, 0
+                            ).astype(np.uint8)
+                            handles.append(server.scene.add_point_cloud(
+                                f"{prefix}/normal_endpoints",
+                                points=endpoints,
+                                colors=np.tile(
+                                    endpoint_color[None], (len(endpoints), 1)
+                                ),
+                                point_size=float(point_size.value) * 1.25,
+                            ))
         if controls["collision_seeds"].value and len(collision_seeds):
             handles.append(server.scene.add_point_cloud(
                 "/collision_seed_mano_vertices",
@@ -614,6 +733,7 @@ def main() -> None:
         control.on_update(lambda _: show_frame(current_frame()))
     threshold_slider.on_update(lambda _: show_frame(current_frame()))
     point_size.on_update(lambda _: show_frame(current_frame()))
+    normal_length.on_update(lambda _: show_frame(current_frame()))
 
     def playback() -> None:
         while True:
@@ -636,6 +756,11 @@ def main() -> None:
         "cyan=GT YCB, warm=raw HACO, bright green=filtered contacts, "
         "magenta points=Stage2 optimization contacts, blue points=collision "
         "seeds, red=contained YCB vertices"
+    )
+    print(
+        "Region colors: palm=red, index=cyan, middle=orange, "
+        "pinky=green, ring=violet, thumb=magenta. Dark endpoint marks "
+        "the positive object-normal direction."
     )
     print("Press Ctrl+C to stop")
     while True:
