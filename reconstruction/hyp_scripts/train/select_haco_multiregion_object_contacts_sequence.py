@@ -133,6 +133,13 @@ def vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
     for corner in range(3):
         np.add.at(output, faces[:, corner], face_normals)
     output /= np.maximum(np.linalg.norm(output, axis=-1, keepdims=True), 1e-12)
+    # A canonical-right-to-left reflection changes mesh handedness without
+    # changing the stored MANO face winding. Orient the resulting normals by
+    # the mesh interior so left/right caches both point out of the hand.
+    center = np.median(vertices, axis=0)
+    radial_alignment = np.sum(output * (vertices - center), axis=-1)
+    if float(np.median(radial_alignment)) < 0.0:
+        output = -output
     return output
 
 
