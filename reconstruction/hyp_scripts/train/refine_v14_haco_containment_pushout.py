@@ -167,6 +167,7 @@ def parse_args() -> argparse.Namespace:
             "joint_and_rigid",
             "rigid_only",
             "rotation_only",
+            "alternating_camera_z_pose",
         ),
         default="local_pose",
         help=(
@@ -177,6 +178,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-residual-translation-mm", type=float, default=5.0
     )
+    parser.add_argument("--alternating-z-steps", type=int, default=50)
+    parser.add_argument("--alternating-pose-steps", type=int, default=75)
     parser.add_argument(
         "--max-residual-rotation-deg", type=float, default=4.0
     )
@@ -618,7 +621,10 @@ def main() -> None:
     if args.max_residual_rotation_deg <= 0:
         raise ValueError("--max-residual-rotation-deg must be positive")
     if args.optimization_mode in (
-        "joint_and_rigid", "rigid_only", "rotation_only"
+        "joint_and_rigid",
+        "rigid_only",
+        "rotation_only",
+        "alternating_camera_z_pose",
     ):
         args.contact_pivot_residual_se3 = True
     elif args.contact_pivot_residual_se3:
@@ -1044,6 +1050,7 @@ def main() -> None:
     contact_region_ids_np = np.full(reconstructed.shape[1], -1, dtype=np.int64)
     contact_region_mask = None
     stage1_contact_region_indices: list[int] = []
+    stage1_contact_region_names: list[str] = []
     if args.region_balanced_contact:
         if "contact_region_id" not in stage1 or "contact_region_names" not in stage1:
             raise KeyError(
@@ -1080,6 +1087,7 @@ def main() -> None:
             stage1_contact_region_indices = [
                 contact_region_names.index(name) for name in fixed_names
             ]
+            stage1_contact_region_names = fixed_names
 
     def build_contact_weights(
         hand: torch.Tensor,
@@ -1266,9 +1274,11 @@ def main() -> None:
     )
     optimize_residual_se3 = args.optimization_mode != "local_pose"
     optimize_residual_translation = args.optimization_mode in (
-        "joint_and_rigid", "rigid_only"
+        "joint_and_rigid", "rigid_only", "alternating_camera_z_pose"
     )
-    optimize_residual_rotation = optimize_residual_se3
+    optimize_residual_rotation = args.optimization_mode in (
+        "joint_and_rigid", "rigid_only", "rotation_only"
+    )
     delta = torch.zeros(
         (frame_count, 15, 3),
         device=device,
@@ -1300,6 +1310,35 @@ def main() -> None:
     if optimize_residual_rotation:
         optimized_parameters.append(residual_rotation)
     optimizer = torch.optim.Adam(optimized_parameters, lr=args.lr)
+    alternating_mode = args.optimization_mode == "alternating_camera_z_pose"
+    if alternating_mode:
+        if args.contact_point_selection != "stage1_probability":
+            raise ValueError(
+                "alternating_camera_z_pose requires "
+                "--contact-point-selection stage1_probability"
+            )
+        if args.alternating_z_steps <= 0 or args.alternating_pose_steps <= 0:
+            raise ValueError("Alternating Z/Pose step counts must be positive")
+        if not stage1_contact_region_names:
+            raise RuntimeError("No Stage1 fixed contact regions for pose optimization")
+    pose_region_joint_slices = {
+        "index": slice(0, 3),
+        "middle": slice(3, 6),
+        "pinky": slice(6, 9),
+        "ring": slice(9, 12),
+        "thumb": slice(12, 15),
+    }
+    optimized_joint_mask = torch.ones((1, 15, 1), device=device)
+    if alternating_mode:
+        optimized_joint_mask.zero_()
+        for region_name in stage1_contact_region_names:
+            joint_slice = pose_region_joint_slices.get(region_name)
+            if joint_slice is not None:
+                optimized_joint_mask[:, joint_slice] = 1.0
+        if not optimized_joint_mask.any():
+            raise RuntimeError(
+                "Stage1 contact regions contain no articulated finger joints"
+            )
     active_indices = torch.from_numpy(active_indices_np).to(device)
     contact_target = args.contact_target_mm / 1000.0
     collision_margin = args.collision_margin_mm / 1000.0
@@ -1356,6 +1395,14 @@ def main() -> None:
         )
 
     for step in range(1, args.steps + 1):
+        alternating_phase = None
+        if alternating_mode:
+            cycle_steps = args.alternating_z_steps + args.alternating_pose_steps
+            alternating_phase = (
+                "camera_z"
+                if (step - 1) % cycle_steps < args.alternating_z_steps
+                else "local_pose"
+            )
         if (
             args.adaptive_balance
             and step > 1
@@ -1667,6 +1714,17 @@ def main() -> None:
             raise FloatingPointError(
                 f"Non-finite Stage2 gradient at optimization step {step}"
             )
+        if alternating_mode:
+            delta.grad.mul_(optimized_joint_mask)
+            residual_translation.grad[:, :2].zero_()
+            if alternating_phase == "camera_z":
+                delta.grad.zero_()
+            else:
+                residual_translation.grad.zero_()
+        delta_before_step = delta.detach().clone() if alternating_mode else None
+        translation_before_step = (
+            residual_translation.detach().clone() if alternating_mode else None
+        )
         gradient_norm = torch.sqrt(sum(
             gradient.square().sum() for gradient in gradients
         ))
@@ -1681,6 +1739,11 @@ def main() -> None:
             best_residual_rotation = residual_rotation.detach().clone()
         optimizer.step()
         with torch.no_grad():
+            if alternating_mode:
+                if alternating_phase == "camera_z":
+                    delta.copy_(delta_before_step)
+                else:
+                    residual_translation.copy_(translation_before_step)
             if not torch.isfinite(delta).all():
                 raise FloatingPointError(
                     f"Non-finite Stage2 parameters after optimization step {step}"
@@ -1688,14 +1751,21 @@ def main() -> None:
             if optimize_local_pose:
                 norm = delta.norm(dim=-1, keepdim=True).clamp_min(1e-12)
                 delta.mul_(torch.clamp(max_delta / norm, max=1.0))
+                delta.mul_(optimized_joint_mask)
                 delta[~optimization_gate] = 0
             translation_limit = args.max_residual_translation_mm / 1000.0
-            translation_norm = residual_translation.norm(
-                dim=-1, keepdim=True
-            ).clamp_min(1e-12)
-            residual_translation.mul_(torch.clamp(
-                translation_limit / translation_norm, max=1.0
-            ))
+            if alternating_mode:
+                residual_translation[:, :2].zero_()
+                residual_translation[:, 2].clamp_(
+                    -translation_limit, translation_limit
+                )
+            else:
+                translation_norm = residual_translation.norm(
+                    dim=-1, keepdim=True
+                ).clamp_min(1e-12)
+                residual_translation.mul_(torch.clamp(
+                    translation_limit / translation_norm, max=1.0
+                ))
             rotation_limit = math.radians(args.max_residual_rotation_deg)
             rotation_norm = residual_rotation.norm(
                 dim=-1, keepdim=True
@@ -1708,6 +1778,7 @@ def main() -> None:
         if step == 1 or step % 25 == 0 or step == args.steps:
             row = {
                 "step": step,
+                "alternating_phase": alternating_phase,
                 "total": total_value,
                 "contact": contact_value,
                 "collision": collision_value,
@@ -1975,6 +2046,14 @@ def main() -> None:
         ),
         "base_mode": args.base_mode,
         "optimization_mode": args.optimization_mode,
+        "alternating_optimization": {
+            "enabled": alternating_mode,
+            "camera_z_steps": args.alternating_z_steps,
+            "local_pose_steps": args.alternating_pose_steps,
+            "pose_regions": stage1_contact_region_names,
+            "camera_xy_frozen": alternating_mode,
+            "rigid_rotation_frozen": alternating_mode,
+        },
         "stream_id": str(query["stream_id"].item()),
         "hand_side": str(query["hand_side"].item()),
         "frames": frame_count,
