@@ -161,6 +161,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--optimization-mode",
+        choices=("local_pose", "joint_and_rigid", "rigid_only"),
+        default="local_pose",
+        help=(
+            "Optimize MANO local pose, local pose plus contact-pivot rigid "
+            "correction, or only the contact-pivot rigid correction."
+        ),
+    )
+    parser.add_argument(
         "--max-residual-translation-mm", type=float, default=5.0
     )
     parser.add_argument(
@@ -494,6 +503,10 @@ def main() -> None:
         raise ValueError("--max-residual-translation-mm must be positive")
     if args.max_residual_rotation_deg <= 0:
         raise ValueError("--max-residual-rotation-deg must be positive")
+    if args.optimization_mode in ("joint_and_rigid", "rigid_only"):
+        args.contact_pivot_residual_se3 = True
+    elif args.contact_pivot_residual_se3:
+        args.optimization_mode = "joint_and_rigid"
     residual_weights = [
         args.w_residual_translation_anchor,
         args.w_residual_rotation_anchor,
@@ -1100,8 +1113,12 @@ def main() -> None:
         )
     )
     total_contact_weight = contact_weight.sum().clamp_min(1e-6)
+    optimize_local_pose = args.optimization_mode != "rigid_only"
+    optimize_residual_se3 = args.optimization_mode != "local_pose"
     delta = torch.zeros(
-        (frame_count, 15, 3), device=device, requires_grad=True
+        (frame_count, 15, 3),
+        device=device,
+        requires_grad=optimize_local_pose,
     )
     pivot_weight = contact_weight.detach()
     pivot_denominator = pivot_weight.sum(dim=-1, keepdim=True)
@@ -1119,8 +1136,8 @@ def main() -> None:
     residual_rotation = torch.zeros(
         (frame_count, 3), device=device, requires_grad=True
     )
-    optimized_parameters = [delta]
-    if args.contact_pivot_residual_se3:
+    optimized_parameters = [delta] if optimize_local_pose else []
+    if optimize_residual_se3:
         optimized_parameters.extend([
             residual_translation,
             residual_rotation,
@@ -1165,7 +1182,7 @@ def main() -> None:
         vertices: torch.Tensor,
         indices: torch.Tensor | slice,
     ) -> torch.Tensor:
-        if not args.contact_pivot_residual_se3:
+        if not optimize_residual_se3:
             return vertices
         gate = optimization_gate[indices, None]
         translation = residual_translation[indices] * gate
@@ -1423,7 +1440,7 @@ def main() -> None:
             + args.w_pose_velocity * weighted_joint_mean(velocity)
             + args.w_pose_acceleration * weighted_joint_mean(acceleration)
         )
-        if args.contact_pivot_residual_se3:
+        if optimize_residual_se3:
             residual_translation_effective = (
                 residual_translation * optimization_gate[:, None]
             )
@@ -1490,9 +1507,10 @@ def main() -> None:
                 raise FloatingPointError(
                     f"Non-finite Stage2 parameters after optimization step {step}"
                 )
-            norm = delta.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-            delta.mul_(torch.clamp(max_delta / norm, max=1.0))
-            delta[~optimization_gate] = 0
+            if optimize_local_pose:
+                norm = delta.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+                delta.mul_(torch.clamp(max_delta / norm, max=1.0))
+                delta[~optimization_gate] = 0
             translation_limit = args.max_residual_translation_mm / 1000.0
             translation_norm = residual_translation.norm(
                 dim=-1, keepdim=True
@@ -1576,7 +1594,7 @@ def main() -> None:
                 stage1_rotation[start:end],
                 mirror_left,
             )
-            if args.contact_pivot_residual_se3:
+            if optimize_residual_se3:
                 rotation = axis_angle_to_matrix(
                     best_residual_rotation[start:end]
                     * optimization_gate[start:end, None]
@@ -1764,6 +1782,7 @@ def main() -> None:
             )
         ),
         "base_mode": args.base_mode,
+        "optimization_mode": args.optimization_mode,
         "stream_id": str(query["stream_id"].item()),
         "hand_side": str(query["hand_side"].item()),
         "frames": frame_count,
@@ -1792,7 +1811,7 @@ def main() -> None:
             ),
         },
         "contact_pivot_residual_se3": {
-            "enabled": args.contact_pivot_residual_se3,
+            "enabled": optimize_residual_se3,
             "max_translation_mm": args.max_residual_translation_mm,
             "max_rotation_deg": args.max_residual_rotation_deg,
             "translation_norm_mm": distribution(
