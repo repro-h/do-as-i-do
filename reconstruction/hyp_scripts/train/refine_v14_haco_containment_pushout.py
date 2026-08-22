@@ -162,7 +162,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--optimization-mode",
-        choices=("local_pose", "joint_and_rigid", "rigid_only"),
+        choices=(
+            "local_pose",
+            "joint_and_rigid",
+            "rigid_only",
+            "rotation_only",
+        ),
         default="local_pose",
         help=(
             "Optimize MANO local pose, local pose plus contact-pivot rigid "
@@ -187,6 +192,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--w-residual-rotation-velocity", type=float, default=1e-3
     )
+    parser.add_argument(
+        "--freeze-contact-correspondences",
+        action="store_true",
+        help="Keep the initial hand-to-object contact targets during refreshes.",
+    )
+    parser.add_argument("--reprojection-fx", type=float, default=600.0)
+    parser.add_argument("--reprojection-fy", type=float, default=600.0)
+    parser.add_argument(
+        "--reprojection-tolerance-px", type=float, default=2.0
+    )
+    parser.add_argument("--w-reprojection", type=float, default=0.0)
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--lr", type=float, default=3e-3)
     parser.add_argument("--max-grad-norm", type=float, default=10.0)
@@ -503,7 +519,9 @@ def main() -> None:
         raise ValueError("--max-residual-translation-mm must be positive")
     if args.max_residual_rotation_deg <= 0:
         raise ValueError("--max-residual-rotation-deg must be positive")
-    if args.optimization_mode in ("joint_and_rigid", "rigid_only"):
+    if args.optimization_mode in (
+        "joint_and_rigid", "rigid_only", "rotation_only"
+    ):
         args.contact_pivot_residual_se3 = True
     elif args.contact_pivot_residual_se3:
         args.optimization_mode = "joint_and_rigid"
@@ -515,6 +533,10 @@ def main() -> None:
     ]
     if any(value < 0 for value in residual_weights):
         raise ValueError("Residual SE3 regularization weights must be non-negative")
+    if args.reprojection_fx <= 0 or args.reprojection_fy <= 0:
+        raise ValueError("Reprojection focal lengths must be positive")
+    if args.reprojection_tolerance_px < 0 or args.w_reprojection < 0:
+        raise ValueError("Invalid reprojection constraint")
     joint_limits = [
         args.mcp_max_joint_delta_deg,
         args.pip_max_joint_delta_deg,
@@ -1113,8 +1135,14 @@ def main() -> None:
         )
     )
     total_contact_weight = contact_weight.sum().clamp_min(1e-6)
-    optimize_local_pose = args.optimization_mode != "rigid_only"
+    optimize_local_pose = args.optimization_mode not in (
+        "rigid_only", "rotation_only"
+    )
     optimize_residual_se3 = args.optimization_mode != "local_pose"
+    optimize_residual_translation = args.optimization_mode in (
+        "joint_and_rigid", "rigid_only"
+    )
+    optimize_residual_rotation = optimize_residual_se3
     delta = torch.zeros(
         (frame_count, 15, 3),
         device=device,
@@ -1131,17 +1159,20 @@ def main() -> None:
         fallback_pivot,
     ).detach()
     residual_translation = torch.zeros(
-        (frame_count, 3), device=device, requires_grad=True
+        (frame_count, 3),
+        device=device,
+        requires_grad=optimize_residual_translation,
     )
     residual_rotation = torch.zeros(
-        (frame_count, 3), device=device, requires_grad=True
+        (frame_count, 3),
+        device=device,
+        requires_grad=optimize_residual_rotation,
     )
     optimized_parameters = [delta] if optimize_local_pose else []
-    if optimize_residual_se3:
-        optimized_parameters.extend([
-            residual_translation,
-            residual_rotation,
-        ])
+    if optimize_residual_translation:
+        optimized_parameters.append(residual_translation)
+    if optimize_residual_rotation:
+        optimized_parameters.append(residual_rotation)
     optimizer = torch.optim.Adam(optimized_parameters, lr=args.lr)
     active_indices = torch.from_numpy(active_indices_np).to(device)
     contact_target = args.contact_target_mm / 1000.0
@@ -1267,18 +1298,21 @@ def main() -> None:
                 frame_contact_scale, frame_collision_scale = (
                     adaptive_scales()
                 )
-                (
-                    current_contact_distance,
-                    fixed_contact_point,
-                    fixed_contact_normal,
-                ) = (
-                    nearest_object_correspondences(
+                if args.freeze_contact_correspondences:
+                    current_contact_distance = torch.linalg.norm(
+                        current_hand - fixed_contact_point, dim=-1
+                    )
+                else:
+                    (
+                        current_contact_distance,
+                        fixed_contact_point,
+                        fixed_contact_normal,
+                    ) = nearest_object_correspondences(
                         current_hand,
                         object_points,
                         object_normals,
                         args.frame_chunk,
                     )
-                )
                 (
                     contact_weight,
                     selected_contact_count,
@@ -1311,6 +1345,7 @@ def main() -> None:
         object_normal_pushout_value = 0.0
         tangential_value = 0.0
         vertex_anchor_value = 0.0
+        reprojection_value = 0.0
         for start in range(0, len(active_indices_np), args.frame_chunk):
             indices = active_indices[start:start + args.frame_chunk]
             effective_delta = delta[indices] * optimization_gate[
@@ -1367,6 +1402,25 @@ def main() -> None:
                 * frame_contact_scale[indices, None]
             ).sum() / total_contact_weight
             chunk_vertex_anchor = displacement.square().sum() / total_active_vertices
+            initial_depth = reconstructed[indices, :, 2].clamp_min(1e-4)
+            refined_depth = refined[:, :, 2].clamp_min(1e-4)
+            initial_projection = torch.stack((
+                args.reprojection_fx
+                * reconstructed[indices, :, 0] / initial_depth,
+                args.reprojection_fy
+                * reconstructed[indices, :, 1] / initial_depth,
+            ), dim=-1)
+            refined_projection = torch.stack((
+                args.reprojection_fx * refined[:, :, 0] / refined_depth,
+                args.reprojection_fy * refined[:, :, 1] / refined_depth,
+            ), dim=-1)
+            reprojection_error = torch.linalg.norm(
+                refined_projection - initial_projection, dim=-1
+            )
+            chunk_reprojection = torch.clamp(
+                reprojection_error - args.reprojection_tolerance_px,
+                min=0.0,
+            ).square().mean()
 
             chunk_collision_sum = torch.zeros((), device=device)
             chunk_object_normal_pushout_sum = torch.zeros((), device=device)
@@ -1420,6 +1474,7 @@ def main() -> None:
                 * chunk_object_normal_pushout
                 + args.w_tangential * chunk_tangential
                 + args.w_vertex_anchor * chunk_vertex_anchor
+                + args.w_reprojection * chunk_reprojection
             )
             chunk_loss.backward()
             contact_value += float(chunk_contact.detach())
@@ -1429,6 +1484,7 @@ def main() -> None:
             )
             tangential_value += float(chunk_tangential.detach())
             vertex_anchor_value += float(chunk_vertex_anchor.detach())
+            reprojection_value += float(chunk_reprojection.detach())
 
         effective_delta = delta * optimization_gate[:, None, None]
         active = optimization_gate
@@ -1472,6 +1528,7 @@ def main() -> None:
             + args.w_object_normal_pushout * object_normal_pushout_value
             + args.w_tangential * tangential_value
             + args.w_vertex_anchor * vertex_anchor_value
+            + args.w_reprojection * reprojection_value
             + float(regularization.detach())
         )
         if not math.isfinite(total_value):
@@ -1536,6 +1593,7 @@ def main() -> None:
                 "object_normal_pushout": object_normal_pushout_value,
                 "tangential": tangential_value,
                 "vertex_anchor": vertex_anchor_value,
+                "reprojection": reprojection_value,
                 "regularization": float(regularization.detach()),
                 "inside_vertices": int(current_inside_count_np.sum()),
                 "adaptive_contact_gate_median": float(
@@ -1613,6 +1671,19 @@ def main() -> None:
         refined = torch.cat(refined_parts)
         refined_pose = torch.cat(refined_pose_parts)
     refined_np = refined.cpu().numpy().astype(np.float32)
+    initial_depth_np = np.maximum(base_vertices_np[..., 2], 1e-4)
+    refined_depth_np = np.maximum(refined_np[..., 2], 1e-4)
+    initial_projection_np = np.stack((
+        args.reprojection_fx * base_vertices_np[..., 0] / initial_depth_np,
+        args.reprojection_fy * base_vertices_np[..., 1] / initial_depth_np,
+    ), axis=-1)
+    refined_projection_np = np.stack((
+        args.reprojection_fx * refined_np[..., 0] / refined_depth_np,
+        args.reprojection_fy * refined_np[..., 1] / refined_depth_np,
+    ), axis=-1)
+    reprojection_error_px = np.linalg.norm(
+        refined_projection_np - initial_projection_np, axis=-1
+    ).astype(np.float32)
     refined_distance, refined_normal_inside = nearest_geometry(
         refined, object_points, object_normals, args.frame_chunk
     )
@@ -1809,6 +1880,7 @@ def main() -> None:
             "residual_rotation_velocity": (
                 args.w_residual_rotation_velocity
             ),
+            "reprojection": args.w_reprojection,
         },
         "contact_pivot_residual_se3": {
             "enabled": optimize_residual_se3,
@@ -1825,6 +1897,19 @@ def main() -> None:
                     best_residual_rotation.cpu().numpy()[optimization_gate_np],
                     axis=-1,
                 ) * 180.0 / math.pi
+            ),
+            "translation_frozen": not optimize_residual_translation,
+            "contact_correspondences_frozen": (
+                args.freeze_contact_correspondences
+            ),
+            "reprojection_fx": args.reprojection_fx,
+            "reprojection_fy": args.reprojection_fy,
+            "reprojection_tolerance_px": args.reprojection_tolerance_px,
+            "reprojection_error_px": distribution(
+                reprojection_error_px[optimization_gate_np]
+            ),
+            "reprojection_frame_median_px": distribution(
+                np.median(reprojection_error_px, axis=-1)[optimization_gate_np]
             ),
         },
         "max_joint_delta_deg": args.max_joint_delta_deg,
@@ -1935,6 +2020,7 @@ def main() -> None:
         "residual_rotation_rotvec": (
             best_residual_rotation.cpu().numpy().astype(np.float32)
         ),
+        "reprojection_error_px": reprojection_error_px,
         "initial_object_vertex_inside_capped_mano": inside_mask_np,
         "refined_object_vertex_inside_capped_mano": refined_inside_mask,
         "initial_inside_object_vertices": inside_count_np,
