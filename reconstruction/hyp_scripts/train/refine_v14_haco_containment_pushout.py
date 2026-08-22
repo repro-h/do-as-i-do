@@ -104,7 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-contact", type=float, default=1.0)
     parser.add_argument("--w-contact-facing", type=float, default=0.0)
     parser.add_argument(
-        "--contact-facing-min-cosine",
+        "--contact-surface-facing-min-cosine",
         type=float,
         default=0.2,
         help=(
@@ -660,8 +660,10 @@ def main() -> None:
         raise ValueError("--stage1-contact-vertex-topk must be positive")
     if args.w_contact_facing < 0:
         raise ValueError("--w-contact-facing must be non-negative")
-    if not -1.0 <= args.contact_facing_min_cosine <= 1.0:
-        raise ValueError("--contact-facing-min-cosine must be in [-1, 1]")
+    if not -1.0 <= args.contact_surface_facing_min_cosine <= 1.0:
+        raise ValueError(
+            "--contact-surface-facing-min-cosine must be in [-1, 1]"
+        )
     if (
         args.contact_point_selection == "stage1_probability"
         and not args.region_balanced_contact
@@ -1667,7 +1669,8 @@ def main() -> None:
                 hand_normals * patch_direction
             ).sum(dim=-1)
             contact_facing_error = torch.clamp(
-                args.contact_facing_min_cosine - contact_facing_cosine,
+                args.contact_surface_facing_min_cosine
+                - contact_facing_cosine,
                 min=0.0,
             ).square()
             chunk_contact_facing = (
@@ -2092,7 +2095,8 @@ def main() -> None:
         ) if len(selected_refined_mm) else None,
         "refined_facing_cosine": distribution(selected_facing_cosine),
         "refined_facing_pass_fraction": float(np.mean(
-            selected_facing_cosine >= args.contact_facing_min_cosine
+            selected_facing_cosine
+            >= args.contact_surface_facing_min_cosine
         )) if len(selected_facing_cosine) else None,
     }
     contact_region_count_np = np.zeros(
@@ -2245,7 +2249,7 @@ def main() -> None:
         },
         "contact_facing": {
             "enabled": args.w_contact_facing > 0,
-            "minimum_cosine": args.contact_facing_min_cosine,
+            "minimum_cosine": args.contact_surface_facing_min_cosine,
             "interpretation": (
                 "MANO outward normal dot normalized direction from the "
                 "selected HACO vertex to its object-patch target"
