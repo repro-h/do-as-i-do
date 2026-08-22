@@ -116,6 +116,9 @@ def parse_args() -> argparse.Namespace:
         type=float,
         help="Optional shared delta limit for the thumb MCP/PIP/DIP joints.",
     )
+    parser.add_argument("--thumb-mcp-max-joint-delta-deg", type=float)
+    parser.add_argument("--thumb-pip-max-joint-delta-deg", type=float)
+    parser.add_argument("--thumb-dip-max-joint-delta-deg", type=float)
     parser.add_argument("--mcp-max-joint-delta-deg", type=float)
     parser.add_argument("--pip-max-joint-delta-deg", type=float)
     parser.add_argument("--dip-max-joint-delta-deg", type=float)
@@ -128,6 +131,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dip-regularization-scale", type=float, default=1.0
     )
+    parser.add_argument("--thumb-mcp-regularization-scale", type=float)
+    parser.add_argument("--thumb-pip-regularization-scale", type=float)
+    parser.add_argument("--thumb-dip-regularization-scale", type=float)
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--lr", type=float, default=3e-3)
     parser.add_argument("--max-grad-norm", type=float, default=10.0)
@@ -443,6 +449,13 @@ def main() -> None:
         and args.thumb_max_joint_delta_deg <= 0
     ):
         raise ValueError("Thumb joint delta limit must be positive")
+    thumb_joint_limits = [
+        args.thumb_mcp_max_joint_delta_deg,
+        args.thumb_pip_max_joint_delta_deg,
+        args.thumb_dip_max_joint_delta_deg,
+    ]
+    if any(value is not None and value <= 0 for value in thumb_joint_limits):
+        raise ValueError("Thumb per-joint delta limits must be positive")
     regularization_scales = [
         args.mcp_regularization_scale,
         args.pip_regularization_scale,
@@ -450,6 +463,16 @@ def main() -> None:
     ]
     if any(value <= 0 for value in regularization_scales):
         raise ValueError("Joint-group regularization scales must be positive")
+    thumb_regularization_scales = [
+        args.thumb_mcp_regularization_scale,
+        args.thumb_pip_regularization_scale,
+        args.thumb_dip_regularization_scale,
+    ]
+    if any(
+        value is not None and value <= 0
+        for value in thumb_regularization_scales
+    ):
+        raise ValueError("Thumb per-joint regularization scales must be positive")
     trajectory = load_npz(Path(args.trajectory_npz).expanduser().resolve())
     query = load_npz(Path(args.query_npz).expanduser().resolve())
     stage1 = load_npz(Path(args.stage1_npz).expanduser().resolve())
@@ -988,9 +1011,15 @@ def main() -> None:
         max_delta[:, 12:15] = (
             args.thumb_max_joint_delta_deg * math.pi / 180.0
         )
+    for offset, value in enumerate(thumb_joint_limits):
+        if value is not None:
+            max_delta[:, 12 + offset] = value * math.pi / 180.0
     joint_regularization_scale = torch.tensor(
         regularization_scales * 5, device=device, dtype=delta.dtype
     ).view(1, 15, 1)
+    for offset, value in enumerate(thumb_regularization_scales):
+        if value is not None:
+            joint_regularization_scale[:, 12 + offset] = value
 
     def weighted_joint_mean(value: torch.Tensor) -> torch.Tensor:
         if not value.numel():
@@ -1519,6 +1548,18 @@ def main() -> None:
         },
         "max_joint_delta_deg": args.max_joint_delta_deg,
         "thumb_max_joint_delta_deg": args.thumb_max_joint_delta_deg,
+        "thumb_joint_constraints": {
+            "max_delta_deg": {
+                "mcp": float(max_delta[0, 12, 0].cpu()) * 180.0 / math.pi,
+                "pip": float(max_delta[0, 13, 0].cpu()) * 180.0 / math.pi,
+                "dip": float(max_delta[0, 14, 0].cpu()) * 180.0 / math.pi,
+            },
+            "regularization_scale": {
+                "mcp": float(joint_regularization_scale[0, 12, 0].cpu()),
+                "pip": float(joint_regularization_scale[0, 13, 0].cpu()),
+                "dip": float(joint_regularization_scale[0, 14, 0].cpu()),
+            },
+        },
         "joint_group_constraints": {
             "order": ["mcp", "pip", "dip"],
             "max_delta_deg": {
