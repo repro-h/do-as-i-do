@@ -68,6 +68,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--intrinsics", type=float, nargs=4)
     parser.add_argument("--frame-stride", type=int, default=4)
     parser.add_argument("--minimum-contact-vertices", type=int, default=3)
+    parser.add_argument(
+        "--haco-topk-per-region",
+        type=int,
+        default=0,
+        help="Use only each region's highest-probability HACO vertices; 0 uses all.",
+    )
     parser.add_argument("--haco-components-per-region", type=int, default=1)
     parser.add_argument("--pixel-radius", type=float, default=30.0)
     parser.add_argument("--pixel-soft-topk", type=int, default=8)
@@ -83,6 +89,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--normal-fallback-max-dot", type=float, default=1.0)
     parser.add_argument(
         "--minimum-normal-compatible-candidates", type=int, default=8
+    )
+    parser.add_argument(
+        "--require-normal-compatible",
+        action="store_true",
+        help="Reject a frame/region instead of falling back to ungated normals.",
     )
     parser.add_argument("--visible-surface-only", action="store_true")
     parser.add_argument("--visibility-layers", type=int, default=1)
@@ -492,6 +503,13 @@ def main() -> None:
             )
             if int(mask.sum()) < args.minimum_contact_vertices:
                 continue
+            if args.haco_topk_per_region > 0 and int(mask.sum()) > args.haco_topk_per_region:
+                component_ids = np.flatnonzero(mask)
+                keep = component_ids[np.argsort(
+                    probability[component_ids]
+                )[-args.haco_topk_per_region:]]
+                mask = np.zeros_like(mask)
+                mask[keep] = True
             region_hand = hand[mask]
             region_hand_normals = hand_normals[mask]
             region_uv = hand_uv[mask]
@@ -551,7 +569,10 @@ def main() -> None:
                 candidate_base_valid
                 & (normal_dot <= args.normal_fallback_max_dot)
             )
-            if (
+            if args.require_normal_compatible:
+                candidate_valid = primary_normal
+                normal_filter_mode = "strict"
+            elif (
                 int(primary_normal.sum())
                 >= args.minimum_normal_compatible_candidates
             ):
@@ -939,6 +960,8 @@ def main() -> None:
             "minimum_normal_compatible_candidates": (
                 args.minimum_normal_compatible_candidates
             ),
+            "require_normal_compatible": args.require_normal_compatible,
+            "haco_topk_per_region": args.haco_topk_per_region,
             "visible_surface_only": args.visible_surface_only,
             "visibility_layers": args.visibility_layers,
             "cluster_radius_mm": args.cluster_radius_mm,
