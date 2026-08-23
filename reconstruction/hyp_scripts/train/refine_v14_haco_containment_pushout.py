@@ -130,6 +130,16 @@ def parse_args() -> argparse.Namespace:
         default=2.0,
         help="Desired opposite-normal displacement for selected HACO vertices.",
     )
+    parser.add_argument(
+        "--contact-normal-pushout-mode",
+        choices=("collision_point_side", "opposite_hand_normal"),
+        default="collision_point_side",
+        help=(
+            "Choose the push direction from the current inside-point side "
+            "relative to HACO top-k normals, or use the legacy fixed "
+            "opposite-MANO-normal direction."
+        ),
+    )
     parser.add_argument("--w-tangential", type=float, default=2.0)
     parser.add_argument("--w-vertex-anchor", type=float, default=1.0)
     parser.add_argument("--w-pose-anchor", type=float, default=5e-4)
@@ -1435,6 +1445,128 @@ def main() -> None:
         )
         return weights, selected_count, effective_count
 
+    def build_contact_normal_pushout_state(
+        hand: torch.Tensor,
+        inside_mask: np.ndarray,
+        points_by_frame: list[torch.Tensor | None],
+        collision_faces: list[torch.Tensor | None],
+        weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Infer a region push direction from the current inside points.
+
+        A collision point selects the side of a HACO region: only top-k
+        normals pointing toward that point contribute to the region vote.
+        The actual push direction is the opposite of the weighted majority
+        normal.  This state is detached and rebuilt after containment refresh.
+        """
+        hand_normals = mano_vertex_normals(
+            hand, mano_faces, mirror_left
+        ).detach()
+        direction = torch.zeros_like(hand)
+        gate = torch.zeros(
+            hand.shape[:2], device=device, dtype=hand.dtype
+        )
+        region_count = len(contact_region_names)
+        region_direction = torch.zeros(
+            (frame_count, region_count, 3),
+            device=device,
+            dtype=hand.dtype,
+        )
+        region_alignment = torch.full(
+            (frame_count, region_count),
+            float("nan"),
+            device=device,
+            dtype=hand.dtype,
+        )
+
+        for frame_index in np.flatnonzero(
+            inside_mask.sum(axis=1) > 0
+        ):
+            points = points_by_frame[frame_index]
+            face_index = collision_faces[frame_index]
+            if points is None or face_index is None or not len(points):
+                continue
+
+            primary_face = face_index.detach().cpu().numpy()
+            if primary_face.ndim > 1:
+                primary_face = primary_face[:, 0]
+            point_regions = face_region_ids_np[primary_face]
+            valid_point_regions = point_regions >= 0
+            active_regions = np.unique(point_regions[valid_point_regions])
+
+            selected_all = weights[frame_index] > 0
+            if not active_regions.size or not contact_region_names:
+                active_regions = np.asarray([-1], dtype=np.int64)
+
+            for region_index in active_regions:
+                if region_index >= 0:
+                    selected = selected_all & torch.from_numpy(
+                        contact_region_ids_np == int(region_index)
+                    ).to(device)
+                    point_mask = point_regions == int(region_index)
+                else:
+                    selected = selected_all
+                    point_mask = np.ones(len(points), dtype=bool)
+                if not selected.any() or not point_mask.any():
+                    continue
+
+                selected_indices = torch.nonzero(
+                    selected, as_tuple=False
+                ).flatten()
+                selected_vertices = hand[frame_index, selected_indices]
+                selected_normals = hand_normals[
+                    frame_index, selected_indices
+                ]
+                selected_weights = weights[
+                    frame_index, selected_indices
+                ].detach().clamp_min(1e-6)
+                collision_point = points[torch.from_numpy(
+                    point_mask
+                ).to(device)].mean(dim=0)
+
+                # Keep only HACO normals on the side facing the current
+                # penetrating object points. If none face the points, use
+                # all top-k normals rather than dropping the constraint.
+                to_collision = collision_point[None] - selected_vertices
+                side_alignment = (
+                    to_collision * selected_normals
+                ).sum(dim=-1)
+                facing_weights = selected_weights * torch.relu(
+                    side_alignment
+                )
+                if float(facing_weights.sum()) <= 1e-8:
+                    facing_weights = selected_weights
+                voted_normal = functional.normalize(
+                    (
+                        selected_normals
+                        * facing_weights[:, None]
+                    ).sum(dim=0, keepdim=True),
+                    dim=-1,
+                )[0]
+                if not torch.isfinite(voted_normal).all():
+                    continue
+
+                # Move the hand opposite to the majority top-k normal.
+                push_direction = -voted_normal
+                direction[frame_index, selected_indices] = push_direction
+                gate[frame_index, selected_indices] = 1.0
+                if region_index >= 0:
+                    region_direction[
+                        frame_index, region_index
+                    ] = push_direction
+                    region_alignment[
+                        frame_index, region_index
+                    ] = (
+                        side_alignment * selected_weights
+                    ).sum() / selected_weights.sum().clamp_min(1e-6)
+
+        return (
+            direction.detach(),
+            gate.detach(),
+            region_direction.detach(),
+            region_alignment.detach(),
+        )
+
     current_contact_distance = initial_distance
     contact_weight, selected_contact_count, contact_effective_count = (
         build_contact_weights(
@@ -1444,6 +1576,18 @@ def main() -> None:
         )
     )
     total_contact_weight = contact_weight.sum().clamp_min(1e-6)
+    (
+        contact_normal_pushout_direction,
+        contact_normal_pushout_gate,
+        contact_normal_region_direction,
+        contact_normal_region_alignment,
+    ) = build_contact_normal_pushout_state(
+        reconstructed,
+        current_inside_mask_np,
+        correspondence_points,
+        correspondence_faces,
+        contact_weight,
+    )
     camera_z_only = args.optimization_mode == "camera_z_only"
     optimize_local_pose = args.optimization_mode not in (
         "rigid_only", "rotation_only", "camera_z_only"
@@ -1670,6 +1814,18 @@ def main() -> None:
                     correspondence_faces,
                 )
                 total_contact_weight = contact_weight.sum().clamp_min(1e-6)
+                (
+                    contact_normal_pushout_direction,
+                    contact_normal_pushout_gate,
+                    contact_normal_region_direction,
+                    contact_normal_region_alignment,
+                ) = build_contact_normal_pushout_state(
+                    current_hand,
+                    current_inside_mask_np,
+                    correspondence_points,
+                    correspondence_faces,
+                    contact_weight,
+                )
                 if args.adaptive_reset_optimizer_on_refresh:
                     optimizer.state.clear()
         contact_facing_phase_scale = (
@@ -1765,52 +1921,40 @@ def main() -> None:
                     * frame_contact_scale[indices, None]
                 ).sum() / total_contact_weight
             displacement = refined - reconstructed[indices]
-            base_hand_normals = mano_vertex_normals(
-                reconstructed[indices], mano_faces, mirror_left
-            ).detach()
-            opposite_normal_direction = -base_hand_normals
+            if (
+                args.contact_normal_pushout_mode
+                == "opposite_hand_normal"
+            ):
+                push_direction = -mano_vertex_normals(
+                    reconstructed[indices], mano_faces, mirror_left
+                ).detach()
+                push_gate = torch.stack([
+                    (
+                        contact_weight[global_index] > 0
+                    ).to(dtype=refined.dtype)
+                    if current_inside_count_np[int(global_index.item())] > 0
+                    else torch.zeros(
+                        reconstructed.shape[1],
+                        device=device,
+                        dtype=refined.dtype,
+                    )
+                    for global_index in indices
+                ])
+            else:
+                push_direction = contact_normal_pushout_direction[indices]
+                push_gate = contact_normal_pushout_gate[indices]
             normal_displacement = (
-                displacement * opposite_normal_direction
+                displacement * push_direction
             ).sum(dim=-1)
             normal_pushout_error = torch.clamp(
                 args.contact_normal_pushout_mm / 1000.0
                 - normal_displacement,
                 min=0.0,
             ).square()
-            normal_pushout_weights = []
-            for local_index, global_index_tensor in enumerate(indices):
-                global_index = int(global_index_tensor.item())
-                region_gate = np.zeros(reconstructed.shape[1], dtype=np.float32)
-                face_index = correspondence_faces[global_index]
-                if face_index is not None and contact_region_names:
-                    face_index_np = face_index.detach().cpu().numpy()
-                    primary_face = (
-                        face_index_np[:, 0]
-                        if face_index_np.ndim > 1
-                        else face_index_np
-                    )
-                    active_regions = face_region_ids_np[primary_face]
-                    active_regions = active_regions[active_regions >= 0]
-                    if active_regions.size:
-                        region_gate = np.isin(
-                            contact_region_ids_np, active_regions
-                        ).astype(np.float32)
-                if not region_gate.any():
-                    region_gate = (
-                        np.ones(reconstructed.shape[1], dtype=np.float32)
-                        if current_inside_count_np[global_index] > 0
-                        else np.zeros(
-                            reconstructed.shape[1], dtype=np.float32
-                        )
-                    )
-                normal_pushout_weights.append(
-                    torch.from_numpy(region_gate).to(device)
-                )
-            normal_pushout_region_gate = torch.stack(normal_pushout_weights)
             chunk_contact_normal_pushout = (
                 normal_pushout_error
                 * contact_weight[indices]
-                * normal_pushout_region_gate
+                * push_gate
             ).sum() / total_contact_weight
             normal_component = (
                 displacement * fixed_contact_normal[indices]
@@ -2368,6 +2512,9 @@ def main() -> None:
             "object_normal_pushout": args.w_object_normal_pushout,
             "contact_normal_pushout": args.w_contact_normal_pushout,
             "contact_normal_pushout_mm": args.contact_normal_pushout_mm,
+            "contact_normal_pushout_mode": (
+                args.contact_normal_pushout_mode
+            ),
             "tangential": args.w_tangential,
             "vertex_anchor": args.w_vertex_anchor,
             "pose_anchor": args.w_pose_anchor,
@@ -2550,6 +2697,19 @@ def main() -> None:
         "adaptive_contact_gate": adaptive_gate.cpu().numpy().astype(np.float32),
         "filtered_contact_mask": filtered_contact_mask_np,
         "filtered_contact_weight": filtered_contact_weight_np.astype(np.float16),
+        "contact_normal_pushout_direction_camera": (
+            contact_normal_pushout_direction.cpu().numpy().astype(np.float32)
+        ),
+        "contact_normal_pushout_gate": (
+            contact_normal_pushout_gate.cpu().numpy().astype(np.float32)
+        ),
+        "contact_normal_region_direction_camera": (
+            contact_normal_region_direction.cpu().numpy().astype(np.float32)
+        ),
+        "contact_normal_region_alignment_mm": (
+            (contact_normal_region_alignment.cpu().numpy() * 1000.0)
+            .astype(np.float32)
+        ),
         "refined_contact_facing_cosine": (
             refined_contact_facing_cosine.cpu().numpy().astype(np.float32)
         ),

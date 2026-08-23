@@ -236,6 +236,32 @@ def main() -> None:
         )
         else None
     )
+    stage2_push_directions = (
+        np.asarray(
+            stage2[
+                "contact_normal_pushout_direction_camera"
+            ][stage2_indices],
+            dtype=np.float32,
+        )
+        if (
+            stage2 is not None
+            and stage2_indices is not None
+            and "contact_normal_pushout_direction_camera" in stage2
+        )
+        else None
+    )
+    stage2_push_gate = (
+        np.asarray(
+            stage2["contact_normal_pushout_gate"][stage2_indices],
+            dtype=np.float32,
+        )
+        if (
+            stage2 is not None
+            and stage2_indices is not None
+            and "contact_normal_pushout_gate" in stage2
+        )
+        else None
+    )
     stage2_contact_region_id = (
         np.asarray(stage2["contact_region_id"], dtype=np.int64)
         if stage2 is not None and "contact_region_id" in stage2
@@ -372,6 +398,10 @@ def main() -> None:
         "stage2_hand_normals": server.gui.add_checkbox(
             "Stage2 HACO hand normals",
             initial_value=stage2_vertices is not None,
+        ),
+        "stage2_push_directions": server.gui.add_checkbox(
+            "Stage2 collision push directions",
+            initial_value=stage2_push_directions is not None,
         ),
         "collision_seeds": server.gui.add_checkbox(
             "Collision seed MANO vertices",
@@ -685,6 +715,59 @@ def main() -> None:
                                 ),
                                 point_size=float(point_size.value) * 1.25,
                             ))
+                        if (
+                            controls["stage2_push_directions"].value
+                            and stage2_push_directions is not None
+                            and stage2_push_gate is not None
+                        ):
+                            push_vectors = stage2_push_directions[
+                                index, region_selected
+                            ]
+                            push_gate = (
+                                stage2_push_gate[index, region_selected] > 0
+                            )
+                            push_norm = np.linalg.norm(
+                                push_vectors, axis=-1
+                            )
+                            valid_push = (
+                                push_gate
+                                & np.isfinite(push_vectors).all(axis=-1)
+                                & (push_norm > 1e-6)
+                            )
+                            if valid_push.any():
+                                push_vectors = (
+                                    push_vectors[valid_push]
+                                    / push_norm[valid_push, None]
+                                )
+                                push_sources = sources[valid_push]
+                                push_endpoints = push_sources + (
+                                    push_vectors
+                                    * float(normal_length.value)
+                                )
+                                push_color = np.minimum(
+                                    color.astype(np.int16) + 35, 255
+                                ).astype(np.uint8)
+                                handles.append(server.scene.add_line_segments(
+                                    f"{prefix}/collision_push_direction",
+                                    points=np.stack(
+                                        (push_sources, push_endpoints),
+                                        axis=1,
+                                    ),
+                                    colors=np.tile(
+                                        push_color[None, None],
+                                        (len(push_sources), 2, 1),
+                                    ),
+                                    line_width=5.0,
+                                ))
+                                handles.append(server.scene.add_point_cloud(
+                                    f"{prefix}/collision_push_endpoints",
+                                    points=push_endpoints,
+                                    colors=np.tile(
+                                        push_color[None],
+                                        (len(push_endpoints), 1),
+                                    ),
+                                    point_size=float(point_size.value) * 1.5,
+                                ))
                         if (
                             controls["stage2_patch_normals"].value
                             and stage2_contact_normals is not None
