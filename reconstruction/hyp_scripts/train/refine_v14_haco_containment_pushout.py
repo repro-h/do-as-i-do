@@ -1993,7 +1993,11 @@ def main() -> None:
             history.append(row)
             print(row)
 
-    if args.adaptive_balance:
+    # Alternating Camera-Z/local-pose phases use different active losses, so
+    # their raw total losses are not comparable. Keep the final feasible
+    # trajectory instead of allowing an earlier Camera-Z checkpoint to erase
+    # the later local-pose update.
+    if args.adaptive_balance or alternating_mode:
         best_delta = delta.detach().clone()
         best_residual_translation = residual_translation.detach().clone()
         best_residual_rotation = residual_rotation.detach().clone()
