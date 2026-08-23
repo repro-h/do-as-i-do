@@ -1252,6 +1252,18 @@ def main() -> None:
             ]
             stage1_contact_region_names = fixed_names
 
+    face_region_ids_np = np.full(
+        len(mano_faces_np), -1, dtype=np.int64
+    )
+    if contact_region_ids_np.shape == (reconstructed.shape[1],):
+        for face_index, face in enumerate(mano_faces_np):
+            region_ids = contact_region_ids_np[face]
+            region_ids = region_ids[region_ids >= 0]
+            if region_ids.size:
+                face_region_ids_np[face_index] = int(
+                    np.bincount(region_ids).argmax()
+                )
+
     def build_contact_weights(
         hand: torch.Tensor,
         distance: torch.Tensor,
@@ -1765,15 +1777,40 @@ def main() -> None:
                 - normal_displacement,
                 min=0.0,
             ).square()
-            containment_frame_gate = torch.from_numpy(
-                (current_inside_count_np[indices.cpu().numpy()] > 0).astype(
-                    np.float32
+            normal_pushout_weights = []
+            for local_index, global_index_tensor in enumerate(indices):
+                global_index = int(global_index_tensor.item())
+                region_gate = np.zeros(reconstructed.shape[1], dtype=np.float32)
+                face_index = correspondence_faces[global_index]
+                if face_index is not None and contact_region_names:
+                    face_index_np = face_index.detach().cpu().numpy()
+                    primary_face = (
+                        face_index_np[:, 0]
+                        if face_index_np.ndim > 1
+                        else face_index_np
+                    )
+                    active_regions = face_region_ids_np[primary_face]
+                    active_regions = active_regions[active_regions >= 0]
+                    if active_regions.size:
+                        region_gate = np.isin(
+                            contact_region_ids_np, active_regions
+                        ).astype(np.float32)
+                if not region_gate.any():
+                    region_gate = (
+                        np.ones(reconstructed.shape[1], dtype=np.float32)
+                        if current_inside_count_np[global_index] > 0
+                        else np.zeros(
+                            reconstructed.shape[1], dtype=np.float32
+                        )
+                    )
+                normal_pushout_weights.append(
+                    torch.from_numpy(region_gate).to(device)
                 )
-            ).to(device)
+            normal_pushout_region_gate = torch.stack(normal_pushout_weights)
             chunk_contact_normal_pushout = (
                 normal_pushout_error
                 * contact_weight[indices]
-                * containment_frame_gate[:, None]
+                * normal_pushout_region_gate
             ).sum() / total_contact_weight
             normal_component = (
                 displacement * fixed_contact_normal[indices]
