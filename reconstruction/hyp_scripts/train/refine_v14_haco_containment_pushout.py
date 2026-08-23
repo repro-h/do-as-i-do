@@ -2406,6 +2406,40 @@ def main() -> None:
         device,
         args.point_chunk,
     )
+
+    def map_inside_vertices_to_regions(
+        hand: torch.Tensor,
+        inside_mask: np.ndarray,
+    ) -> np.ndarray:
+        """Map each currently inside object vertex to its closest MANO region."""
+        labels = np.full(inside_mask.shape, -1, dtype=np.int16)
+        with torch.no_grad():
+            for frame_index in np.flatnonzero(
+                inside_mask.sum(axis=1) > 0
+            ):
+                points = torch.from_numpy(
+                    object_vertices_np[frame_index, inside_mask[frame_index]]
+                ).to(device)
+                face_index, _ = closest_face_correspondences(
+                    points,
+                    hand[frame_index],
+                    mano_faces,
+                    args.correspondence_topk,
+                )
+                primary_face = face_index.detach().cpu().numpy()
+                if primary_face.ndim > 1:
+                    primary_face = primary_face[:, 0]
+                labels[frame_index, inside_mask[frame_index]] = (
+                    face_region_ids_np[primary_face].astype(np.int16)
+                )
+        return labels
+
+    initial_inside_region_id = map_inside_vertices_to_regions(
+        reconstructed, inside_mask_np
+    )
+    refined_inside_region_id = map_inside_vertices_to_regions(
+        refined, refined_inside_mask
+    )
     if args.filter_contact_points:
         with torch.no_grad():
             (
@@ -2793,6 +2827,8 @@ def main() -> None:
         "refined_object_vertex_inside_capped_mano": refined_inside_mask,
         "initial_inside_object_vertices": inside_count_np,
         "refined_inside_object_vertices": refined_inside_count,
+        "initial_inside_object_region_id": initial_inside_region_id,
+        "refined_inside_object_region_id": refined_inside_region_id,
         "contact_mask": contact_mask_np,
         "contact_probability": probability_np.astype(np.float16),
         "contact_gate": contact_gate_np,

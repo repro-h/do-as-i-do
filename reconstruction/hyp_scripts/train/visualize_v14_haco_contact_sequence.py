@@ -262,6 +262,18 @@ def main() -> None:
         )
         else None
     )
+    stage2_inside_region_id = (
+        np.asarray(
+            stage2["refined_inside_object_region_id"][stage2_indices],
+            dtype=np.int64,
+        )
+        if (
+            stage2 is not None
+            and stage2_indices is not None
+            and "refined_inside_object_region_id" in stage2
+        )
+        else None
+    )
     stage2_contact_region_id = (
         np.asarray(stage2["contact_region_id"], dtype=np.int64)
         if stage2 is not None and "contact_region_id" in stage2
@@ -417,6 +429,10 @@ def main() -> None:
         "stage2_inside": server.gui.add_checkbox(
             "Stage2 contained YCB vertices",
             initial_value=stage2_inside is not None,
+        ),
+        "stage2_inside_regions": server.gui.add_checkbox(
+            "Stage2 contained YCB by region",
+            initial_value=stage2_inside_region_id is not None,
         ),
     }
     handles = []
@@ -825,16 +841,43 @@ def main() -> None:
             and stage2_inside is not None
             and stage2_inside[index].any()
         ):
-            selected = object_vertices[index, stage2_inside[index]]
-            handles.append(server.scene.add_point_cloud(
-                "/stage2_contained_object_vertices",
-                points=selected,
-                colors=np.tile(
-                    np.asarray([[255, 25, 25]], dtype=np.uint8),
-                    (len(selected), 1),
-                ),
-                point_size=float(point_size.value) * 0.9,
-            ))
+            if (
+                controls["stage2_inside_regions"].value
+                and stage2_inside_region_id is not None
+            ):
+                for region_index, region_name in enumerate(
+                    stage2_contact_region_names
+                ):
+                    selected_mask = (
+                        stage2_inside[index]
+                        & (stage2_inside_region_id[index] == region_index)
+                    )
+                    if not selected_mask.any():
+                        continue
+                    selected = object_vertices[index, selected_mask]
+                    color = region_colors.get(
+                        region_name,
+                        np.asarray([230, 210, 40], dtype=np.uint8),
+                    )
+                    handles.append(server.scene.add_point_cloud(
+                        f"/stage2_contained_regions/{region_name}",
+                        points=selected,
+                        colors=np.tile(
+                            color[None], (len(selected), 1)
+                        ),
+                        point_size=float(point_size.value) * 1.0,
+                    ))
+            else:
+                selected = object_vertices[index, stage2_inside[index]]
+                handles.append(server.scene.add_point_cloud(
+                    "/stage2_contained_object_vertices",
+                    points=selected,
+                    colors=np.tile(
+                        np.asarray([[255, 25, 25]], dtype=np.uint8),
+                        (len(selected), 1),
+                    ),
+                    point_size=float(point_size.value) * 0.9,
+                ))
         print(
             f"frame={frame_id(ids[index])} index={index} "
             f"haco={int(active.sum())} "
