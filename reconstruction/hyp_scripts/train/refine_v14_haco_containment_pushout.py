@@ -132,13 +132,32 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--contact-normal-pushout-mode",
-        choices=("collision_point_side", "opposite_hand_normal"),
+        choices=(
+            "collision_point_side",
+            "object_normal_opposed",
+            "opposite_hand_normal",
+        ),
         default="collision_point_side",
         help=(
             "Choose the push direction from the current inside-point side "
             "relative to HACO top-k normals, or use the legacy fixed "
             "opposite-MANO-normal direction."
         ),
+    )
+    parser.add_argument(
+        "--contact-normal-opposed-min-cosine",
+        type=float,
+        default=0.2,
+        help=(
+            "Require HACO top-k hand normals to have dot product <= "
+            "-this value with the voted object normal."
+        ),
+    )
+    parser.add_argument(
+        "--contact-normal-opposed-fraction",
+        type=float,
+        default=0.5,
+        help="Minimum weighted fraction of opposed HACO top-k normals.",
     )
     parser.add_argument("--w-tangential", type=float, default=2.0)
     parser.add_argument("--w-vertex-anchor", type=float, default=1.0)
@@ -727,6 +746,14 @@ def main() -> None:
         raise ValueError("--w-contact-normal-pushout must be non-negative")
     if args.contact_normal_pushout_mm < 0:
         raise ValueError("--contact-normal-pushout-mm must be non-negative")
+    if not -1.0 <= args.contact_normal_opposed_min_cosine <= 1.0:
+        raise ValueError(
+            "--contact-normal-opposed-min-cosine must be in [-1, 1]"
+        )
+    if not 0.0 <= args.contact_normal_opposed_fraction <= 1.0:
+        raise ValueError(
+            "--contact-normal-opposed-fraction must be in [0, 1]"
+        )
     if args.max_grad_norm <= 0:
         raise ValueError("--max-grad-norm must be positive")
     if args.max_residual_translation_mm <= 0:
@@ -1449,9 +1476,16 @@ def main() -> None:
         hand: torch.Tensor,
         inside_mask: np.ndarray,
         points_by_frame: list[torch.Tensor | None],
+        point_normals_by_frame: list[torch.Tensor | None],
         collision_faces: list[torch.Tensor | None],
         weights: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """Infer a region push direction from the current inside points.
 
         A collision point selects the side of a HACO region: only top-k
@@ -1478,13 +1512,25 @@ def main() -> None:
             device=device,
             dtype=hand.dtype,
         )
+        region_opposed_fraction = torch.full(
+            (frame_count, region_count),
+            float("nan"),
+            device=device,
+            dtype=hand.dtype,
+        )
 
         for frame_index in np.flatnonzero(
             inside_mask.sum(axis=1) > 0
         ):
             points = points_by_frame[frame_index]
+            point_normals = point_normals_by_frame[frame_index]
             face_index = collision_faces[frame_index]
-            if points is None or face_index is None or not len(points):
+            if (
+                points is None
+                or point_normals is None
+                or face_index is None
+                or not len(points)
+            ):
                 continue
 
             primary_face = face_index.detach().cpu().numpy()
@@ -1520,9 +1566,54 @@ def main() -> None:
                 selected_weights = weights[
                     frame_index, selected_indices
                 ].detach().clamp_min(1e-6)
-                collision_point = points[torch.from_numpy(
+                point_selector = torch.from_numpy(
                     point_mask
-                ).to(device)].mean(dim=0)
+                ).to(device)
+                collision_point = points[point_selector].mean(dim=0)
+
+                if (
+                    args.contact_normal_pushout_mode
+                    == "object_normal_opposed"
+                ):
+                    voted_object_normal = functional.normalize(
+                        point_normals[point_selector].mean(
+                            dim=0, keepdim=True
+                        ),
+                        dim=-1,
+                    )[0]
+                    if not torch.isfinite(voted_object_normal).all():
+                        continue
+                    normal_dot = (
+                        selected_normals * voted_object_normal
+                    ).sum(dim=-1)
+                    opposed = normal_dot <= (
+                        -args.contact_normal_opposed_min_cosine
+                    )
+                    opposed_fraction = (
+                        selected_weights * opposed.to(selected_weights.dtype)
+                    ).sum() / selected_weights.sum().clamp_min(1e-6)
+                    if float(opposed_fraction) < (
+                        args.contact_normal_opposed_fraction
+                    ):
+                        continue
+                    push_direction = voted_object_normal
+                    direction[frame_index, selected_indices[opposed]] = (
+                        push_direction
+                    )
+                    gate[frame_index, selected_indices[opposed]] = 1.0
+                    if region_index >= 0:
+                        region_direction[
+                            frame_index, region_index
+                        ] = push_direction
+                        region_alignment[
+                            frame_index, region_index
+                        ] = (
+                            normal_dot * selected_weights
+                        ).sum() / selected_weights.sum().clamp_min(1e-6)
+                        region_opposed_fraction[
+                            frame_index, region_index
+                        ] = opposed_fraction
+                    continue
 
                 # Keep only HACO normals on the side facing the current
                 # penetrating object points. If none face the points, use
@@ -1565,6 +1656,7 @@ def main() -> None:
             gate.detach(),
             region_direction.detach(),
             region_alignment.detach(),
+            region_opposed_fraction.detach(),
         )
 
     current_contact_distance = initial_distance
@@ -1581,10 +1673,12 @@ def main() -> None:
         contact_normal_pushout_gate,
         contact_normal_region_direction,
         contact_normal_region_alignment,
+        contact_normal_region_opposed_fraction,
     ) = build_contact_normal_pushout_state(
         reconstructed,
         current_inside_mask_np,
         correspondence_points,
+        correspondence_object_normals,
         correspondence_faces,
         contact_weight,
     )
@@ -1819,10 +1913,12 @@ def main() -> None:
                     contact_normal_pushout_gate,
                     contact_normal_region_direction,
                     contact_normal_region_alignment,
+                    contact_normal_region_opposed_fraction,
                 ) = build_contact_normal_pushout_state(
                     current_hand,
                     current_inside_mask_np,
                     correspondence_points,
+                    correspondence_object_normals,
                     correspondence_faces,
                     contact_weight,
                 )
@@ -2515,6 +2611,12 @@ def main() -> None:
             "contact_normal_pushout_mode": (
                 args.contact_normal_pushout_mode
             ),
+            "contact_normal_opposed_min_cosine": (
+                args.contact_normal_opposed_min_cosine
+            ),
+            "contact_normal_opposed_fraction": (
+                args.contact_normal_opposed_fraction
+            ),
             "tangential": args.w_tangential,
             "vertex_anchor": args.w_vertex_anchor,
             "pose_anchor": args.w_pose_anchor,
@@ -2708,6 +2810,11 @@ def main() -> None:
         ),
         "contact_normal_region_alignment_mm": (
             (contact_normal_region_alignment.cpu().numpy() * 1000.0)
+            .astype(np.float32)
+        ),
+        "contact_normal_region_opposed_fraction": (
+            contact_normal_region_opposed_fraction.cpu()
+            .numpy()
             .astype(np.float32)
         ),
         "refined_contact_facing_cosine": (
