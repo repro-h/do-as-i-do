@@ -56,6 +56,12 @@ def parse_args() -> argparse.Namespace:
         "--frame-id",
         help="Optional single frame to optimize instead of the full sequence",
     )
+    parser.add_argument(
+        "--direction",
+        choices=("camera_z", "wrist_ray"),
+        default="camera_z",
+        help="Depth correction direction in camera coordinates",
+    )
     parser.add_argument("--phase-key", default="predicted_contact_gate")
     parser.add_argument("--minimum-phase-gate", type=float, default=0.25)
     parser.add_argument("--supervision-npz", required=True)
@@ -403,9 +409,13 @@ def main() -> None:
     object_full_camera = transform_object(object_local, poses)
     boundary = directed_boundary_loop(faces)
 
-    rays = wrist / np.maximum(
-        np.linalg.norm(wrist, axis=-1, keepdims=True), 1e-8
-    )
+    if args.direction == "camera_z":
+        rays = np.zeros_like(wrist, dtype=np.float32)
+        rays[:, 2] = 1.0
+    else:
+        rays = wrist / np.maximum(
+            np.linalg.norm(wrist, axis=-1, keepdims=True), 1e-8
+        )
     offsets_mm = np.zeros(len(ids), dtype=np.float32)
     probe_m = args.probe_mm / 1000.0
     history: list[dict[str, object]] = []
@@ -707,7 +717,12 @@ def main() -> None:
 
     evaluated = active & np.isfinite(initial_gaps) & np.isfinite(refined_gaps)
     summary = {
-        "method": "fixed_contact_threshold_ray_depth_feedback_v1",
+        "method": (
+            "fixed_contact_threshold_camera_z_depth_feedback_v1"
+            if args.direction == "camera_z"
+            else "fixed_contact_threshold_wrist_ray_depth_feedback_v1"
+        ),
+        "correction_direction": args.direction,
         "stream_id": str(query["stream_id"].item()),
         "initial_hand_source": initial_hand_source,
         "contact_target_source_npz": str(
@@ -717,8 +732,8 @@ def main() -> None:
         "fixed_regions": fixed_names,
         "active_frames": int(active.sum()),
         "contact_evaluated_frames": int(evaluated.sum()),
-        "ray_offset_mm": distribution(offsets_mm[active]),
-        "absolute_ray_offset_mm": distribution(np.abs(offsets_mm[active])),
+        "depth_offset_mm": distribution(offsets_mm[active]),
+        "absolute_depth_offset_mm": distribution(np.abs(offsets_mm[active])),
         "contact_gap_mm": {
             "initial": distribution(initial_gaps[evaluated]),
             "refined": distribution(refined_gaps[evaluated]),
@@ -781,8 +796,8 @@ def main() -> None:
         "initial_wrist_camera": wrist,
         "refined_wrist_camera": refined_wrist,
         "translation_camera": (refined_wrist - wrist).astype(np.float32),
-        "wrist_ray_camera": rays.astype(np.float32),
-        "ray_offset_mm": offsets_mm,
+        "correction_direction_camera": rays.astype(np.float32),
+        "depth_offset_mm": offsets_mm,
         "contact_gate": gate,
         "prediction_valid": valid,
         "initial_fixed_contact_gap_mm": initial_gaps,
