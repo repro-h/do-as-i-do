@@ -52,6 +52,10 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--phase-npz", required=True)
+    parser.add_argument(
+        "--frame-id",
+        help="Optional single frame to optimize instead of the full sequence",
+    )
     parser.add_argument("--phase-key", default="predicted_contact_gate")
     parser.add_argument("--minimum-phase-gate", type=float, default=0.25)
     parser.add_argument("--supervision-npz", required=True)
@@ -263,7 +267,19 @@ def main() -> None:
     fixed = load_npz(Path(args.fixed_patch_npz).expanduser().resolve())
     phase = load_npz(Path(args.phase_npz).expanduser().resolve())
     supervision = load_npz(Path(args.supervision_npz).expanduser().resolve())
-    ids = np.asarray(query["frame_ids"])
+    all_ids = np.asarray(query["frame_ids"])
+    if args.frame_id is not None:
+        requested = frame_id(args.frame_id)
+        query_frame_ids = [frame_id(value) for value in all_ids]
+        if requested not in query_frame_ids:
+            raise KeyError(f"Frame {requested} not found in query archive")
+        selected_query_indices = np.asarray(
+            [query_frame_ids.index(requested)], dtype=np.int64
+        )
+        ids = all_ids[selected_query_indices]
+    else:
+        selected_query_indices = np.arange(len(all_ids), dtype=np.int64)
+        ids = all_ids
     trajectory_indices = aligned_indices(trajectory["frame_ids"], ids)
     contact_indices = aligned_indices(contact["frame_ids"], ids)
     phase_indices = aligned_indices(phase["frame_ids"], ids)
@@ -273,7 +289,8 @@ def main() -> None:
         trajectory["predicted_wrist_camera"][trajectory_indices], dtype=np.float32
     )
     hand = np.asarray(
-        query["vertices_3d_root_relative_original"], dtype=np.float32
+        query["vertices_3d_root_relative_original"][selected_query_indices],
+        dtype=np.float32,
     ) + wrist[:, None]
     initial_hand_source = None
     if args.initial_hand_npz:
@@ -304,7 +321,7 @@ def main() -> None:
         contact["contact_probability"][contact_indices], dtype=np.float32
     )
     valid = (
-        np.asarray(query["model_valid"]).astype(bool)
+        np.asarray(query["model_valid"])[selected_query_indices].astype(bool)
         & np.asarray(trajectory["prediction_valid"][trajectory_indices]).astype(bool)
         & np.asarray(contact["contact_valid"][contact_indices]).astype(bool)
         & np.isfinite(hand).all(axis=(1, 2))
@@ -675,8 +692,9 @@ def main() -> None:
     if args.gt_hand_npz:
         gt = load_npz(Path(args.gt_hand_npz).expanduser().resolve())
         side = str(query["hand_side"].item()).lower()
-        gt_vertices = np.asarray(gt[f"{side}_vertices"], dtype=np.float32)[:len(ids)]
-        gt_valid = valid & np.asarray(gt[f"{side}_valid"]).astype(bool)[:len(ids)]
+        gt_indices = aligned_indices(gt["frame_ids"], ids)
+        gt_vertices = np.asarray(gt[f"{side}_vertices"], dtype=np.float32)[gt_indices]
+        gt_valid = valid & np.asarray(gt[f"{side}_valid"]).astype(bool)[gt_indices]
         initial_error = np.linalg.norm(hand[gt_valid] - gt_vertices[gt_valid], axis=-1)
         refined_error = np.linalg.norm(refined[gt_valid] - gt_vertices[gt_valid], axis=-1)
         gt_summary = {
