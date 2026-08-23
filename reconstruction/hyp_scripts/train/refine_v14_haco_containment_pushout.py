@@ -1592,6 +1592,10 @@ def main() -> None:
                     opposed_fraction = (
                         selected_weights * opposed.to(selected_weights.dtype)
                     ).sum() / selected_weights.sum().clamp_min(1e-6)
+                    if region_index >= 0:
+                        region_opposed_fraction[
+                            frame_index, region_index
+                        ] = opposed_fraction
                     if float(opposed_fraction) < (
                         args.contact_normal_opposed_fraction
                     ):
@@ -1610,9 +1614,6 @@ def main() -> None:
                         ] = (
                             normal_dot * selected_weights
                         ).sum() / selected_weights.sum().clamp_min(1e-6)
-                        region_opposed_fraction[
-                            frame_index, region_index
-                        ] = opposed_fraction
                     continue
 
                 # Keep only HACO normals on the side facing the current
@@ -2466,6 +2467,29 @@ def main() -> None:
                 refined_distance,
                 final_collision_faces,
             )
+    with torch.no_grad():
+        (
+            final_collision_points,
+            final_collision_normals,
+            final_collision_faces,
+            _,
+        ) = build_collision_correspondences(
+            refined, refined_inside_mask
+        )
+        (
+            contact_normal_pushout_direction,
+            contact_normal_pushout_gate,
+            contact_normal_region_direction,
+            contact_normal_region_alignment,
+            contact_normal_region_opposed_fraction,
+        ) = build_contact_normal_pushout_state(
+            refined,
+            refined_inside_mask,
+            final_collision_points,
+            final_collision_normals,
+            final_collision_faces,
+            contact_weight,
+        )
     filtered_contact_mask_np = (
         contact_weight > 0
     ).cpu().numpy()
