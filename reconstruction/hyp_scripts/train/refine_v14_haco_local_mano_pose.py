@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import inspect
 import math
 import os
 import sys
@@ -98,11 +99,25 @@ def load_wilor_mano(
     previous = Path.cwd()
     try:
         os.chdir(wilor_root)
+        load_kwargs = {
+            "checkpoint_path": str(checkpoint),
+            "cfg_path": str(config),
+            "init_renderer": False,
+            "mano_data_dir": str(mano_data_dir),
+        }
+        signature = inspect.signature(load_wilor)
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+        if not accepts_kwargs:
+            load_kwargs = {
+                key: value
+                for key, value in load_kwargs.items()
+                if key in signature.parameters
+            }
         model, _ = load_wilor(
-            checkpoint_path=str(checkpoint),
-            cfg_path=str(config),
-            init_renderer=False,
-            mano_data_dir=str(mano_data_dir),
+            **load_kwargs,
         )
     finally:
         os.chdir(previous)
