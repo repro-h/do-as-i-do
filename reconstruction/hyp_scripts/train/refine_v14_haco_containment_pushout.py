@@ -179,11 +179,14 @@ def parse_args() -> argparse.Namespace:
             "rigid_only",
             "rotation_only",
             "alternating_camera_z_pose",
+            "camera_z_only",
         ),
         default="local_pose",
         help=(
             "Optimize MANO local pose, local pose plus contact-pivot rigid "
-            "correction, or only the contact-pivot rigid correction."
+            "correction, or only the contact-pivot rigid correction. "
+            "camera_z_only freezes the input local pose and optimizes only "
+            "the camera-space Z translation."
         ),
     )
     parser.add_argument(
@@ -706,6 +709,7 @@ def main() -> None:
         "rigid_only",
         "rotation_only",
         "alternating_camera_z_pose",
+        "camera_z_only",
     ):
         args.contact_pivot_residual_se3 = True
     elif args.contact_pivot_residual_se3:
@@ -1409,12 +1413,16 @@ def main() -> None:
         )
     )
     total_contact_weight = contact_weight.sum().clamp_min(1e-6)
+    camera_z_only = args.optimization_mode == "camera_z_only"
     optimize_local_pose = args.optimization_mode not in (
-        "rigid_only", "rotation_only"
+        "rigid_only", "rotation_only", "camera_z_only"
     )
     optimize_residual_se3 = args.optimization_mode != "local_pose"
     optimize_residual_translation = args.optimization_mode in (
-        "joint_and_rigid", "rigid_only", "alternating_camera_z_pose"
+        "joint_and_rigid",
+        "rigid_only",
+        "alternating_camera_z_pose",
+        "camera_z_only",
     )
     optimize_residual_rotation = args.optimization_mode in (
         "joint_and_rigid", "rigid_only", "rotation_only"
@@ -1893,6 +1901,8 @@ def main() -> None:
                 delta.grad.zero_()
             else:
                 residual_translation.grad.zero_()
+        elif camera_z_only:
+            residual_translation.grad[:, :2].zero_()
         delta_before_step = delta.detach().clone() if alternating_mode else None
         translation_before_step = (
             residual_translation.detach().clone() if alternating_mode else None
@@ -1927,6 +1937,11 @@ def main() -> None:
                 delta[~optimization_gate] = 0
             translation_limit = args.max_residual_translation_mm / 1000.0
             if alternating_mode:
+                residual_translation[:, :2].zero_()
+                residual_translation[:, 2].clamp_(
+                    -translation_limit, translation_limit
+                )
+            elif camera_z_only:
                 residual_translation[:, :2].zero_()
                 residual_translation[:, 2].clamp_(
                     -translation_limit, translation_limit
