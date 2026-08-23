@@ -692,7 +692,10 @@ def main() -> None:
     if args.gt_hand_npz:
         gt = load_npz(Path(args.gt_hand_npz).expanduser().resolve())
         side = str(query["hand_side"].item()).lower()
-        gt_indices = aligned_indices(gt["frame_ids"], ids)
+        if "frame_ids" in gt:
+            gt_indices = aligned_indices(gt["frame_ids"], ids)
+        else:
+            gt_indices = selected_query_indices
         gt_vertices = np.asarray(gt[f"{side}_vertices"], dtype=np.float32)[gt_indices]
         gt_valid = valid & np.asarray(gt[f"{side}_valid"]).astype(bool)[gt_indices]
         initial_error = np.linalg.norm(hand[gt_valid] - gt_vertices[gt_valid], axis=-1)
