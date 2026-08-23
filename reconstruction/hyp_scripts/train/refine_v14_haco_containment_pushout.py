@@ -115,6 +115,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--w-collision", type=float, default=5.0)
     parser.add_argument("--w-object-normal-pushout", type=float, default=0.0)
+    parser.add_argument(
+        "--w-contact-normal-pushout",
+        type=float,
+        default=0.0,
+        help=(
+            "Push selected high-probability HACO vertices opposite to their "
+            "input MANO outward normals on frames with containment."
+        ),
+    )
+    parser.add_argument(
+        "--contact-normal-pushout-mm",
+        type=float,
+        default=2.0,
+        help="Desired opposite-normal displacement for selected HACO vertices.",
+    )
     parser.add_argument("--w-tangential", type=float, default=2.0)
     parser.add_argument("--w-vertex-anchor", type=float, default=1.0)
     parser.add_argument("--w-pose-anchor", type=float, default=5e-4)
@@ -698,6 +713,10 @@ def main() -> None:
         raise ValueError("Invalid adaptive collision scale range")
     if args.w_object_normal_pushout < 0:
         raise ValueError("--w-object-normal-pushout must be non-negative")
+    if args.w_contact_normal_pushout < 0:
+        raise ValueError("--w-contact-normal-pushout must be non-negative")
+    if args.contact_normal_pushout_mm < 0:
+        raise ValueError("--contact-normal-pushout-mm must be non-negative")
     if args.max_grad_norm <= 0:
         raise ValueError("--max-grad-norm must be positive")
     if args.max_residual_translation_mm <= 0:
@@ -1665,6 +1684,7 @@ def main() -> None:
         contact_facing_value = 0.0
         collision_value = 0.0
         object_normal_pushout_value = 0.0
+        contact_normal_pushout_value = 0.0
         tangential_value = 0.0
         vertex_anchor_value = 0.0
         reprojection_value = 0.0
@@ -1733,6 +1753,28 @@ def main() -> None:
                     * frame_contact_scale[indices, None]
                 ).sum() / total_contact_weight
             displacement = refined - reconstructed[indices]
+            base_hand_normals = mano_vertex_normals(
+                reconstructed[indices], mano_faces, mirror_left
+            ).detach()
+            opposite_normal_direction = -base_hand_normals
+            normal_displacement = (
+                displacement * opposite_normal_direction
+            ).sum(dim=-1)
+            normal_pushout_error = torch.clamp(
+                args.contact_normal_pushout_mm / 1000.0
+                - normal_displacement,
+                min=0.0,
+            ).square()
+            containment_frame_gate = torch.from_numpy(
+                (current_inside_count_np[indices.cpu().numpy()] > 0).astype(
+                    np.float32
+                )
+            ).to(device)
+            chunk_contact_normal_pushout = (
+                normal_pushout_error
+                * contact_weight[indices]
+                * containment_frame_gate[:, None]
+            ).sum() / total_contact_weight
             normal_component = (
                 displacement * fixed_contact_normal[indices]
             ).sum(dim=-1, keepdim=True) * fixed_contact_normal[indices]
@@ -1816,6 +1858,8 @@ def main() -> None:
                 + args.w_collision * chunk_collision
                 + args.w_object_normal_pushout
                 * chunk_object_normal_pushout
+                + args.w_contact_normal_pushout
+                * chunk_contact_normal_pushout
                 + args.w_tangential * chunk_tangential
                 + args.w_vertex_anchor * chunk_vertex_anchor
                 + args.w_reprojection * chunk_reprojection
@@ -1826,6 +1870,9 @@ def main() -> None:
             collision_value += float(chunk_collision.detach())
             object_normal_pushout_value += float(
                 chunk_object_normal_pushout.detach()
+            )
+            contact_normal_pushout_value += float(
+                chunk_contact_normal_pushout.detach()
             )
             tangential_value += float(chunk_tangential.detach())
             vertex_anchor_value += float(chunk_vertex_anchor.detach())
@@ -1874,6 +1921,7 @@ def main() -> None:
             * contact_facing_value
             + args.w_collision * collision_value
             + args.w_object_normal_pushout * object_normal_pushout_value
+            + args.w_contact_normal_pushout * contact_normal_pushout_value
             + args.w_tangential * tangential_value
             + args.w_vertex_anchor * vertex_anchor_value
             + args.w_reprojection * reprojection_value
@@ -1972,6 +2020,7 @@ def main() -> None:
                 "contact_facing_active": bool(contact_facing_phase_scale),
                 "collision": collision_value,
                 "object_normal_pushout": object_normal_pushout_value,
+                "contact_normal_pushout": contact_normal_pushout_value,
                 "tangential": tangential_value,
                 "vertex_anchor": vertex_anchor_value,
                 "reprojection": reprojection_value,
@@ -2280,6 +2329,8 @@ def main() -> None:
             "contact_facing": args.w_contact_facing,
             "collision": args.w_collision,
             "object_normal_pushout": args.w_object_normal_pushout,
+            "contact_normal_pushout": args.w_contact_normal_pushout,
+            "contact_normal_pushout_mm": args.contact_normal_pushout_mm,
             "tangential": args.w_tangential,
             "vertex_anchor": args.w_vertex_anchor,
             "pose_anchor": args.w_pose_anchor,
