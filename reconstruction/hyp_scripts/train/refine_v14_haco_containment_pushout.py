@@ -135,12 +135,14 @@ def parse_args() -> argparse.Namespace:
         choices=(
             "collision_point_side",
             "object_normal_opposed",
+            "object_normal_region",
             "opposite_hand_normal",
         ),
         default="collision_point_side",
         help=(
             "Choose the push direction from the current inside-point side "
-            "relative to HACO top-k normals, or use the legacy fixed "
+            "relative to HACO top-k normals, use the voted object normal "
+            "for all selected points in an active region, or use the legacy "
             "opposite-MANO-normal direction."
         ),
     )
@@ -1491,7 +1493,9 @@ def main() -> None:
         A collision point selects the side of a HACO region: only top-k
         normals pointing toward that point contribute to the region vote.
         The actual push direction is the opposite of the weighted majority
-        normal.  This state is detached and rebuilt after containment refresh.
+        normal.  object_normal_region applies the voted object normal to all
+        selected HACO anchors in an active region. This state is detached and
+        rebuilt after containment refresh.
         """
         hand_normals = mano_vertex_normals(
             hand, mano_faces, mirror_left
@@ -1571,9 +1575,9 @@ def main() -> None:
                 ).to(device)
                 collision_point = points[point_selector].mean(dim=0)
 
-                if (
-                    args.contact_normal_pushout_mode
-                    == "object_normal_opposed"
+                if args.contact_normal_pushout_mode in (
+                    "object_normal_opposed",
+                    "object_normal_region",
                 ):
                     voted_object_normal = functional.normalize(
                         point_normals[point_selector].mean(
@@ -1601,10 +1605,20 @@ def main() -> None:
                     ):
                         continue
                     push_direction = voted_object_normal
-                    direction[frame_index, selected_indices[opposed]] = (
-                        push_direction
-                    )
-                    gate[frame_index, selected_indices[opposed]] = 1.0
+                    if args.contact_normal_pushout_mode == (
+                        "object_normal_region"
+                    ):
+                        # Inside points determine the region direction. All
+                        # selected HACO anchors then provide pose gradient.
+                        direction[frame_index, selected_indices] = (
+                            push_direction
+                        )
+                        gate[frame_index, selected_indices] = 1.0
+                    else:
+                        direction[frame_index, selected_indices[opposed]] = (
+                            push_direction
+                        )
+                        gate[frame_index, selected_indices[opposed]] = 1.0
                     if region_index >= 0:
                         region_direction[
                             frame_index, region_index
