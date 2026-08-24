@@ -1729,6 +1729,7 @@ def main() -> None:
         points_by_frame: list[torch.Tensor | None],
         point_normals_by_frame: list[torch.Tensor | None],
         collision_faces: list[torch.Tensor | None],
+        collision_barycentric: list[torch.Tensor | None],
         weights: torch.Tensor,
     ) -> tuple[
         torch.Tensor,
@@ -1794,10 +1795,12 @@ def main() -> None:
             points = points_by_frame[frame_index]
             point_normals = point_normals_by_frame[frame_index]
             face_index = collision_faces[frame_index]
+            barycentric = collision_barycentric[frame_index]
             if (
                 points is None
                 or point_normals is None
                 or face_index is None
+                or barycentric is None
                 or not len(points)
             ):
                 continue
@@ -1805,7 +1808,14 @@ def main() -> None:
             primary_face = face_index.detach().cpu().numpy()
             if primary_face.ndim > 1:
                 primary_face = primary_face[:, 0]
-            point_regions = face_region_ids_np[primary_face]
+            barycentric_np = barycentric.detach().cpu().numpy()
+            if barycentric_np.ndim > 2:
+                barycentric_np = barycentric_np[:, 0]
+            nearest_corner = barycentric_np.argmax(axis=-1)
+            nearest_vertex = mano_faces_np[
+                primary_face, nearest_corner
+            ]
+            point_regions = contact_region_ids_np[nearest_vertex]
             valid_point_regions = point_regions >= 0
             active_regions = np.unique(point_regions[valid_point_regions])
 
@@ -2097,23 +2107,42 @@ def main() -> None:
             region_index
         ][None]
         if args.contact_normal_side_reference == "haco_normal":
-            reference = -(
-                initial_hand_normals * region_weights[..., None]
-            ).sum(dim=1)
-        else:
-            reference = (
-                fixed_contact_normal * region_weights[..., None]
-            ).sum(dim=1)
+            for frame_index in range(frame_count):
+                selected = region_weights[frame_index] > 0
+                if not selected.any():
+                    continue
+                normals = -initial_hand_normals[frame_index, selected]
+                weights = region_weights[frame_index, selected]
+                similarity = normals @ normals.T
+                support = (
+                    similarity >= 0.5
+                ).to(weights.dtype) @ weights
+                seed = int(support.argmax())
+                dominant = similarity[seed] >= 0.5
+                reference = (
+                    normals[dominant] * weights[dominant, None]
+                ).sum(dim=0)
+                reference_norm = reference.norm()
+                coherence = reference_norm / weights[
+                    dominant
+                ].sum().clamp_min(1e-6)
+                if (
+                    reference_norm > 1e-6
+                    and coherence
+                    >= args.contact_normal_haco_coherence_minimum
+                ):
+                    contact_side_reference_normal[
+                        frame_index, region_index
+                    ] = reference / reference_norm
+                    contact_side_reference_valid[
+                        frame_index, region_index
+                    ] = True
+            continue
+        reference = (
+            fixed_contact_normal * region_weights[..., None]
+        ).sum(dim=1)
         reference_norm = reference.norm(dim=-1)
-        weight_sum = region_weights.sum(dim=-1).clamp_min(1e-6)
-        coherence = reference_norm / weight_sum
-        valid = (
-            reference_norm > 1e-6
-        ) & (
-            coherence >= args.contact_normal_haco_coherence_minimum
-            if args.contact_normal_side_reference == "haco_normal"
-            else torch.ones_like(coherence, dtype=torch.bool)
-        )
+        valid = reference_norm > 1e-6
         contact_side_reference_normal[valid, region_index] = (
             reference[valid] / reference_norm[valid, None]
         )
@@ -2132,6 +2161,7 @@ def main() -> None:
         correspondence_points,
         correspondence_object_normals,
         correspondence_faces,
+        correspondence_barycentric,
         clearance_reference_weight,
     )
     camera_z_only = args.optimization_mode == "camera_z_only"
@@ -2392,6 +2422,7 @@ def main() -> None:
                     correspondence_points,
                     correspondence_object_normals,
                     correspondence_faces,
+                    correspondence_barycentric,
                     clearance_reference_weight,
                 )
                 refresh_optimized_joint_mask()
@@ -3050,7 +3081,7 @@ def main() -> None:
             final_collision_points,
             final_collision_normals,
             final_collision_faces,
-            _,
+            final_collision_barycentric,
         ) = build_collision_correspondences(
             refined, refined_inside_mask
         )
@@ -3068,8 +3099,10 @@ def main() -> None:
             final_collision_points,
             final_collision_normals,
             final_collision_faces,
+            final_collision_barycentric,
             clearance_reference_weight,
         )
+        refresh_optimized_joint_mask()
     filtered_contact_mask_np = (
         contact_weight > 0
     ).cpu().numpy()
