@@ -159,14 +159,15 @@ def parse_args() -> argparse.Namespace:
             "collision_point_side",
             "object_normal_opposed",
             "object_normal_region",
+            "object_normal_full_region",
             "opposite_hand_normal",
         ),
         default="collision_point_side",
         help=(
             "Choose the push direction from the current inside-point side "
             "relative to HACO top-k normals, use the voted object normal "
-            "for all selected points in an active region, or use the legacy "
-            "opposite-MANO-normal direction."
+            "for selected points or the complete MANO region in an active "
+            "region, or use the legacy opposite-MANO-normal direction."
         ),
     )
     parser.add_argument(
@@ -1587,9 +1588,11 @@ def main() -> None:
         A collision point selects the side of a HACO region: only top-k
         normals pointing toward that point contribute to the region vote.
         The actual push direction is the opposite of the weighted majority
-        normal.  object_normal_region applies the voted object normal to all
-        selected HACO anchors in an active region. This state is detached and
-        rebuilt after containment refresh.
+        normal. object_normal_region applies the voted object normal to all
+        selected HACO anchors in an active region. object_normal_full_region
+        applies it to every MANO vertex assigned to that region, while still
+        using only selected HACO anchors to validate the normal direction.
+        This state is detached and rebuilt after containment refresh.
         """
         hand_normals = mano_vertex_normals(
             hand, mano_faces, mirror_left
@@ -1672,6 +1675,7 @@ def main() -> None:
                 if args.contact_normal_pushout_mode in (
                     "object_normal_opposed",
                     "object_normal_region",
+                    "object_normal_full_region",
                 ):
                     voted_object_normal = functional.normalize(
                         point_normals[point_selector].mean(
@@ -1700,6 +1704,16 @@ def main() -> None:
                         continue
                     push_direction = voted_object_normal
                     if args.contact_normal_pushout_mode == (
+                        "object_normal_full_region"
+                    ) and region_index >= 0:
+                        region_vertices = torch.from_numpy(
+                            contact_region_ids_np == int(region_index)
+                        ).to(device)
+                        direction[frame_index, region_vertices] = (
+                            push_direction
+                        )
+                        gate[frame_index, region_vertices] = 1.0
+                    elif args.contact_normal_pushout_mode == (
                         "object_normal_region"
                     ):
                         # Inside points determine the region direction. All
@@ -2202,11 +2216,18 @@ def main() -> None:
                 - normal_displacement,
                 min=0.0,
             ).square()
+            if args.contact_normal_pushout_mode == (
+                "object_normal_full_region"
+            ):
+                push_weight = push_gate
+                push_denominator = push_weight.sum().clamp_min(1.0)
+            else:
+                push_weight = contact_weight[indices] * push_gate
+                push_denominator = total_contact_weight
             chunk_contact_normal_pushout = (
                 normal_pushout_error
-                * contact_weight[indices]
-                * push_gate
-            ).sum() / total_contact_weight
+                * push_weight
+            ).sum() / push_denominator
             normal_component = (
                 displacement * fixed_contact_normal[indices]
             ).sum(dim=-1, keepdim=True) * fixed_contact_normal[indices]
