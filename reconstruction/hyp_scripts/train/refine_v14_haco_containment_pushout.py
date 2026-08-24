@@ -266,6 +266,23 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help="Minimum side-compatible penetrating points in a local cluster.",
     )
+    parser.add_argument(
+        "--contact-normal-adaptive-min-cluster-points",
+        action="store_true",
+        help=(
+            "Adapt the local-normal support minimum to small penetrating "
+            "regions while retaining a three-point noise floor."
+        ),
+    )
+    parser.add_argument(
+        "--contact-normal-min-cluster-fraction",
+        type=float,
+        default=0.25,
+        help=(
+            "Required fraction of a region's penetrating points when the "
+            "adaptive local-normal support minimum is enabled."
+        ),
+    )
     parser.add_argument("--w-tangential", type=float, default=2.0)
     parser.add_argument("--w-vertex-anchor", type=float, default=1.0)
     parser.add_argument("--w-pose-anchor", type=float, default=5e-4)
@@ -869,6 +886,10 @@ def main() -> None:
         raise ValueError("--contact-normal-pushout-mm must be non-negative")
     if args.contact_normal_clearance_mm < 0:
         raise ValueError("--contact-normal-clearance-mm must be non-negative")
+    if not 0.0 < args.contact_normal_min_cluster_fraction <= 1.0:
+        raise ValueError(
+            "--contact-normal-min-cluster-fraction must be in (0, 1]"
+        )
     if args.w_contact_normal_clearance > 0 and not args.region_balanced_contact:
         raise ValueError(
             "--w-contact-normal-clearance requires --region-balanced-contact"
@@ -1871,9 +1892,21 @@ def main() -> None:
                     side_compatible = side_alignment >= (
                         args.contact_normal_patch_side_min_cosine
                     )
-                    if int(side_compatible.sum()) < (
+                    required_cluster_points = (
                         args.contact_normal_min_cluster_points
-                    ):
+                    )
+                    if args.contact_normal_adaptive_min_cluster_points:
+                        required_cluster_points = min(
+                            required_cluster_points,
+                            max(
+                                3,
+                                math.ceil(
+                                    args.contact_normal_min_cluster_fraction
+                                    * int(point_selector.sum())
+                                ),
+                            ),
+                        )
+                    if int(side_compatible.sum()) < required_cluster_points:
                         continue
                     compatible_indices = torch.nonzero(
                         side_compatible, as_tuple=False
@@ -3331,6 +3364,12 @@ def main() -> None:
             "contact_normal_pushout_mm": args.contact_normal_pushout_mm,
             "contact_normal_clearance": args.w_contact_normal_clearance,
             "contact_normal_clearance_mm": args.contact_normal_clearance_mm,
+            "contact_normal_adaptive_min_cluster_points": (
+                args.contact_normal_adaptive_min_cluster_points
+            ),
+            "contact_normal_min_cluster_fraction": (
+                args.contact_normal_min_cluster_fraction
+            ),
             "contact_normal_pushout_mode": (
                 args.contact_normal_pushout_mode
             ),
