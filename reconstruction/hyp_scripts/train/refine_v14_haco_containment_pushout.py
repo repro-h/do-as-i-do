@@ -208,6 +208,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--contact-normal-side-reference",
+        choices=("patch_normal", "haco_normal"),
+        default="patch_normal",
+        help=(
+            "Lock the surface side to the frozen Stage1 patch normal or to "
+            "the opposite of the compact HACO hand-normal vote."
+        ),
+    )
+    parser.add_argument(
+        "--contact-normal-haco-coherence-minimum",
+        type=float,
+        default=0.4,
+        help="Minimum resultant length for a frozen HACO-normal side vote.",
+    )
+    parser.add_argument(
         "--contact-normal-min-cluster-points",
         type=int,
         default=8,
@@ -832,6 +847,10 @@ def main() -> None:
         )
     if args.contact_normal_min_cluster_points <= 0:
         raise ValueError("--contact-normal-min-cluster-points must be positive")
+    if not 0.0 <= args.contact_normal_haco_coherence_minimum <= 1.0:
+        raise ValueError(
+            "--contact-normal-haco-coherence-minimum must be in [0, 1]"
+        )
     if args.max_grad_norm <= 0:
         raise ValueError("--max-grad-norm must be positive")
     if args.max_residual_translation_mm <= 0:
@@ -1807,12 +1826,15 @@ def main() -> None:
                         ].mean(dim=1),
                         dim=-1,
                     )
-                    opposed = (
-                        mapped_hand_normals * dominant_object_normals
+                    topk_opposed = (
+                        selected_normals * voted_object_normal
                     ).sum(dim=-1) <= (
                         -args.contact_normal_opposed_min_cosine
                     )
-                    opposed_fraction = opposed.to(hand.dtype).mean()
+                    opposed_fraction = (
+                        selected_weights
+                        * topk_opposed.to(selected_weights.dtype)
+                    ).sum() / selected_weights.sum().clamp_min(1e-6)
                     if region_index >= 0:
                         region_opposed_fraction[
                             frame_index, region_index
@@ -1971,15 +1993,31 @@ def main() -> None:
         device=device,
         dtype=torch.bool,
     )
+    initial_hand_normals = mano_vertex_normals(
+        reconstructed, mano_faces, mirror_left
+    ).detach()
     for region_index in range(len(contact_region_names)):
         region_weights = contact_weight * contact_region_mask[
             region_index
         ][None]
-        reference = (
-            fixed_contact_normal * region_weights[..., None]
-        ).sum(dim=1)
+        if args.contact_normal_side_reference == "haco_normal":
+            reference = -(
+                initial_hand_normals * region_weights[..., None]
+            ).sum(dim=1)
+        else:
+            reference = (
+                fixed_contact_normal * region_weights[..., None]
+            ).sum(dim=1)
         reference_norm = reference.norm(dim=-1)
-        valid = reference_norm > 1e-6
+        weight_sum = region_weights.sum(dim=-1).clamp_min(1e-6)
+        coherence = reference_norm / weight_sum
+        valid = (
+            reference_norm > 1e-6
+        ) & (
+            coherence >= args.contact_normal_haco_coherence_minimum
+            if args.contact_normal_side_reference == "haco_normal"
+            else torch.ones_like(coherence, dtype=torch.bool)
+        )
         contact_side_reference_normal[valid, region_index] = (
             reference[valid] / reference_norm[valid, None]
         )
@@ -3108,6 +3146,12 @@ def main() -> None:
             ),
             "contact_normal_patch_side_min_cosine": (
                 args.contact_normal_patch_side_min_cosine
+            ),
+            "contact_normal_side_reference": (
+                args.contact_normal_side_reference
+            ),
+            "contact_normal_haco_coherence_minimum": (
+                args.contact_normal_haco_coherence_minimum
             ),
             "contact_normal_min_cluster_points": (
                 args.contact_normal_min_cluster_points
