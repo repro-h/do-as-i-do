@@ -99,6 +99,29 @@ def parse_args() -> argparse.Namespace:
         default=12.0,
         help="Radius used to cluster Stage1 HACO candidates on MANO.",
     )
+    parser.add_argument(
+        "--clearance-all-haco-regions",
+        action="store_true",
+        help=(
+            "Build penetration-side references from compact HACO top-k "
+            "points in every current region, independently of the fixed "
+            "Stage1 contact-patch regions."
+        ),
+    )
+    parser.add_argument(
+        "--clearance-region-vertex-topk",
+        type=int,
+        default=16,
+        help="Compact HACO top-k used per frame/region for clearance only.",
+    )
+    parser.add_argument(
+        "--dynamic-region-joint-mask",
+        action="store_true",
+        help=(
+            "Only optimize finger joints belonging to fixed contact regions "
+            "or regions with a currently valid penetration-clearance direction."
+        ),
+    )
     parser.add_argument("--filter-contact-points", action="store_true")
     parser.add_argument("--filtered-contact-topk", type=int, default=48)
     parser.add_argument("--filtered-component-topk", type=int, default=8)
@@ -789,6 +812,8 @@ def main() -> None:
         raise ValueError("--filtered-contact-topk must be positive")
     if args.stage1_contact_vertex_topk <= 0:
         raise ValueError("--stage1-contact-vertex-topk must be positive")
+    if args.clearance_region_vertex_topk <= 0:
+        raise ValueError("--clearance-region-vertex-topk must be positive")
     if args.stage1_component_radius_mm <= 0:
         raise ValueError("--stage1-component-radius-mm must be positive")
     if args.w_contact_facing < 0:
@@ -1654,6 +1679,50 @@ def main() -> None:
         )
         return weights, selected_count, effective_count
 
+    def build_clearance_reference_weights(
+        hand: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select compact HACO anchors for penetration-side inference.
+
+        Unlike contact weights, these anchors do not require a fixed object
+        patch. They only identify which anatomical region and surface side a
+        current penetrating object point belongs to.
+        """
+        if not args.clearance_all_haco_regions:
+            return contact_weight.detach().clone()
+        if contact_region_mask is None:
+            raise RuntimeError(
+                "--clearance-all-haco-regions requires region-balanced contact"
+            )
+        weights = torch.zeros_like(probability_contact_weight)
+        for frame_index in range(frame_count):
+            if contact_gate[frame_index] <= 0:
+                continue
+            for region_index in range(len(contact_region_names)):
+                candidates = torch.nonzero(
+                    contact_mask[frame_index]
+                    & contact_region_mask[region_index],
+                    as_tuple=False,
+                ).flatten()
+                if not len(candidates):
+                    continue
+                candidates = choose_compact_stage1_candidates(
+                    candidates,
+                    hand[frame_index],
+                    probability_contact_weight[frame_index, candidates],
+                )
+                count = min(
+                    args.clearance_region_vertex_topk, len(candidates)
+                )
+                chosen = candidates[torch.topk(
+                    probability_contact_weight[frame_index, candidates],
+                    count,
+                ).indices]
+                weights[frame_index, chosen] = (
+                    probability_contact_weight[frame_index, chosen]
+                )
+        return weights.detach()
+
     def build_contact_normal_pushout_state(
         hand: torch.Tensor,
         inside_mask: np.ndarray,
@@ -2007,6 +2076,9 @@ def main() -> None:
         )
     )
     total_contact_weight = contact_weight.sum().clamp_min(1e-6)
+    clearance_reference_weight = build_clearance_reference_weights(
+        reconstructed
+    )
     contact_side_reference_normal = torch.zeros(
         (frame_count, len(contact_region_names), 3),
         device=device,
@@ -2021,7 +2093,7 @@ def main() -> None:
         reconstructed, mano_faces, mirror_left
     ).detach()
     for region_index in range(len(contact_region_names)):
-        region_weights = contact_weight * contact_region_mask[
+        region_weights = clearance_reference_weight * contact_region_mask[
             region_index
         ][None]
         if args.contact_normal_side_reference == "haco_normal":
@@ -2060,7 +2132,7 @@ def main() -> None:
         correspondence_points,
         correspondence_object_normals,
         correspondence_faces,
-        contact_weight,
+        clearance_reference_weight,
     )
     camera_z_only = args.optimization_mode == "camera_z_only"
     optimize_local_pose = args.optimization_mode not in (
@@ -2125,17 +2197,35 @@ def main() -> None:
         "ring": slice(9, 12),
         "thumb": slice(12, 15),
     }
-    optimized_joint_mask = torch.ones((1, 15, 1), device=device)
-    if alternating_mode:
+    optimized_joint_mask = torch.ones(
+        (frame_count, 15, 1), device=device
+    )
+
+    def refresh_optimized_joint_mask() -> None:
+        if not (alternating_mode or args.dynamic_region_joint_mask):
+            optimized_joint_mask.fill_(1.0)
+            return
         optimized_joint_mask.zero_()
         for region_name in stage1_contact_region_names:
             joint_slice = pose_region_joint_slices.get(region_name)
             if joint_slice is not None:
-                optimized_joint_mask[:, joint_slice] = 1.0
+                optimized_joint_mask[optimization_gate, joint_slice] = 1.0
+        if args.dynamic_region_joint_mask:
+            valid_clearance_region = (
+                contact_normal_region_direction.norm(dim=-1) > 1e-6
+            )
+            for region_index, region_name in enumerate(contact_region_names):
+                joint_slice = pose_region_joint_slices.get(region_name)
+                if joint_slice is None:
+                    continue
+                frame_mask = valid_clearance_region[:, region_index]
+                optimized_joint_mask[frame_mask, joint_slice] = 1.0
         if not optimized_joint_mask.any():
             raise RuntimeError(
-                "Stage1 contact regions contain no articulated finger joints"
+                "No fixed-contact or clearance region has articulated joints"
             )
+
+    refresh_optimized_joint_mask()
     active_indices = torch.from_numpy(active_indices_np).to(device)
     contact_target = args.contact_target_mm / 1000.0
     collision_margin = args.collision_margin_mm / 1000.0
@@ -2302,8 +2392,9 @@ def main() -> None:
                     correspondence_points,
                     correspondence_object_normals,
                     correspondence_faces,
-                    contact_weight,
+                    clearance_reference_weight,
                 )
+                refresh_optimized_joint_mask()
                 if args.adaptive_reset_optimizer_on_refresh:
                     optimizer.state.clear()
         contact_facing_phase_scale = (
@@ -2701,6 +2792,8 @@ def main() -> None:
             raise FloatingPointError(
                 f"Non-finite Stage2 gradient at optimization step {step}"
             )
+        if optimize_local_pose and args.dynamic_region_joint_mask:
+            delta.grad.mul_(optimized_joint_mask)
         if alternating_mode:
             delta.grad.mul_(optimized_joint_mask)
             residual_translation.grad[:, :2].zero_()
@@ -2975,7 +3068,7 @@ def main() -> None:
             final_collision_points,
             final_collision_normals,
             final_collision_faces,
-            contact_weight,
+            clearance_reference_weight,
         )
     filtered_contact_mask_np = (
         contact_weight > 0
@@ -3262,6 +3355,21 @@ def main() -> None:
             ),
             "refined_region_cosine": contact_region_facing_summary,
         },
+        "clearance_regions": {
+            "all_haco_regions": args.clearance_all_haco_regions,
+            "region_vertex_topk": args.clearance_region_vertex_topk,
+            "dynamic_joint_mask": args.dynamic_region_joint_mask,
+            "selected_vertices": int(
+                (clearance_reference_weight > 0).sum().cpu()
+            ),
+            "selected_frames_by_region": {
+                name: int((
+                    clearance_reference_weight
+                    * contact_region_mask[index][None]
+                ).sum(dim=-1).gt(0).sum().cpu())
+                for index, name in enumerate(contact_region_names)
+            },
+        },
         "contact_pivot_residual_se3": {
             "enabled": optimize_residual_se3,
             "max_translation_mm": args.max_residual_translation_mm,
@@ -3423,6 +3531,12 @@ def main() -> None:
         "adaptive_contact_gate": adaptive_gate.cpu().numpy().astype(np.float32),
         "filtered_contact_mask": filtered_contact_mask_np,
         "filtered_contact_weight": filtered_contact_weight_np.astype(np.float16),
+        "clearance_reference_weight": (
+            clearance_reference_weight.cpu().numpy().astype(np.float16)
+        ),
+        "optimized_joint_mask": (
+            optimized_joint_mask.cpu().numpy().astype(bool)
+        ),
         "contact_normal_pushout_direction_camera": (
             contact_normal_pushout_direction.cpu().numpy().astype(np.float32)
         ),
