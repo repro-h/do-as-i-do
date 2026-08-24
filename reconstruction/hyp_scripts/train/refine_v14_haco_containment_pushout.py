@@ -160,6 +160,7 @@ def parse_args() -> argparse.Namespace:
             "object_normal_opposed",
             "object_normal_region",
             "object_normal_full_region",
+            "local_surface_opposed",
             "opposite_hand_normal",
         ),
         default="collision_point_side",
@@ -184,6 +185,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.5,
         help="Minimum weighted fraction of opposed HACO top-k normals.",
+    )
+    parser.add_argument(
+        "--contact-normal-object-consistency-cosine",
+        type=float,
+        default=0.7,
+        help="Cosine threshold used to form a dominant local object-normal cluster.",
+    )
+    parser.add_argument(
+        "--contact-normal-object-consistency-fraction",
+        type=float,
+        default=0.5,
+        help="Minimum fraction of penetrating points in the dominant normal cluster.",
     )
     parser.add_argument("--w-tangential", type=float, default=2.0)
     parser.add_argument("--w-vertex-anchor", type=float, default=1.0)
@@ -789,6 +802,14 @@ def main() -> None:
     if not 0.0 <= args.contact_normal_opposed_fraction <= 1.0:
         raise ValueError(
             "--contact-normal-opposed-fraction must be in [0, 1]"
+        )
+    if not -1.0 <= args.contact_normal_object_consistency_cosine <= 1.0:
+        raise ValueError(
+            "--contact-normal-object-consistency-cosine must be in [-1, 1]"
+        )
+    if not 0.0 <= args.contact_normal_object_consistency_fraction <= 1.0:
+        raise ValueError(
+            "--contact-normal-object-consistency-fraction must be in [0, 1]"
         )
     if args.max_grad_norm <= 0:
         raise ValueError("--max-grad-norm must be positive")
@@ -1582,6 +1603,7 @@ def main() -> None:
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
     ]:
         """Infer a region push direction from the current inside points.
 
@@ -1614,6 +1636,12 @@ def main() -> None:
             dtype=hand.dtype,
         )
         region_opposed_fraction = torch.full(
+            (frame_count, region_count),
+            float("nan"),
+            device=device,
+            dtype=hand.dtype,
+        )
+        region_object_consistency_fraction = torch.full(
             (frame_count, region_count),
             float("nan"),
             device=device,
@@ -1671,6 +1699,82 @@ def main() -> None:
                     point_mask
                 ).to(device)
                 collision_point = points[point_selector].mean(dim=0)
+
+                if args.contact_normal_pushout_mode == "local_surface_opposed":
+                    local_object_normals = functional.normalize(
+                        point_normals[point_selector], dim=-1
+                    )
+                    if not len(local_object_normals):
+                        continue
+                    similarity = (
+                        local_object_normals @ local_object_normals.T
+                    )
+                    support = (
+                        similarity
+                        >= args.contact_normal_object_consistency_cosine
+                    ).sum(dim=-1)
+                    dominant_seed = int(support.argmax())
+                    dominant = similarity[dominant_seed] >= (
+                        args.contact_normal_object_consistency_cosine
+                    )
+                    consistency_fraction = dominant.to(hand.dtype).mean()
+                    if region_index >= 0:
+                        region_object_consistency_fraction[
+                            frame_index, region_index
+                        ] = consistency_fraction
+                    if float(consistency_fraction) < (
+                        args.contact_normal_object_consistency_fraction
+                    ):
+                        continue
+
+                    local_face_index = face_index[point_selector]
+                    if local_face_index.ndim > 1:
+                        local_face_index = local_face_index[:, 0]
+                    dominant_face_index = local_face_index[dominant]
+                    dominant_object_normals = local_object_normals[dominant]
+                    voted_object_normal = functional.normalize(
+                        dominant_object_normals.mean(dim=0, keepdim=True),
+                        dim=-1,
+                    )[0]
+                    mapped_face_vertices = mano_faces[dominant_face_index]
+                    mapped_hand_normals = functional.normalize(
+                        hand_normals[
+                            frame_index, mapped_face_vertices
+                        ].mean(dim=1),
+                        dim=-1,
+                    )
+                    opposed = (
+                        mapped_hand_normals * dominant_object_normals
+                    ).sum(dim=-1) <= (
+                        -args.contact_normal_opposed_min_cosine
+                    )
+                    opposed_fraction = opposed.to(hand.dtype).mean()
+                    if region_index >= 0:
+                        region_opposed_fraction[
+                            frame_index, region_index
+                        ] = opposed_fraction
+                    if float(opposed_fraction) < (
+                        args.contact_normal_opposed_fraction
+                    ):
+                        continue
+
+                    affected_vertices = torch.unique(
+                        mapped_face_vertices.flatten()
+                    )
+                    direction[frame_index, affected_vertices] = (
+                        voted_object_normal
+                    )
+                    gate[frame_index, affected_vertices] = 1.0
+                    if region_index >= 0:
+                        region_direction[
+                            frame_index, region_index
+                        ] = voted_object_normal
+                        region_alignment[
+                            frame_index, region_index
+                        ] = (
+                            mapped_hand_normals * dominant_object_normals
+                        ).sum(dim=-1).mean()
+                    continue
 
                 if args.contact_normal_pushout_mode in (
                     "object_normal_opposed",
@@ -1780,6 +1884,7 @@ def main() -> None:
             region_direction.detach(),
             region_alignment.detach(),
             region_opposed_fraction.detach(),
+            region_object_consistency_fraction.detach(),
         )
 
     current_contact_distance = initial_distance
@@ -1797,6 +1902,7 @@ def main() -> None:
         contact_normal_region_direction,
         contact_normal_region_alignment,
         contact_normal_region_opposed_fraction,
+        contact_normal_region_object_consistency_fraction,
     ) = build_contact_normal_pushout_state(
         reconstructed,
         current_inside_mask_np,
@@ -2037,6 +2143,7 @@ def main() -> None:
                     contact_normal_region_direction,
                     contact_normal_region_alignment,
                     contact_normal_region_opposed_fraction,
+                    contact_normal_region_object_consistency_fraction,
                 ) = build_contact_normal_pushout_state(
                     current_hand,
                     current_inside_mask_np,
@@ -2216,8 +2323,9 @@ def main() -> None:
                 - normal_displacement,
                 min=0.0,
             ).square()
-            if args.contact_normal_pushout_mode == (
-                "object_normal_full_region"
+            if args.contact_normal_pushout_mode in (
+                "object_normal_full_region",
+                "local_surface_opposed",
             ):
                 push_weight = push_gate
                 push_denominator = push_weight.sum().clamp_min(1.0)
@@ -2657,6 +2765,7 @@ def main() -> None:
             contact_normal_region_direction,
             contact_normal_region_alignment,
             contact_normal_region_opposed_fraction,
+            contact_normal_region_object_consistency_fraction,
         ) = build_contact_normal_pushout_state(
             refined,
             refined_inside_mask,
@@ -2900,6 +3009,12 @@ def main() -> None:
             "contact_normal_opposed_fraction": (
                 args.contact_normal_opposed_fraction
             ),
+            "contact_normal_object_consistency_cosine": (
+                args.contact_normal_object_consistency_cosine
+            ),
+            "contact_normal_object_consistency_fraction": (
+                args.contact_normal_object_consistency_fraction
+            ),
             "tangential": args.w_tangential,
             "vertex_anchor": args.w_vertex_anchor,
             "pose_anchor": args.w_pose_anchor,
@@ -3106,6 +3221,11 @@ def main() -> None:
         ),
         "contact_normal_region_opposed_fraction": (
             contact_normal_region_opposed_fraction.cpu()
+            .numpy()
+            .astype(np.float32)
+        ),
+        "contact_normal_region_object_consistency_fraction": (
+            contact_normal_region_object_consistency_fraction.cpu()
             .numpy()
             .astype(np.float32)
         ),
