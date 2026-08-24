@@ -885,16 +885,16 @@ def main() -> None:
                     push_norm = np.linalg.norm(
                         push_vectors, axis=-1, keepdims=True
                     )
-                    valid = (
+                    valid_push = (
                         np.isfinite(push_vectors).all(axis=-1)
                         & (push_norm[:, 0] > 1e-6)
                     )
-                    if not valid.any():
+                    if not valid_push.any():
                         continue
-                    push_sources = push_sources[valid]
+                    push_sources = push_sources[valid_push]
                     push_vectors = (
-                        push_vectors[valid]
-                        / push_norm[valid]
+                        push_vectors[valid_push]
+                        / push_norm[valid_push]
                     )
                     push_endpoints = push_sources + (
                         push_vectors * float(normal_length.value)
