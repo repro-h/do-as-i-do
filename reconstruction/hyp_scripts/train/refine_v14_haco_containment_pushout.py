@@ -118,6 +118,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-contact", type=float, default=1.0)
     parser.add_argument("--w-contact-facing", type=float, default=0.0)
     parser.add_argument(
+        "--contact-facing-mode",
+        choices=("pointwise", "region_centroid"),
+        default="pointwise",
+        help=(
+            "Apply facing independently to every selected contact or once "
+            "per region using weighted hand/patch centroids and normals."
+        ),
+    )
+    parser.add_argument(
         "--contact-surface-facing-min-cosine",
         type=float,
         default=0.2,
@@ -725,6 +734,14 @@ def main() -> None:
         raise ValueError("--stage1-component-radius-mm must be positive")
     if args.w_contact_facing < 0:
         raise ValueError("--w-contact-facing must be non-negative")
+    if (
+        args.contact_facing_mode == "region_centroid"
+        and not args.region_balanced_contact
+    ):
+        raise ValueError(
+            "--contact-facing-mode region_centroid requires "
+            "--region-balanced-contact"
+        )
     if not -1.0 <= args.contact_surface_facing_min_cosine <= 1.0:
         raise ValueError(
             "--contact-surface-facing-min-cosine must be in [-1, 1]"
@@ -2070,22 +2087,68 @@ def main() -> None:
             hand_normals = mano_vertex_normals(
                 refined, mano_faces, mirror_left
             )
-            patch_direction = functional.normalize(
-                fixed_contact_point[indices] - refined, dim=-1
-            )
-            contact_facing_cosine = (
-                hand_normals * patch_direction
-            ).sum(dim=-1)
-            contact_facing_error = torch.clamp(
-                args.contact_surface_facing_min_cosine
-                - contact_facing_cosine,
-                min=0.0,
-            ).square()
-            chunk_contact_facing = (
-                contact_facing_error
-                * contact_weight[indices]
-                * frame_contact_scale[indices, None]
-            ).sum() / total_contact_weight
+            if args.contact_facing_mode == "region_centroid":
+                assert contact_region_mask is not None
+                assert contact_region_active is not None
+                assert total_contact_region_scale is not None
+                facing_region_weight = (
+                    contact_weight[indices, None]
+                    * contact_region_mask[None]
+                )
+                facing_region_denominator = facing_region_weight.sum(
+                    dim=-1, keepdim=True
+                ).clamp_min(1e-6)
+                facing_hand_centroid = (
+                    refined[:, None]
+                    * facing_region_weight[..., None]
+                ).sum(dim=-2) / facing_region_denominator
+                facing_patch_centroid = (
+                    fixed_contact_point[indices, None]
+                    * facing_region_weight[..., None]
+                ).sum(dim=-2) / facing_region_denominator
+                facing_hand_normal = functional.normalize(
+                    (
+                        hand_normals[:, None]
+                        * facing_region_weight[..., None]
+                    ).sum(dim=-2),
+                    dim=-1,
+                )
+                facing_patch_direction = functional.normalize(
+                    facing_patch_centroid - facing_hand_centroid,
+                    dim=-1,
+                )
+                contact_facing_cosine = (
+                    facing_hand_normal * facing_patch_direction
+                ).sum(dim=-1)
+                contact_facing_error = torch.clamp(
+                    args.contact_surface_facing_min_cosine
+                    - contact_facing_cosine,
+                    min=0.0,
+                ).square()
+                facing_region_scale = (
+                    contact_region_active[indices]
+                    * frame_contact_scale[indices, None]
+                )
+                chunk_contact_facing = (
+                    contact_facing_error * facing_region_scale
+                ).sum() / total_contact_region_scale
+            else:
+                patch_direction = functional.normalize(
+                    fixed_contact_point[indices] - refined, dim=-1
+                )
+                contact_facing_cosine = (
+                    hand_normals * patch_direction
+                ).sum(dim=-1)
+                contact_facing_error = torch.clamp(
+                    args.contact_surface_facing_min_cosine
+                    - contact_facing_cosine,
+                    min=0.0,
+                ).square()
+                chunk_contact_facing = (
+                    contact_facing_error
+                    * contact_weight[indices]
+                    * frame_contact_scale[indices, None]
+                ).sum() / total_contact_weight
             if args.region_balanced_contact:
                 region_weight = (
                     contact_weight[indices, None]
@@ -2599,6 +2662,56 @@ def main() -> None:
     selected_facing_cosine = (
         refined_contact_facing_cosine.cpu().numpy()[filtered_contact_mask_np]
     )
+    refined_contact_region_facing_cosine_np = np.empty(
+        (frame_count, 0), dtype=np.float32
+    )
+    contact_region_facing_summary: dict[str, object] = {}
+    if contact_region_mask is not None and contact_region_names:
+        with torch.no_grad():
+            final_region_weight = (
+                contact_weight[:, None] * contact_region_mask[None]
+            )
+            final_region_denominator = final_region_weight.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-6)
+            final_hand_centroid = (
+                refined[:, None] * final_region_weight[..., None]
+            ).sum(dim=-2) / final_region_denominator
+            final_patch_centroid = (
+                refined_contact_point[:, None]
+                * final_region_weight[..., None]
+            ).sum(dim=-2) / final_region_denominator
+            final_region_normal = functional.normalize(
+                (
+                    refined_hand_normals[:, None]
+                    * final_region_weight[..., None]
+                ).sum(dim=-2),
+                dim=-1,
+            )
+            final_region_direction = functional.normalize(
+                final_patch_centroid - final_hand_centroid,
+                dim=-1,
+            )
+            final_region_cosine = (
+                final_region_normal * final_region_direction
+            ).sum(dim=-1)
+        refined_contact_region_facing_cosine_np = (
+            final_region_cosine.cpu().numpy().astype(np.float32)
+        )
+        final_region_count = (
+            (contact_weight[:, None] > 0)
+            & contact_region_mask[None]
+        ).sum(dim=-1).cpu().numpy()
+        refined_contact_region_facing_cosine_np[
+            final_region_count < args.contact_region_min_vertices
+        ] = np.nan
+        for region_index, region_name in enumerate(contact_region_names):
+            region_values = refined_contact_region_facing_cosine_np[
+                :, region_index
+            ]
+            contact_region_facing_summary[region_name] = distribution(
+                region_values[np.isfinite(region_values)]
+            )
     selected_initial_mm = (
         initial_distance.cpu().numpy()[filtered_contact_mask_np] * 1000.0
     )
@@ -2785,11 +2898,16 @@ def main() -> None:
         },
         "contact_facing": {
             "enabled": args.w_contact_facing > 0,
+            "mode": args.contact_facing_mode,
             "minimum_cosine": args.contact_surface_facing_min_cosine,
             "interpretation": (
-                "MANO outward normal dot normalized direction from the "
+                "Weighted region-normal dot direction from the HACO "
+                "component centroid to its object-patch centroid"
+                if args.contact_facing_mode == "region_centroid"
+                else "MANO outward normal dot normalized direction from the "
                 "selected HACO vertex to its object-patch target"
             ),
+            "refined_region_cosine": contact_region_facing_summary,
         },
         "contact_pivot_residual_se3": {
             "enabled": optimize_residual_se3,
@@ -2972,6 +3090,9 @@ def main() -> None:
         ),
         "refined_contact_facing_cosine": (
             refined_contact_facing_cosine.cpu().numpy().astype(np.float32)
+        ),
+        "refined_contact_region_facing_cosine": (
+            refined_contact_region_facing_cosine_np
         ),
         "contact_target_point_camera": (
             fixed_contact_point.cpu().numpy().astype(np.float32)
