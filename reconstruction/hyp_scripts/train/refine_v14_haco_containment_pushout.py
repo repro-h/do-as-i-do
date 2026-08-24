@@ -85,6 +85,20 @@ def parse_args() -> argparse.Namespace:
             "vertices per Stage1 fixed-patch region and frame."
         ),
     )
+    parser.add_argument(
+        "--stage1-compact-component",
+        action="store_true",
+        help=(
+            "Select one spatially compact HACO component per region/frame "
+            "before applying the Stage1 probability top-k."
+        ),
+    )
+    parser.add_argument(
+        "--stage1-component-radius-mm",
+        type=float,
+        default=12.0,
+        help="Radius used to cluster Stage1 HACO candidates on MANO.",
+    )
     parser.add_argument("--filter-contact-points", action="store_true")
     parser.add_argument("--filtered-contact-topk", type=int, default=48)
     parser.add_argument("--filtered-component-topk", type=int, default=8)
@@ -707,6 +721,8 @@ def main() -> None:
         raise ValueError("--filtered-contact-topk must be positive")
     if args.stage1_contact_vertex_topk <= 0:
         raise ValueError("--stage1-contact-vertex-topk must be positive")
+    if args.stage1_component_radius_mm <= 0:
+        raise ValueError("--stage1-component-radius-mm must be positive")
     if args.w_contact_facing < 0:
         raise ValueError("--w-contact-facing must be non-negative")
     if not -1.0 <= args.contact_surface_facing_min_cosine <= 1.0:
@@ -1303,6 +1319,59 @@ def main() -> None:
                     np.bincount(region_ids).argmax()
                 )
 
+    def choose_compact_stage1_candidates(
+        candidates: torch.Tensor,
+        hand_frame: torch.Tensor,
+        candidate_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Keep one compact high-probability component for a region."""
+        if len(candidates) <= 1:
+            return candidates
+        points = hand_frame[candidates].detach().cpu().numpy()
+        radius = args.stage1_component_radius_mm / 1000.0
+        parent = np.arange(len(candidates), dtype=np.int64)
+
+        def find(index: int) -> int:
+            while parent[index] != index:
+                parent[index] = parent[parent[index]]
+                index = int(parent[index])
+            return index
+
+        distances = np.linalg.norm(
+            points[:, None, :] - points[None, :, :], axis=-1
+        )
+        close_pairs = np.argwhere(distances <= radius)
+        for first, second in close_pairs:
+            root_first = find(int(first))
+            root_second = find(int(second))
+            if root_first != root_second:
+                parent[root_second] = root_first
+
+        components: dict[int, list[int]] = {}
+        for index in range(len(candidates)):
+            components.setdefault(find(index), []).append(index)
+
+        best_component = None
+        best_score = -float("inf")
+        weights_np = candidate_weights.detach().cpu().numpy()
+        for component in components.values():
+            component_points = points[component]
+            component_weights = weights_np[component]
+            total_weight = float(component_weights.sum())
+            centroid = (
+                component_points * component_weights[:, None]
+            ).sum(axis=0) / max(total_weight, 1e-8)
+            compactness = float(
+                np.mean(np.linalg.norm(component_points - centroid, axis=-1))
+            )
+            score = total_weight / (1.0 + compactness / max(radius, 1e-8))
+            if score > best_score:
+                best_score = score
+                best_component = component
+
+        assert best_component is not None
+        return candidates[torch.as_tensor(best_component, device=device)]
+
     def build_contact_weights(
         hand: torch.Tensor,
         distance: torch.Tensor,
@@ -1321,6 +1390,14 @@ def main() -> None:
                     ).flatten()
                     if not len(candidates):
                         continue
+                    if args.stage1_compact_component:
+                        candidates = choose_compact_stage1_candidates(
+                            candidates,
+                            hand[frame_index],
+                            probability_contact_weight[
+                                frame_index, candidates
+                            ],
+                        )
                     count = min(args.stage1_contact_vertex_topk, len(candidates))
                     chosen = candidates[torch.topk(
                         probability_contact_weight[frame_index, candidates],
@@ -2774,6 +2851,8 @@ def main() -> None:
         "contact_filter": {
             "point_selection": args.contact_point_selection,
             "stage1_region_topk": args.stage1_contact_vertex_topk,
+            "stage1_compact_component": args.stage1_compact_component,
+            "stage1_component_radius_mm": args.stage1_component_radius_mm,
             "stage1_regions": [
                 contact_region_names[index]
                 for index in stage1_contact_region_indices
