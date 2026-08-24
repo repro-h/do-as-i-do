@@ -198,6 +198,21 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="Minimum fraction of penetrating points in the dominant normal cluster.",
     )
+    parser.add_argument(
+        "--contact-normal-patch-side-min-cosine",
+        type=float,
+        default=0.5,
+        help=(
+            "Require a penetration-cluster object normal to agree with the "
+            "frozen Stage1 contact-patch normal for the same HACO region."
+        ),
+    )
+    parser.add_argument(
+        "--contact-normal-min-cluster-points",
+        type=int,
+        default=8,
+        help="Minimum side-compatible penetrating points in a local cluster.",
+    )
     parser.add_argument("--w-tangential", type=float, default=2.0)
     parser.add_argument("--w-vertex-anchor", type=float, default=1.0)
     parser.add_argument("--w-pose-anchor", type=float, default=5e-4)
@@ -811,6 +826,12 @@ def main() -> None:
         raise ValueError(
             "--contact-normal-object-consistency-fraction must be in [0, 1]"
         )
+    if not -1.0 <= args.contact_normal_patch_side_min_cosine <= 1.0:
+        raise ValueError(
+            "--contact-normal-patch-side-min-cosine must be in [-1, 1]"
+        )
+    if args.contact_normal_min_cluster_points <= 0:
+        raise ValueError("--contact-normal-min-cluster-points must be positive")
     if args.max_grad_norm <= 0:
         raise ValueError("--max-grad-norm must be positive")
     if args.max_residual_translation_mm <= 0:
@@ -1604,6 +1625,7 @@ def main() -> None:
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
     ]:
         """Infer a region push direction from the current inside points.
 
@@ -1642,6 +1664,12 @@ def main() -> None:
             dtype=hand.dtype,
         )
         region_object_consistency_fraction = torch.full(
+            (frame_count, region_count),
+            float("nan"),
+            device=device,
+            dtype=hand.dtype,
+        )
+        region_patch_side_alignment = torch.full(
             (frame_count, region_count),
             float("nan"),
             device=device,
@@ -1706,6 +1734,31 @@ def main() -> None:
                     )
                     if not len(local_object_normals):
                         continue
+                    if region_index < 0:
+                        continue
+                    reference_normal = contact_side_reference_normal[
+                        frame_index, region_index
+                    ]
+                    if not contact_side_reference_valid[
+                        frame_index, region_index
+                    ]:
+                        continue
+                    side_alignment = (
+                        local_object_normals * reference_normal
+                    ).sum(dim=-1)
+                    side_compatible = side_alignment >= (
+                        args.contact_normal_patch_side_min_cosine
+                    )
+                    if int(side_compatible.sum()) < (
+                        args.contact_normal_min_cluster_points
+                    ):
+                        continue
+                    compatible_indices = torch.nonzero(
+                        side_compatible, as_tuple=False
+                    ).flatten()
+                    local_object_normals = local_object_normals[
+                        compatible_indices
+                    ]
                     similarity = (
                         local_object_normals @ local_object_normals.T
                     )
@@ -1730,12 +1783,23 @@ def main() -> None:
                     local_face_index = face_index[point_selector]
                     if local_face_index.ndim > 1:
                         local_face_index = local_face_index[:, 0]
+                    local_face_index = local_face_index[compatible_indices]
                     dominant_face_index = local_face_index[dominant]
                     dominant_object_normals = local_object_normals[dominant]
                     voted_object_normal = functional.normalize(
                         dominant_object_normals.mean(dim=0, keepdim=True),
                         dim=-1,
                     )[0]
+                    patch_side_alignment = (
+                        voted_object_normal * reference_normal
+                    ).sum()
+                    region_patch_side_alignment[
+                        frame_index, region_index
+                    ] = patch_side_alignment
+                    if float(patch_side_alignment) < (
+                        args.contact_normal_patch_side_min_cosine
+                    ):
+                        continue
                     mapped_face_vertices = mano_faces[dominant_face_index]
                     mapped_hand_normals = functional.normalize(
                         hand_normals[
@@ -1885,6 +1949,7 @@ def main() -> None:
             region_alignment.detach(),
             region_opposed_fraction.detach(),
             region_object_consistency_fraction.detach(),
+            region_patch_side_alignment.detach(),
         )
 
     current_contact_distance = initial_distance
@@ -1896,6 +1961,29 @@ def main() -> None:
         )
     )
     total_contact_weight = contact_weight.sum().clamp_min(1e-6)
+    contact_side_reference_normal = torch.zeros(
+        (frame_count, len(contact_region_names), 3),
+        device=device,
+        dtype=reconstructed.dtype,
+    )
+    contact_side_reference_valid = torch.zeros(
+        (frame_count, len(contact_region_names)),
+        device=device,
+        dtype=torch.bool,
+    )
+    for region_index in range(len(contact_region_names)):
+        region_weights = contact_weight * contact_region_mask[
+            region_index
+        ][None]
+        reference = (
+            fixed_contact_normal * region_weights[..., None]
+        ).sum(dim=1)
+        reference_norm = reference.norm(dim=-1)
+        valid = reference_norm > 1e-6
+        contact_side_reference_normal[valid, region_index] = (
+            reference[valid] / reference_norm[valid, None]
+        )
+        contact_side_reference_valid[:, region_index] = valid
     (
         contact_normal_pushout_direction,
         contact_normal_pushout_gate,
@@ -1903,6 +1991,7 @@ def main() -> None:
         contact_normal_region_alignment,
         contact_normal_region_opposed_fraction,
         contact_normal_region_object_consistency_fraction,
+        contact_normal_region_patch_side_alignment,
     ) = build_contact_normal_pushout_state(
         reconstructed,
         current_inside_mask_np,
@@ -2144,6 +2233,7 @@ def main() -> None:
                     contact_normal_region_alignment,
                     contact_normal_region_opposed_fraction,
                     contact_normal_region_object_consistency_fraction,
+                    contact_normal_region_patch_side_alignment,
                 ) = build_contact_normal_pushout_state(
                     current_hand,
                     current_inside_mask_np,
@@ -2766,6 +2856,7 @@ def main() -> None:
             contact_normal_region_alignment,
             contact_normal_region_opposed_fraction,
             contact_normal_region_object_consistency_fraction,
+            contact_normal_region_patch_side_alignment,
         ) = build_contact_normal_pushout_state(
             refined,
             refined_inside_mask,
@@ -3015,6 +3106,12 @@ def main() -> None:
             "contact_normal_object_consistency_fraction": (
                 args.contact_normal_object_consistency_fraction
             ),
+            "contact_normal_patch_side_min_cosine": (
+                args.contact_normal_patch_side_min_cosine
+            ),
+            "contact_normal_min_cluster_points": (
+                args.contact_normal_min_cluster_points
+            ),
             "tangential": args.w_tangential,
             "vertex_anchor": args.w_vertex_anchor,
             "pose_anchor": args.w_pose_anchor,
@@ -3228,6 +3325,14 @@ def main() -> None:
             contact_normal_region_object_consistency_fraction.cpu()
             .numpy()
             .astype(np.float32)
+        ),
+        "contact_normal_region_patch_side_alignment": (
+            contact_normal_region_patch_side_alignment.cpu()
+            .numpy()
+            .astype(np.float32)
+        ),
+        "contact_normal_patch_side_reference_camera": (
+            contact_side_reference_normal.cpu().numpy().astype(np.float32)
         ),
         "refined_contact_facing_cosine": (
             refined_contact_facing_cosine.cpu().numpy().astype(np.float32)
