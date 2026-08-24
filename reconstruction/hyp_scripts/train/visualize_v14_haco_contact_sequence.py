@@ -212,6 +212,18 @@ def main() -> None:
         )
         else None
     )
+    stage2_clearance_weight = (
+        np.asarray(
+            stage2["clearance_reference_weight"][stage2_indices],
+            dtype=np.float32,
+        )
+        if (
+            stage2 is not None
+            and stage2_indices is not None
+            and "clearance_reference_weight" in stage2
+        )
+        else None
+    )
     stage2_contact_targets = (
         np.asarray(
             stage2["contact_target_point_camera"][stage2_indices],
@@ -413,6 +425,14 @@ def main() -> None:
         ),
         "stage2_push_directions": server.gui.add_checkbox(
             "Stage2 collision push directions",
+            initial_value=stage2_push_directions is not None,
+        ),
+        "stage2_clearance_topk": server.gui.add_checkbox(
+            "Stage2 clearance HACO top-k",
+            initial_value=stage2_clearance_weight is not None,
+        ),
+        "stage2_clearance_directions": server.gui.add_checkbox(
+            "Stage2 clearance push directions",
             initial_value=stage2_push_directions is not None,
         ),
         "collision_seeds": server.gui.add_checkbox(
@@ -815,6 +835,81 @@ def main() -> None:
                                 ),
                                 point_size=float(point_size.value) * 1.25,
                             ))
+        if (
+            stage2_vertices is not None
+            and stage2_contact_region_id is not None
+            and stage2_clearance_weight is not None
+            and (
+                controls["stage2_clearance_topk"].value
+                or controls["stage2_clearance_directions"].value
+            )
+        ):
+            clearance_selected = stage2_clearance_weight[index] > 0
+            for region_index, region_name in enumerate(
+                stage2_contact_region_names
+            ):
+                region_selected = (
+                    clearance_selected
+                    & (stage2_contact_region_id == region_index)
+                )
+                if not region_selected.any():
+                    continue
+                color = region_colors.get(
+                    region_name,
+                    np.asarray([230, 210, 40], dtype=np.uint8),
+                )
+                prefix = f"/stage2_clearance/{region_name}"
+                if controls["stage2_clearance_topk"].value:
+                    sources = stage2_vertices[index, region_selected]
+                    handles.append(server.scene.add_point_cloud(
+                        f"{prefix}/haco_topk",
+                        points=sources,
+                        colors=np.tile(color[None], (len(sources), 1)),
+                        point_size=float(point_size.value) * 1.8,
+                    ))
+                if (
+                    controls["stage2_clearance_directions"].value
+                    and stage2_push_directions is not None
+                    and stage2_push_gate is not None
+                ):
+                    push_selected = (
+                        (stage2_push_gate[index] > 0)
+                        & (stage2_contact_region_id == region_index)
+                    )
+                    if not push_selected.any():
+                        continue
+                    push_sources = stage2_vertices[index, push_selected]
+                    push_vectors = stage2_push_directions[
+                        index, push_selected
+                    ]
+                    push_norm = np.linalg.norm(
+                        push_vectors, axis=-1, keepdims=True
+                    )
+                    valid = (
+                        np.isfinite(push_vectors).all(axis=-1)
+                        & (push_norm[:, 0] > 1e-6)
+                    )
+                    if not valid.any():
+                        continue
+                    push_sources = push_sources[valid]
+                    push_vectors = (
+                        push_vectors[valid]
+                        / push_norm[valid]
+                    )
+                    push_endpoints = push_sources + (
+                        push_vectors * float(normal_length.value)
+                    )
+                    line_colors = np.tile(
+                        color[None, None], (len(push_sources), 2, 1)
+                    )
+                    handles.append(server.scene.add_line_segments(
+                        f"{prefix}/push_directions",
+                        points=np.stack(
+                            (push_sources, push_endpoints), axis=1
+                        ),
+                        colors=line_colors,
+                        line_width=5.0,
+                    ))
         if controls["collision_seeds"].value and len(collision_seeds):
             handles.append(server.scene.add_point_cloud(
                 "/collision_seed_mano_vertices",
