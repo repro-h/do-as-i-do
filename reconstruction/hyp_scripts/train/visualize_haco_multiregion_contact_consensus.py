@@ -9,9 +9,11 @@ import time
 from pathlib import Path
 
 import numpy as np
+import torch
 import trimesh
 import viser
 
+from audit_capped_mano_ycb_vertices import contains_points_vote
 from refine_v14_haco_sequence_contact_containment import mano_contact_region_ids
 from select_haco_multiregion_object_contacts_sequence import (
     adjacency,
@@ -26,6 +28,7 @@ from visualize_haco_choir_opposition_candidates import (
     physical_pose,
 )
 from visualize_haco_multiregion_object_contacts import PALETTE, colors, lighter
+from visualize_capped_mano_wrist import cap_faces, directed_boundary_loop
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,6 +51,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8098)
     parser.add_argument("--haco-anchor-topk", type=int, default=12)
     parser.add_argument("--haco-anchor-min-vertices", type=int, default=3)
+    parser.add_argument(
+        "--penetration-seeds",
+        action="store_true",
+        help=(
+            "Show YCB vertices contained by the current capped V14 hand, "
+            "colored by their nearest MANO contact region."
+        ),
+    )
+    parser.add_argument("--penetration-point-chunk", type=int, default=256)
+    parser.add_argument(
+        "--penetration-device", choices=("cpu", "cuda"), default="cpu"
+    )
     parser.add_argument(
         "--region-selection",
         choices=("auto", "selected", "stable", "translation_consistent"),
@@ -163,6 +178,10 @@ def main() -> None:
         args.mano_data_dir, str(query["hand_side"].item()).lower()
     )
     mano_graph = adjacency(hand_faces, 778)
+    wrist_boundary = directed_boundary_loop(hand_faces)
+    capped_faces = np.concatenate(
+        (hand_faces, cap_faces(wrist_boundary, hand.shape[1])), axis=0
+    )
 
     mesh = trimesh.load(Path(args.object_mesh).expanduser().resolve(), process=False)
     if isinstance(mesh, trimesh.Scene):
@@ -280,9 +299,51 @@ def main() -> None:
     show_opposition = server.gui.add_checkbox(
         "Automatic opposition", initial_value=True
     )
+    show_penetration_seeds = server.gui.add_checkbox(
+        "First-touch penetration seeds",
+        initial_value=args.penetration_seeds,
+    )
     handles = []
     playing = {"value": False}
     suppress = {"value": False}
+    penetration_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+
+    def penetration_seeds(index: int) -> tuple[np.ndarray, np.ndarray]:
+        cached = penetration_cache.get(index)
+        if cached is not None:
+            return cached
+        current_hand = hand[index]
+        center = current_hand[wrist_boundary].mean(axis=0)
+        capped_vertices = np.concatenate((current_hand, center[None]), axis=0)
+        current_object = (
+            object_local @ poses[index][:3, :3].T + poses[index][:3, 3]
+        )
+        lower = capped_vertices.min(axis=0) - 1e-4
+        upper = capped_vertices.max(axis=0) + 1e-4
+        broadphase = np.all(
+            (current_object >= lower) & (current_object <= upper), axis=-1
+        )
+        candidate_ids = np.flatnonzero(broadphase)
+        inside = np.zeros(len(current_object), dtype=bool)
+        if len(candidate_ids):
+            device = torch.device(args.penetration_device)
+            selected, _ = contains_points_vote(
+                current_object[candidate_ids],
+                capped_vertices,
+                capped_faces,
+                args.penetration_point_chunk,
+                ray_count=1,
+                device=device,
+            )
+            inside[candidate_ids] = selected
+        labels = np.full(len(current_object), -1, dtype=np.int16)
+        if inside.any():
+            nearest = np.linalg.norm(
+                current_object[inside, None] - current_hand[None], axis=-1
+            ).argmin(axis=1)
+            labels[inside] = region_ids[nearest].astype(np.int16)
+        penetration_cache[index] = inside, labels
+        return inside, labels
 
     def clear() -> None:
         while handles:
@@ -429,6 +490,20 @@ def main() -> None:
                     ),
                     line_width=4.0,
                 ))
+        if show_penetration_seeds.value and valid[index]:
+            inside, labels = penetration_seeds(index)
+            for region_index, name in enumerate(region_names):
+                selected = inside & (labels == region_index)
+                if not selected.any():
+                    continue
+                seed_points = object_vertices[selected]
+                color = PALETTE[name]
+                handles.append(server.scene.add_point_cloud(
+                    f"/penetration_seed/{name}",
+                    points=seed_points,
+                    colors=colors(len(seed_points), color),
+                    point_size=float(point_size.value) * 1.45,
+                ))
         print(
             f"frame={requested} index={index} "
             f"sampled={any(frame == requested for frame, _ in observation_lookup)}",
@@ -457,6 +532,7 @@ def main() -> None:
         show_observations,
         show_votes,
         show_opposition,
+        show_penetration_seeds,
     ):
         control.on_update(lambda _: show_frame(int(frame_slider.value)))
 
