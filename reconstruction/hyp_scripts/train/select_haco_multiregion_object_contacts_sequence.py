@@ -8,11 +8,13 @@ import json
 from pathlib import Path
 
 import numpy as np
+import torch
 import trimesh
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import cKDTree
 
+from audit_capped_mano_ycb_vertices import contains_points_vote
 from refine_v14_haco_sequence_contact_containment import mano_contact_region_ids
 from visualize_haco_choir_opposition_candidates import (
     frame_id,
@@ -24,6 +26,7 @@ from visualize_haco_choir_opposition_candidates import (
     project,
 )
 from visualize_haco_multiregion_object_contacts import visible_object_vertices
+from visualize_capped_mano_wrist import cap_faces, directed_boundary_loop
 
 
 def parse_args() -> argparse.Namespace:
@@ -87,6 +90,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pixel-soft-topk", type=int, default=8)
     parser.add_argument("--pixel-sigma", type=float, default=12.0)
     parser.add_argument("--candidate-topk", type=int, default=512)
+    parser.add_argument(
+        "--penetration-seeded-candidates",
+        action="store_true",
+        help=(
+            "Prioritize the first-touch object surface already contained by "
+            "the capped V14 hand, grouped by HACO region. Candidate restriction "
+            "uses mesh geodesic distance so nearby opposite surfaces stay separate."
+        ),
+    )
+    parser.add_argument("--penetration-seed-min-vertices", type=int, default=3)
+    parser.add_argument("--penetration-seed-radius-mm", type=float, default=15.0)
+    parser.add_argument("--penetration-seed-weight", type=float, default=4.0)
+    parser.add_argument("--penetration-seed-point-chunk", type=int, default=256)
+    parser.add_argument("--penetration-seed-rays", type=int, choices=(1, 3), default=3)
+    parser.add_argument(
+        "--penetration-seed-device", choices=("cpu", "cuda"), default="cpu"
+    )
     parser.add_argument("--distance-slack-mm", type=float, default=60.0)
     parser.add_argument("--max-contact-distance-mm", type=float, default=90.0)
     parser.add_argument("--max-depth-intrusion-mm", type=float, default=12.0)
@@ -337,6 +357,13 @@ def main() -> None:
         raise ValueError("--onset-half-life-frames must be positive")
     if args.minimum_dominant_observations <= 0:
         raise ValueError("--minimum-dominant-observations must be positive")
+    if args.penetration_seed_min_vertices <= 0:
+        raise ValueError("--penetration-seed-min-vertices must be positive")
+    if args.penetration_seed_radius_mm <= 0:
+        raise ValueError("--penetration-seed-radius-mm must be positive")
+    penetration_device = torch.device(args.penetration_seed_device)
+    if penetration_device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--penetration-seed-device cuda requested but unavailable")
     if args.visibility_layers <= 0:
         raise ValueError("--visibility-layers must be positive")
     if args.onset_window_frames < 0:
@@ -458,6 +485,10 @@ def main() -> None:
         np.linalg.norm(object_normals_local, axis=-1, keepdims=True), 1e-12
     )
     object_sparse_graph = mesh_graph(object_local, object_faces)
+    wrist_boundary = directed_boundary_loop(faces)
+    capped_faces = np.concatenate(
+        (faces, cap_faces(wrist_boundary, hand_vertices.shape[1])), axis=0
+    )
     normalized_left = bool(
         np.asarray(supervision.get("normalized_left", False)).item()
     )
@@ -467,6 +498,9 @@ def main() -> None:
 
     observations: list[dict[str, object]] = []
     skipped: list[dict[str, object]] = []
+    penetration_seed_audit: list[dict[str, object]] = []
+    frozen_penetration_seed_ids: dict[str, np.ndarray] = {}
+    penetration_seed_source_frames: dict[str, str] = {}
     contact_onset_index = int(np.flatnonzero(valid)[0])
     region_onset_indices: dict[str, int] = {}
     for progress, index in enumerate(eligible, start=1):
@@ -483,6 +517,33 @@ def main() -> None:
         object_normals /= np.maximum(
             np.linalg.norm(object_normals, axis=-1, keepdims=True), 1e-12
         )
+        penetration_labels = np.full(len(object_vertices), -1, dtype=np.int16)
+        if args.penetration_seeded_candidates:
+            cap_center = hand[wrist_boundary].mean(axis=0)
+            capped_vertices = np.concatenate((hand, cap_center[None]), axis=0)
+            lower = capped_vertices.min(axis=0) - 1e-4
+            upper = capped_vertices.max(axis=0) + 1e-4
+            broadphase = np.all(
+                (object_vertices >= lower) & (object_vertices <= upper), axis=-1
+            )
+            broadphase_ids = np.flatnonzero(broadphase)
+            if len(broadphase_ids):
+                contained, _ = contains_points_vote(
+                    object_vertices[broadphase_ids],
+                    capped_vertices,
+                    capped_faces,
+                    args.penetration_seed_point_chunk,
+                    ray_count=args.penetration_seed_rays,
+                    device=penetration_device,
+                )
+                inside_ids = broadphase_ids[contained]
+                if len(inside_ids):
+                    nearest_hand = cKDTree(hand).query(
+                        object_vertices[inside_ids], k=1
+                    )[1]
+                    penetration_labels[inside_ids] = region_ids[
+                        nearest_hand
+                    ].astype(np.int16)
         object_uv = project(object_vertices, intrinsics)
         hand_uv = project(hand, intrinsics)
         visible = np.ones(len(object_vertices), dtype=bool)
@@ -553,6 +614,56 @@ def main() -> None:
             candidates = eligible_object[
                 np.argsort(pixel_distance[eligible_object])[: args.candidate_topk]
             ]
+            current_penetration_seed_ids = np.flatnonzero(
+                penetration_labels == region_index
+            )
+            if (
+                region_name not in frozen_penetration_seed_ids
+                and len(current_penetration_seed_ids)
+                >= args.penetration_seed_min_vertices
+            ):
+                frozen_penetration_seed_ids[region_name] = (
+                    current_penetration_seed_ids.copy()
+                )
+                penetration_seed_source_frames[region_name] = requested
+            penetration_seed_ids = frozen_penetration_seed_ids.get(
+                region_name, np.empty(0, dtype=np.int64)
+            )
+            seed_geodesic_mm = np.full(len(candidates), np.inf, dtype=np.float32)
+            seed_mode = "fallback_no_seed"
+            if len(penetration_seed_ids) >= args.penetration_seed_min_vertices:
+                seed_distance = dijkstra(
+                    object_sparse_graph,
+                    directed=False,
+                    indices=penetration_seed_ids,
+                    limit=args.penetration_seed_radius_mm / 1000.0,
+                    min_only=True,
+                )
+                seed_geodesic_mm = (
+                    np.asarray(seed_distance[candidates], dtype=np.float32) * 1000.0
+                )
+                seeded = np.isfinite(seed_geodesic_mm)
+                if seeded.any():
+                    candidates = candidates[seeded]
+                    seed_geodesic_mm = seed_geodesic_mm[seeded]
+                    seed_mode = "penetration_seeded"
+                else:
+                    seed_mode = "fallback_no_candidate_on_seed_surface"
+            penetration_seed_audit.append({
+                "frame_id": requested,
+                "region": region_name,
+                "seed_vertices": int(len(penetration_seed_ids)),
+                "current_inside_vertices": int(
+                    len(current_penetration_seed_ids)
+                ),
+                "seed_source_frame": penetration_seed_source_frames.get(
+                    region_name
+                ),
+                "mode": seed_mode,
+                "seeded_candidates": int(
+                    np.isfinite(seed_geodesic_mm).sum()
+                ),
+            })
             matched = nearest_contact[candidates]
             matched_hand = region_hand[matched]
             matched_normals = region_hand_normals[matched]
@@ -632,6 +743,10 @@ def main() -> None:
                 + args.w_facing * (1.0 - facing)
                 + args.w_normal * (1.0 + normal_dot)
             )
+            if seed_mode == "penetration_seeded":
+                score += args.penetration_seed_weight * seed_geodesic_mm[
+                    candidate_valid
+                ]
             selected_offset = int(np.argmin(score))
             selected_id = int(candidates[selected_offset])
             if (
@@ -682,6 +797,12 @@ def main() -> None:
                 "facing_cosine": float(facing[selected_offset]),
                 "normal_dot": float(normal_dot[selected_offset]),
                 "normal_filter_mode": normal_filter_mode,
+                "penetration_seed_mode": seed_mode,
+                "penetration_seed_vertices": int(len(penetration_seed_ids)),
+                "penetration_seed_geodesic_mm": float(
+                    seed_geodesic_mm[candidate_valid][selected_offset]
+                    if seed_mode == "penetration_seeded" else np.nan
+                ),
                 "primary_normal_candidates": int(primary_normal.sum()),
                 "fallback_normal_candidates": int(fallback_normal.sum()),
                 "haco_vertices": int(len(contact_vertices)),
@@ -732,6 +853,17 @@ def main() -> None:
             [row["depth_intrusion_mm"] for row in observations],
             dtype=np.float32,
         ),
+        "observation_penetration_seed_modes": np.asarray(
+            [row["penetration_seed_mode"] for row in observations]
+        ),
+        "observation_penetration_seed_vertices": np.asarray(
+            [row["penetration_seed_vertices"] for row in observations],
+            dtype=np.int32,
+        ),
+        "observation_penetration_seed_geodesic_mm": np.asarray(
+            [row["penetration_seed_geodesic_mm"] for row in observations],
+            dtype=np.float32,
+        ),
         "observation_onset_weights": np.asarray(
             [row["onset_weight"] for row in observations], dtype=np.float32
         ),
@@ -751,6 +883,10 @@ def main() -> None:
             dtype=np.float32,
         ),
     }
+    for region_name, seed_ids in frozen_penetration_seed_ids.items():
+        output_arrays[
+            f"{region_name}_penetration_seed_vertex_ids"
+        ] = seed_ids.astype(np.int64)
 
     region_translation_votes: dict[str, np.ndarray] = {}
     region_vote_weights: dict[str, float] = {}
@@ -944,6 +1080,8 @@ def main() -> None:
         "eligible_frames": int(valid.sum()),
         "sampled_frames": int(len(eligible)),
         "successful_observations": len(observations),
+        "penetration_seed_audit": penetration_seed_audit,
+        "penetration_seed_source_frames": penetration_seed_source_frames,
         "selected_regions": selected_regions,
         "translation_consistent_regions": translation_consistent_names,
         "automatic_opposition_pairs": [
@@ -978,6 +1116,14 @@ def main() -> None:
             "distance_slack_mm": args.distance_slack_mm,
             "max_contact_distance_mm": args.max_contact_distance_mm,
             "max_depth_intrusion_mm": args.max_depth_intrusion_mm,
+            "penetration_seeded_candidates": (
+                args.penetration_seeded_candidates
+            ),
+            "penetration_seed_min_vertices": (
+                args.penetration_seed_min_vertices
+            ),
+            "penetration_seed_radius_mm": args.penetration_seed_radius_mm,
+            "penetration_seed_rays": args.penetration_seed_rays,
             "depth_intrusion_sigma_mm": args.depth_intrusion_sigma_mm,
             "onset_half_life_frames": args.onset_half_life_frames,
             "min_facing_cosine": args.min_facing_cosine,
@@ -1006,6 +1152,7 @@ def main() -> None:
                 "pixel": args.w_pixel,
                 "distance": args.w_distance,
                 "depth_intrusion": args.w_depth_intrusion,
+                "penetration_seed": args.penetration_seed_weight,
                 "facing": args.w_facing,
                 "normal": args.w_normal,
             },

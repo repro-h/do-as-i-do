@@ -307,10 +307,22 @@ def main() -> None:
     playing = {"value": False}
     suppress = {"value": False}
     penetration_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    fixed_penetration_labels = np.full(len(object_local), -1, dtype=np.int16)
+    for region_index, region_name in enumerate(region_names):
+        key = f"{region_name}_penetration_seed_vertex_ids"
+        if key in selection:
+            seed_ids = np.asarray(selection[key], dtype=np.int64)
+            fixed_penetration_labels[seed_ids] = region_index
+    has_fixed_penetration_seeds = bool((fixed_penetration_labels >= 0).any())
 
     def penetration_seeds(index: int) -> tuple[np.ndarray, np.ndarray]:
         cached = penetration_cache.get(index)
         if cached is not None:
+            return cached
+        if has_fixed_penetration_seeds:
+            inside = fixed_penetration_labels >= 0
+            cached = inside, fixed_penetration_labels.copy()
+            penetration_cache[index] = cached
             return cached
         current_hand = hand[index]
         center = current_hand[wrist_boundary].mean(axis=0)
