@@ -35,6 +35,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inside-low-fraction", type=float, default=0.01)
     parser.add_argument("--inside-high-fraction", type=float, default=0.02)
     parser.add_argument("--lightweight-single-frame", action="store_true")
+    parser.add_argument(
+        "--clearance-regions",
+        nargs="*",
+        default=None,
+        help=(
+            "Only visualize Stage2 clearance top-k points and push directions "
+            "for these HACO region names."
+        ),
+    )
     parser.add_argument("--initial-frame", type=int, default=0)
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--port", type=int, default=8098)
@@ -848,6 +857,11 @@ def main() -> None:
             for region_index, region_name in enumerate(
                 stage2_contact_region_names
             ):
+                if (
+                    args.clearance_regions is not None
+                    and region_name not in args.clearance_regions
+                ):
+                    continue
                 region_selected = (
                     clearance_selected
                     & (stage2_contact_region_id == region_index)
