@@ -229,6 +229,9 @@ class DexYCBMultiHandWindowDataset(Dataset):
             "target_t": torch.from_numpy(target),
             "target_valid": torch.from_numpy(target_valid),
             "intrinsics": torch.from_numpy(finite_float(intrinsics)),
+            "image_wh": torch.from_numpy(
+                np.broadcast_to(resized_wh[None], (time, 2)).copy()
+            ),
             "stream_index": torch.tensor(self.stream_indices[row["stream_id"]]),
             "frame_index": torch.tensor(row["frame_indices"], dtype=torch.long),
         }

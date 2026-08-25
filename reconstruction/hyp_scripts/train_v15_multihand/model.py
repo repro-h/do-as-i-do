@@ -21,6 +21,8 @@ class MultiHandPi3XTrajectoryModel(nn.Module):
         max_xy_m=1.5,
         max_depth_m=2.5,
         initial_depth_m=0.85,
+        translation_parameterization="ray_depth_uv",
+        max_image_offset_fraction=0.15,
     ):
         super().__init__()
         if token_dim % heads:
@@ -29,6 +31,12 @@ class MultiHandPi3XTrajectoryModel(nn.Module):
         self.spatial_bias = float(spatial_bias)
         self.max_xy_m = float(max_xy_m)
         self.max_depth_m = float(max_depth_m)
+        self.translation_parameterization = str(translation_parameterization)
+        self.max_image_offset_fraction = float(max_image_offset_fraction)
+        if self.translation_parameterization not in ("direct_xyz", "ray_depth_uv"):
+            raise ValueError(
+                f"Unknown translation parameterization: {self.translation_parameterization}"
+            )
         self.point_encoder = nn.Sequential(
             nn.LayerNorm(point_dim), nn.Linear(point_dim, token_dim)
         )
@@ -202,9 +210,34 @@ class MultiHandPi3XTrajectoryModel(nn.Module):
             residual_raw * weight
         ).sum(dim=1, keepdim=True) / weight.sum(dim=1, keepdim=True).clamp_min(1.0)
         raw = base_raw[:, None] + residual_raw
-        xy = torch.tanh(raw[..., :2]) * self.max_xy_m
         depth = torch.sigmoid(raw[..., 2:3]) * self.max_depth_m
-        translation = torch.cat((xy, depth), dim=-1)
-        translation = translation.reshape(batch_size, hands, time, 3).permute(0, 2, 1, 3)
-        return translation
+        if self.translation_parameterization == "direct_xyz":
+            xy = torch.tanh(raw[..., :2]) * self.max_xy_m
+            translation = torch.cat((xy, depth), dim=-1)
+            translation = translation.reshape(
+                batch_size, hands, time, 3
+            ).permute(0, 2, 1, 3)
+            return translation, None
 
+        root_uv01 = (joint_uv[:, :, :, 0] + 1.0) * 0.5
+        image_wh = batch["image_wh"][:, :, None].expand(-1, -1, hands, -1)
+        root_pixels = root_uv01 * (image_wh - 1.0).clamp_min(1.0)
+        image_offset = torch.tanh(raw[..., :2]).reshape(
+            batch_size, hands, time, 2
+        ).permute(0, 2, 1, 3)
+        image_offset = image_offset * image_wh * self.max_image_offset_fraction
+        predicted_pixels = root_pixels + image_offset
+        depth = depth.reshape(batch_size, hands, time, 1).permute(0, 2, 1, 3)
+        intrinsics = batch["intrinsics"][:, :, None]
+        x = (
+            (predicted_pixels[..., 0] - intrinsics[..., 0, 2])
+            / intrinsics[..., 0, 0].clamp_min(1e-6)
+            * depth[..., 0]
+        )
+        y = (
+            (predicted_pixels[..., 1] - intrinsics[..., 1, 2])
+            / intrinsics[..., 1, 1].clamp_min(1e-6)
+            * depth[..., 0]
+        )
+        translation = torch.stack((x, y, depth[..., 0]), dim=-1)
+        return translation, predicted_pixels

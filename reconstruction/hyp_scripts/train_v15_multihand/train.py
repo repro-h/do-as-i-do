@@ -21,7 +21,7 @@ from dataset import DexYCBMultiHandWindowDataset, QueryNoise  # noqa: E402
 from model import MultiHandPi3XTrajectoryModel  # noqa: E402
 
 
-MODEL_VERSION = "v15_side_free_multihand_pi3x_translation_v1"
+MODEL_VERSION = "v15_1_side_free_multihand_pi3x_ray_translation_v1"
 
 
 def parse_args():
@@ -57,6 +57,14 @@ def parse_args():
     parser.add_argument("--w-relative", type=float, default=0.5)
     parser.add_argument("--w-velocity", type=float, default=0.05)
     parser.add_argument("--w-acceleration", type=float, default=0.02)
+    parser.add_argument("--w-reprojection", type=float, default=0.1)
+    parser.add_argument("--reprojection-beta-px", type=float, default=2.0)
+    parser.add_argument(
+        "--translation-parameterization",
+        choices=("ray_depth_uv", "direct_xyz"),
+        default="ray_depth_uv",
+    )
+    parser.add_argument("--max-image-offset-fraction", type=float, default=0.15)
     parser.add_argument("--smooth-l1-beta-mm", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
@@ -107,7 +115,10 @@ def distribution(values):
 def run_epoch(model, loader, device, args, optimizer=None):
     training = optimizer is not None
     model.train(training)
-    totals = {key: 0.0 for key in ("total", "absolute", "depth", "relative", "velocity", "acceleration")}
+    totals = {key: 0.0 for key in (
+        "total", "absolute", "depth", "relative", "velocity",
+        "acceleration", "reprojection",
+    )}
     translation_errors, depth_errors = [], []
     axis_errors = {axis: [] for axis in ("x", "y", "z")}
     stitched = defaultdict(list)
@@ -117,7 +128,7 @@ def run_epoch(model, loader, device, args, optimizer=None):
         valid = batch["target_valid"] & batch["hand_slot_valid"]
         target = batch["target_t"]
         with torch.set_grad_enabled(training):
-            prediction = model(batch)
+            prediction, predicted_pixels = model(batch)
             beta = args.smooth_l1_beta_mm / 1000.0
             absolute = masked_mean(smooth_l1(prediction - target, beta), valid)
             depth = masked_mean(smooth_l1(prediction[..., 2] - target[..., 2], beta), valid)
@@ -130,9 +141,31 @@ def run_epoch(model, loader, device, args, optimizer=None):
             )
             velocity = temporal_loss(prediction, target, valid, 1, beta)
             acceleration = temporal_loss(prediction, target, valid, 2, beta)
+            target_depth = target[..., 2].clamp_min(1e-6)
+            intrinsics = batch["intrinsics"][:, :, None]
+            target_pixels = torch.stack((
+                target[..., 0] / target_depth * intrinsics[..., 0, 0]
+                + intrinsics[..., 0, 2],
+                target[..., 1] / target_depth * intrinsics[..., 1, 1]
+                + intrinsics[..., 1, 2],
+            ), dim=-1)
+            if predicted_pixels is None:
+                predicted_pixels = torch.stack((
+                    prediction[..., 0] / prediction[..., 2].clamp_min(1e-6)
+                    * intrinsics[..., 0, 0] + intrinsics[..., 0, 2],
+                    prediction[..., 1] / prediction[..., 2].clamp_min(1e-6)
+                    * intrinsics[..., 1, 1] + intrinsics[..., 1, 2],
+                ), dim=-1)
+            reprojection = masked_mean(
+                smooth_l1(
+                    predicted_pixels - target_pixels,
+                    args.reprojection_beta_px,
+                ), valid,
+            )
             total = (
                 absolute + args.w_depth * depth + args.w_relative * relative
                 + args.w_velocity * velocity + args.w_acceleration * acceleration
+                + args.w_reprojection * reprojection / 1000.0
             )
             if not torch.isfinite(total):
                 raise RuntimeError("non-finite loss")
@@ -144,6 +177,7 @@ def run_epoch(model, loader, device, args, optimizer=None):
         for key, value in (
             ("total", total), ("absolute", absolute), ("depth", depth),
             ("relative", relative), ("velocity", velocity), ("acceleration", acceleration),
+            ("reprojection", reprojection),
         ):
             totals[key] += float(value.detach())
         mask = valid.detach().cpu().numpy().astype(bool)
@@ -267,6 +301,7 @@ def main():
         "coordinate_frame": "original_camera",
         "query_source": "dexycb_gt_2d_with_train_only_noise",
         "visibility_source": args.visibility_source,
+        "translation_parameterization": args.translation_parameterization,
     }
     print(json.dumps(audit, indent=2))
     if args.audit_only:
@@ -281,6 +316,8 @@ def main():
         heads=args.heads,
         temporal_layers=args.temporal_layers,
         dropout=args.dropout,
+        translation_parameterization=args.translation_parameterization,
+        max_image_offset_fraction=args.max_image_offset_fraction,
     ).to(device)
     if args.checkpoint:
         checkpoint = torch.load(args.checkpoint, map_location="cpu")
