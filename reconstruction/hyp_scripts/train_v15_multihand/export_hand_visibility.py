@@ -26,6 +26,10 @@ def parse_args():
     parser.add_argument("--backbone", default="wilor")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--hand-confidence", type=float, default=0.3)
+    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--status-json")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -49,6 +53,29 @@ def unique_stream_frames(rows):
         ):
             streams[row["stream_id"]][int(frame)] = (image, label, side)
     return streams
+
+
+def valid_cache(path, stream_id, expected_frames):
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            required = {
+                "frame_indices", "joint_visibility", "visibility_valid",
+                "bbox_confidence", "detector_joint_uv",
+            }
+            if not required.issubset(data.files):
+                return False
+            frames = np.asarray(data["frame_indices"], dtype=np.int64)
+            visibility = np.asarray(data["joint_visibility"])
+            valid = np.asarray(data["visibility_valid"])
+            if str(data["stream_id"].item()) != stream_id:
+                return False
+            if not np.array_equal(frames, expected_frames):
+                return False
+            if visibility.shape != (len(frames), 21) or valid.shape != (len(frames),):
+                return False
+            return bool(np.isfinite(visibility).all())
+    except (OSError, KeyError, ValueError):
+        return False
 
 
 def select_detection(results, label_path, expected_side):
@@ -76,25 +103,44 @@ def select_detection(results, label_path, expected_side):
 
 def main():
     args = parse_args()
-    detector_root = Path(args.detector_root).expanduser().resolve()
-    sys.path.insert(0, str(detector_root / "src"))
-    from hand_visibility_detector import HandVisibilityPipeline
-
     streams = unique_stream_frames(load_rows(args.windows))
-    pipeline = HandVisibilityPipeline(
-        device=args.device,
-        vis_checkpoint=args.checkpoint,
-        backbone=args.backbone,
-        hand_conf=args.hand_confidence,
-    )
+    items = sorted(streams.items())
+    if args.limit > 0:
+        items = items[:args.limit]
+    if args.num_shards <= 0:
+        raise ValueError("--num-shards must be positive")
+    if not 0 <= args.shard_index < args.num_shards:
+        raise ValueError("--shard-index is outside the shard range")
+    items = items[args.shard_index::args.num_shards]
     out_root = Path(args.out_root).expanduser().resolve()
-    completed = failed = 0
-    for stream_id, records in tqdm(sorted(streams.items()), desc="streams"):
+    pending = []
+    cached = []
+    for stream_id, records in items:
+        expected = np.asarray(sorted(records), dtype=np.int64)
+        output = out_root / stream_id / "visibility_cache.npz"
+        if not args.overwrite and valid_cache(output, stream_id, expected):
+            cached.append(stream_id)
+        else:
+            pending.append((stream_id, records))
+
+    pipeline = None
+    if pending:
+        detector_root = Path(args.detector_root).expanduser().resolve()
+        sys.path.insert(0, str(detector_root / "src"))
+        from hand_visibility_detector import HandVisibilityPipeline
+
+        pipeline = HandVisibilityPipeline(
+            device=args.device,
+            vis_checkpoint=args.checkpoint,
+            backbone=args.backbone,
+            hand_conf=args.hand_confidence,
+        )
+
+    completed = list(cached)
+    failures = []
+    for stream_id, records in tqdm(pending, desc="streams"):
         stream_out = out_root / stream_id
         output = stream_out / "visibility_cache.npz"
-        if output.is_file() and not args.overwrite:
-            completed += 1
-            continue
         stream_out.mkdir(parents=True, exist_ok=True)
         frame_indices = np.asarray(sorted(records), dtype=np.int64)
         visibility = np.full((len(frame_indices), 21), 0.5, dtype=np.float32)
@@ -160,14 +206,29 @@ def main():
                     ),
                     "output": str(output),
                 }, handle, indent=2)
-            completed += 1
+            completed.append(stream_id)
         except Exception as error:
-            failed += 1
+            failures.append({"stream_id": stream_id, "error": repr(error)})
             print(f"FAILED {stream_id}: {type(error).__name__}: {error}")
-    print(json.dumps({
-        "streams": len(streams), "completed": completed, "failed": failed,
+    status = {
+        "windows": str(Path(args.windows).expanduser().resolve()),
+        "num_shards": args.num_shards,
+        "shard_index": args.shard_index,
+        "streams": len(items),
+        "completed": len(completed),
+        "cached": len(cached),
+        "failed": len(failures),
+        "completed_streams": completed,
+        "failures": failures,
         "out_root": str(out_root),
-    }, indent=2))
+    }
+    if args.status_json:
+        status_path = Path(args.status_json).expanduser().resolve()
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_path.write_text(json.dumps(status, indent=2), encoding="utf-8")
+    print(json.dumps(status, indent=2))
+    if failures:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

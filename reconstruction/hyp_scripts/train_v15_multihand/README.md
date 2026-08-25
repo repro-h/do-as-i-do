@@ -54,3 +54,49 @@ python train.py \
   --out-dir /tmp/v15-audit \
   --audit-only
 ```
+
+## Sharded cache export
+
+Both exporters support `--num-shards`, `--shard-index` and strict cache
+validation. `run_sharded_export.sh` launches one shard per selected GPU, while
+the existing `wait_for_gpus_and_run.sh` waits until enough GPUs are free.
+
+Pi3X S0 caches must use original camera coordinates. A prior V13 cache may be
+passed through `--reuse-root`: valid right-hand streams are symlinked, while
+canonical-right/mirrored left-hand streams are rejected and recomputed.
+
+```bash
+wait_for_gpus_and_run.sh --count 4 --max-used-mib 2000 -- \
+  run_sharded_export.sh \
+  --log-dir /data2/hyp/test_v15/logs/pi3x_train \
+  --num-shards 4 -- \
+  "$PI3_PYTHON" -u export_pi3x_s0.py \
+  --windows /data2/hyp/test_v15/manifests/train_windows.jsonl \
+  --hand-uni-root "$HAND_UNI_ROOT" \
+  --pi3-root "$PI3_ROOT" \
+  --checkpoint "$PI3X_CHECKPOINT" \
+  --export-script "$EXPORT_PI3X_SCRIPT" \
+  --out-root /data2/hyp/test_v15/pi3x/train \
+  --reuse-root /data2/hyp/unihand-pi3x-feature/v13_pi3x_full_ws16_s8_fp16/train \
+  --window-size 16 --window-stride 8 --device cuda
+```
+
+Visibility export uses the same launcher and the visibility environment:
+
+```bash
+wait_for_gpus_and_run.sh --count 4 --max-used-mib 2000 -- \
+  run_sharded_export.sh \
+  --log-dir /data2/hyp/test_v15/logs/visibility_train \
+  --num-shards 4 -- \
+  "$VISIBILITY_PYTHON" -u export_hand_visibility.py \
+  --windows /data2/hyp/test_v15/manifests/train_windows.jsonl \
+  --detector-root "$HAND_VISIBILITY_ROOT" \
+  --out-root /data2/hyp/test_v15/visibility/train \
+  --backbone wilor --device cuda
+```
+
+The default Pi3X regime is 16 frames with stride 8. A 74-frame stream therefore
+produces starts `0,8,...,56,58` and nine independently inferred overlapping
+windows. Larger windows are supported by the exporter. Training and inference
+must use the same context regime; for windows above 64 frames, also pass a
+sufficient `--max-window-size` to `train.py`.

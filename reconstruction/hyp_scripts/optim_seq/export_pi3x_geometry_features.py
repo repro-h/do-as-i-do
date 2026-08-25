@@ -16,7 +16,12 @@ import torch
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--frame-map-json", required=True)
-    parser.add_argument("--hand-npz", required=True)
+    intrinsics = parser.add_mutually_exclusive_group(required=True)
+    intrinsics.add_argument("--hand-npz")
+    intrinsics.add_argument(
+        "--intrinsics-json",
+        help="JSON file containing a 3x3 intrinsics matrix.",
+    )
     parser.add_argument("--hand-uni-root", required=True)
     parser.add_argument("--pi3-root", required=True)
     parser.add_argument("--checkpoint", required=True)
@@ -151,7 +156,16 @@ def final_tensor(value) -> torch.Tensor:
 def main() -> None:
     args = parse_args()
     frame_map_path = Path(args.frame_map_json).expanduser().resolve()
-    hand_path = Path(args.hand_npz).expanduser().resolve()
+    hand_path = (
+        None
+        if args.hand_npz is None
+        else Path(args.hand_npz).expanduser().resolve()
+    )
+    intrinsics_path = (
+        None
+        if args.intrinsics_json is None
+        else Path(args.intrinsics_json).expanduser().resolve()
+    )
     hand_uni_root = Path(args.hand_uni_root).expanduser().resolve()
     checkpoint = Path(args.checkpoint).expanduser().resolve()
     out_dir = Path(args.out_dir).expanduser().resolve()
@@ -174,8 +188,14 @@ def main() -> None:
         raise ValueError(f"Invalid frame range [{frame_start}, {frame_end})")
     selected_rows = rows[frame_start:frame_end]
 
-    with np.load(hand_path, allow_pickle=False) as payload:
-        intrinsics = np.asarray(payload["intrinsics"], dtype=np.float32)
+    if hand_path is not None:
+        with np.load(hand_path, allow_pickle=False) as payload:
+            intrinsics = np.asarray(payload["intrinsics"], dtype=np.float32)
+    else:
+        payload = json.loads(intrinsics_path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            payload = payload["intrinsics"]
+        intrinsics = np.asarray(payload, dtype=np.float32)
     if intrinsics.ndim == 3:
         intrinsics = intrinsics[0]
     intrinsics = intrinsics.reshape(3, 3)
@@ -483,7 +503,10 @@ def main() -> None:
         "model": "Pi3X",
         "checkpoint": str(checkpoint),
         "frame_map_json": str(frame_map_path),
-        "hand_npz": str(hand_path),
+        "hand_npz": None if hand_path is None else str(hand_path),
+        "intrinsics_json": (
+            None if intrinsics_path is None else str(intrinsics_path)
+        ),
         "uses_gt_intrinsics": True,
         "feature_layer": "point_decoder.final_output",
         "metric_feature_layer": (

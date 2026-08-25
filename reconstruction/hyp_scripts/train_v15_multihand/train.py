@@ -47,6 +47,7 @@ def parse_args():
     parser.add_argument("--hidden-dim", type=int, default=192)
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--temporal-layers", type=int, default=2)
+    parser.add_argument("--max-window-size", type=int, default=64)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--global-noise-px", type=float, default=4.0)
     parser.add_argument("--temporal-noise-px", type=float, default=0.5)
@@ -302,6 +303,7 @@ def main():
         "query_source": "dexycb_gt_2d_with_train_only_noise",
         "visibility_source": args.visibility_source,
         "translation_parameterization": args.translation_parameterization,
+        "max_window_size": args.max_window_size,
     }
     print(json.dumps(audit, indent=2))
     if args.audit_only:
@@ -315,6 +317,7 @@ def main():
         hidden_dim=args.hidden_dim,
         heads=args.heads,
         temporal_layers=args.temporal_layers,
+        max_window_size=args.max_window_size,
         dropout=args.dropout,
         translation_parameterization=args.translation_parameterization,
         max_image_offset_fraction=args.max_image_offset_fraction,
