@@ -61,6 +61,14 @@ def parse_args() -> argparse.Namespace:
             "keeps later-arriving fingers without using their late penetrated frames."
         ),
     )
+    parser.add_argument(
+        "--per-region-onset-from-valid-observation",
+        action="store_true",
+        help=(
+            "Start each region window at its first object candidate that "
+            "passes all geometry gates, rather than its first HACO-only frame."
+        ),
+    )
     parser.add_argument("--supervision-npz", required=True)
     parser.add_argument("--object-mesh", required=True)
     parser.add_argument("--mano-data-dir", required=True)
@@ -495,10 +503,13 @@ def main() -> None:
             if int(raw_mask.sum()) < args.minimum_contact_vertices:
                 continue
             if args.per_region_onset_window_frames > 0:
-                region_onset = region_onset_indices.setdefault(
-                    region_name, int(index)
-                )
-                if int(index) >= (
+                region_onset = region_onset_indices.get(region_name)
+                if region_onset is None:
+                    if not args.per_region_onset_from_valid_observation:
+                        region_onset = region_onset_indices.setdefault(
+                            region_name, int(index)
+                        )
+                elif int(index) >= (
                     region_onset + args.per_region_onset_window_frames
                 ):
                     continue
@@ -623,6 +634,11 @@ def main() -> None:
             )
             selected_offset = int(np.argmin(score))
             selected_id = int(candidates[selected_offset])
+            if (
+                args.per_region_onset_window_frames > 0
+                and args.per_region_onset_from_valid_observation
+            ):
+                region_onset_indices.setdefault(region_name, int(index))
             contact_vertices = np.flatnonzero(mask)
             contact_weights = np.maximum(probability[contact_vertices], 1e-6)
             hand_region_center = np.average(
@@ -950,6 +966,9 @@ def main() -> None:
             "onset_window_frames": args.onset_window_frames,
             "per_region_onset_window_frames": (
                 args.per_region_onset_window_frames
+            ),
+            "per_region_onset_from_valid_observation": (
+                args.per_region_onset_from_valid_observation
             ),
             "region_onset_frames": {
                 name: frame_id(ids[index])
