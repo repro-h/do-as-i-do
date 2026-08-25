@@ -31,7 +31,12 @@ def parse_args():
 
 
 def load_rows(path):
-    with Path(path).open("r", encoding="utf-8") as handle:
+    manifest = Path(path).expanduser().resolve()
+    if not manifest.is_file():
+        raise FileNotFoundError(
+            f"--windows must point to a JSONL file, got: {manifest}"
+        )
+    with manifest.open("r", encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
 
 
@@ -75,13 +80,13 @@ def main():
     sys.path.insert(0, str(detector_root / "src"))
     from hand_visibility_detector import HandVisibilityPipeline
 
+    streams = unique_stream_frames(load_rows(args.windows))
     pipeline = HandVisibilityPipeline(
         device=args.device,
         vis_checkpoint=args.checkpoint,
         backbone=args.backbone,
         hand_conf=args.hand_confidence,
     )
-    streams = unique_stream_frames(load_rows(args.windows))
     out_root = Path(args.out_root).expanduser().resolve()
     completed = failed = 0
     for stream_id, records in tqdm(sorted(streams.items()), desc="streams"):
@@ -150,4 +155,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
