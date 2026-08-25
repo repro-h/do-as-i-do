@@ -29,6 +29,12 @@ def parse_args():
     parser.add_argument("--val-windows", required=True)
     parser.add_argument("--pi3x-train-root", required=True)
     parser.add_argument("--pi3x-val-root", required=True)
+    parser.add_argument("--visibility-train-root")
+    parser.add_argument("--visibility-val-root")
+    parser.add_argument(
+        "--visibility-source", choices=("detector", "mask", "ones"),
+        default="detector",
+    )
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=2)
@@ -165,6 +171,8 @@ def make_dataset(args, split, training):
         max_hands=args.max_hands,
         training=training,
         noise=noise,
+        visibility_source=args.visibility_source,
+        visibility_root=getattr(args, f"visibility_{split}_root"),
     )
 
 
@@ -187,6 +195,7 @@ def main():
         "side_input": False,
         "coordinate_frame": "original_camera",
         "query_source": "dexycb_gt_2d_with_train_only_noise",
+        "visibility_source": args.visibility_source,
     }
     print(json.dumps(audit, indent=2))
     if args.audit_only:
@@ -248,4 +257,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

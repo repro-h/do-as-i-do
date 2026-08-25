@@ -10,6 +10,12 @@ noise. This is a controlled test of Pi3X depth observability, not the final
 inference query provider. A later detector/WiLoR provider can emit the same
 `[T, H, 21, ...]` schema.
 
+Joint visibility comes from the external `hand_visibility_detector` as 21
+sigmoid probabilities. Export it once per stream with
+`export_hand_visibility.py`; training never runs that network online. Missing
+detections use neutral probability 0.5. `mask` and `ones` remain available only
+as ablations through `--visibility-source`.
+
 ## Coordinate contract
 
 - Images, 2D joints, intrinsics, Pi3X cache and 3D targets use original camera
@@ -42,7 +48,9 @@ python train.py \
   --val-windows /data2/hyp/unihand-v15/manifests/val_windows.jsonl \
   --pi3x-train-root /data2/hyp/unihand-v15/pi3x/train \
   --pi3x-val-root /data2/hyp/unihand-v15/pi3x/val \
+  --visibility-train-root /data2/hyp/unihand-v15/visibility/train \
+  --visibility-val-root /data2/hyp/unihand-v15/visibility/val \
+  --visibility-source detector \
   --out-dir /tmp/v15-audit \
   --audit-only
 ```
-

@@ -87,6 +87,8 @@ class DexYCBMultiHandWindowDataset(Dataset):
         noise=None,
         visibility_radius_px=5,
         require_original_camera=True,
+        visibility_source="detector",
+        visibility_root=None,
     ):
         self.rows = load_jsonl(windows)
         if not self.rows:
@@ -97,6 +99,15 @@ class DexYCBMultiHandWindowDataset(Dataset):
         self.noise = noise if noise is not None else QueryNoise()
         self.visibility_radius_px = int(visibility_radius_px)
         self.require_original_camera = bool(require_original_camera)
+        self.visibility_source = str(visibility_source)
+        self.visibility_root = (
+            None if visibility_root is None
+            else Path(visibility_root).expanduser().resolve()
+        )
+        if self.visibility_source not in ("detector", "mask", "ones"):
+            raise ValueError(f"Unknown visibility source: {self.visibility_source}")
+        if self.visibility_source == "detector" and self.visibility_root is None:
+            raise ValueError("visibility_root is required for detector visibility")
         streams = sorted({row["stream_id"] for row in self.rows})
         self.stream_indices = {stream: index for index, stream in enumerate(streams)}
 
@@ -114,6 +125,20 @@ class DexYCBMultiHandWindowDataset(Dataset):
         target = np.zeros((time, hands, 3), dtype=np.float32)
         target_valid = np.zeros((time, hands), dtype=bool)
         hand_slot_valid = np.zeros((time, hands), dtype=bool)
+        detector_visibility = {}
+        if self.visibility_source == "detector":
+            visibility_file = (
+                self.visibility_root / row["stream_id"] / "visibility_cache.npz"
+            )
+            with np.load(str(visibility_file), allow_pickle=False) as cache:
+                cache_frames = np.asarray(cache["frame_indices"], dtype=np.int64)
+                cache_values = np.asarray(cache["joint_visibility"], dtype=np.float32)
+                cache_valid = np.asarray(cache["visibility_valid"], dtype=bool)
+            detector_visibility = {
+                int(frame): cache_values[offset]
+                for offset, frame in enumerate(cache_frames)
+                if cache_valid[offset]
+            }
 
         for frame, label_path in enumerate(labels):
             with np.load(label_path, allow_pickle=False) as data:
@@ -128,9 +153,17 @@ class DexYCBMultiHandWindowDataset(Dataset):
             )
             query_uv_px[frame, 0] = finite_float(uv)
             query_valid[frame, 0] = valid
-            visibility[frame, 0] = mask_visibility(
-                seg == 255, uv, self.visibility_radius_px
-            )
+            if self.visibility_source == "mask":
+                visibility[frame, 0] = mask_visibility(
+                    seg == 255, uv, self.visibility_radius_px
+                )
+            elif self.visibility_source == "ones":
+                visibility[frame, 0] = 1.0
+            else:
+                visibility[frame, 0] = detector_visibility.get(
+                    int(row["frame_indices"][frame]),
+                    np.full(joints, 0.5, dtype=np.float32),
+                )
             target[frame, 0] = finite_float(xyz[0])
             target_valid[frame, 0] = bool(np.isfinite(xyz[0]).all() and xyz[0, 2] > 0)
             hand_slot_valid[frame, 0] = True
@@ -199,4 +232,3 @@ class DexYCBMultiHandWindowDataset(Dataset):
             "stream_index": torch.tensor(self.stream_indices[row["stream_id"]]),
             "frame_index": torch.tensor(row["frame_indices"], dtype=torch.long),
         }
-
