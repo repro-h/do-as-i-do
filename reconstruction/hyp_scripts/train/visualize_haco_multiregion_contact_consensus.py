@@ -35,6 +35,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-npz", required=True)
     parser.add_argument("--hand-npz")
     parser.add_argument("--hand-vertices-key")
+    parser.add_argument("--gt-hand-npz")
+    parser.add_argument(
+        "--gt-hand-side", choices=("auto", "left", "right"), default="auto"
+    )
     parser.add_argument("--contact-sequence-npz", required=True)
     parser.add_argument("--supervision-npz", required=True)
     parser.add_argument("--object-mesh", required=True)
@@ -107,6 +111,50 @@ def main() -> None:
         np.asarray(query["model_valid"]).astype(bool)
         & np.asarray(trajectory["prediction_valid"][trajectory_indices]).astype(bool)
     )
+    gt_hand = None
+    gt_valid = np.zeros(count, dtype=bool)
+    gt_faces = hand_faces
+    gt_label = "DexYCB GT hand"
+    if args.gt_hand_npz:
+        gt_data = load_npz(Path(args.gt_hand_npz).expanduser().resolve())
+        side_candidates = (
+            (args.gt_hand_side,)
+            if args.gt_hand_side != "auto"
+            else ("left", "right")
+        )
+        available: list[tuple[int, str, np.ndarray, np.ndarray]] = []
+        for side in side_candidates:
+            vertices_key = f"{side}_vertices"
+            valid_key = f"{side}_valid"
+            if vertices_key not in gt_data:
+                continue
+            vertices = np.asarray(gt_data[vertices_key], dtype=np.float32)
+            side_valid = np.asarray(
+                gt_data.get(valid_key, np.isfinite(vertices).all(axis=(1, 2)))
+            ).astype(bool)
+            side_valid &= np.isfinite(vertices).all(axis=(1, 2))
+            available.append((int(side_valid.sum()), side, vertices, side_valid))
+        if not available:
+            raise KeyError("GT archive contains no requested hand vertices")
+        _, gt_side, gt_vertices_all, gt_valid_all = max(
+            available, key=lambda row: row[0]
+        )
+        if "frame_ids" in gt_data:
+            gt_indices = np.asarray([
+                index_for(gt_data["frame_ids"], frame_id(value)) for value in ids
+            ])
+        elif len(gt_vertices_all) == count:
+            gt_indices = np.arange(count, dtype=np.int64)
+        else:
+            raise ValueError(
+                "GT archive has no frame_ids and does not match query length"
+            )
+        gt_hand = gt_vertices_all[gt_indices]
+        gt_valid = gt_valid_all[gt_indices]
+        faces_key = f"{gt_side}_faces"
+        if faces_key in gt_data:
+            gt_faces = np.asarray(gt_data[faces_key], dtype=np.int64)
+        gt_label = f"DexYCB GT hand ({gt_side})"
     probability = np.asarray(
         contact["contact_probability"][contact_indices], dtype=np.float32
     )
@@ -211,6 +259,9 @@ def main() -> None:
     )
     show_object = server.gui.add_checkbox("GT YCB object", initial_value=True)
     show_hand = server.gui.add_checkbox(hand_label, initial_value=True)
+    show_gt_hand = server.gui.add_checkbox(
+        gt_label, initial_value=gt_hand is not None
+    )
     show_haco = server.gui.add_checkbox("HACO components", initial_value=True)
     show_anchors = server.gui.add_checkbox(
         "Selected high-probability anchors", initial_value=True
@@ -259,6 +310,14 @@ def main() -> None:
                 faces=hand_faces,
                 color=(80, 175, 245),
                 opacity=0.45,
+            ))
+        if show_gt_hand.value and gt_hand is not None and gt_valid[index]:
+            handles.append(server.scene.add_mesh_simple(
+                "/gt_hand",
+                vertices=gt_hand[index],
+                faces=gt_faces,
+                color=(245, 170, 105),
+                opacity=0.42,
             ))
         for region_index, name in enumerate(region_names):
             color = PALETTE[name]
@@ -389,6 +448,7 @@ def main() -> None:
         point_size,
         show_object,
         show_hand,
+        show_gt_hand,
         show_haco,
         show_anchors,
         probability_heatmap,
