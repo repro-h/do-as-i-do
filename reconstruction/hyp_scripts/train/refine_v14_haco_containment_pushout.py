@@ -142,13 +142,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-contact-facing", type=float, default=0.0)
     parser.add_argument(
         "--contact-facing-mode",
-        choices=("pointwise", "region_centroid"),
+        choices=("pointwise", "region_centroid", "patch_normal_component"),
         default="pointwise",
         help=(
             "Apply facing independently to every selected contact or once "
             "per region using weighted hand/patch centroids and normals."
         ),
     )
+    parser.add_argument("--facing-component-hand-normal-cosine", type=float, default=0.5)
+    parser.add_argument("--facing-component-object-normal-cosine", type=float, default=0.7)
+    parser.add_argument("--facing-component-opposed-min-cosine", type=float, default=0.2)
+    parser.add_argument("--facing-component-min-vertices", type=int, default=3)
+    parser.add_argument("--facing-component-min-weight-fraction", type=float, default=0.25)
     parser.add_argument(
         "--contact-surface-facing-min-cosine",
         type=float,
@@ -836,17 +841,28 @@ def main() -> None:
     if args.w_contact_facing < 0:
         raise ValueError("--w-contact-facing must be non-negative")
     if (
-        args.contact_facing_mode == "region_centroid"
+        args.contact_facing_mode in ("region_centroid", "patch_normal_component")
         and not args.region_balanced_contact
     ):
         raise ValueError(
-            "--contact-facing-mode region_centroid requires "
+            "region-level contact facing requires "
             "--region-balanced-contact"
         )
     if not -1.0 <= args.contact_surface_facing_min_cosine <= 1.0:
         raise ValueError(
             "--contact-surface-facing-min-cosine must be in [-1, 1]"
         )
+    for name, value in (
+        ("--facing-component-hand-normal-cosine", args.facing_component_hand_normal_cosine),
+        ("--facing-component-object-normal-cosine", args.facing_component_object_normal_cosine),
+        ("--facing-component-opposed-min-cosine", args.facing_component_opposed_min_cosine),
+    ):
+        if not -1.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be in [-1, 1]")
+    if args.facing_component_min_vertices <= 0:
+        raise ValueError("--facing-component-min-vertices must be positive")
+    if not 0.0 <= args.facing_component_min_weight_fraction <= 1.0:
+        raise ValueError("--facing-component-min-weight-fraction must be in [0, 1]")
     if (
         args.contact_point_selection == "stage1_probability"
         and not args.region_balanced_contact
@@ -2135,6 +2151,148 @@ def main() -> None:
     initial_hand_normals = mano_vertex_normals(
         reconstructed, mano_faces, mirror_left
     ).detach()
+
+    # Freeze a data-driven HACO surface component for facing. Components are
+    # selected by MANO connectivity and normal agreement with the fixed object
+    # patch, without assuming that contact occurs at an anatomical fingertip.
+    facing_component_weight = torch.zeros_like(contact_weight)
+    facing_component_object_normal = torch.zeros(
+        (frame_count, len(contact_region_names), 3),
+        device=device,
+        dtype=reconstructed.dtype,
+    )
+    facing_component_valid = torch.zeros(
+        (frame_count, len(contact_region_names)),
+        device=device,
+        dtype=torch.bool,
+    )
+    facing_component_support_fraction = torch.full(
+        (frame_count, len(contact_region_names)),
+        float("nan"),
+        device=device,
+        dtype=reconstructed.dtype,
+    )
+    if args.contact_facing_mode == "patch_normal_component":
+        edges = hand_edges_np
+        for frame_index in range(frame_count):
+            for region_index in range(len(contact_region_names)):
+                selected = (
+                    (contact_weight[frame_index] > 0)
+                    & contact_region_mask[region_index]
+                )
+                selected_ids = torch.nonzero(
+                    selected, as_tuple=False
+                ).flatten()
+                if len(selected_ids) < args.facing_component_min_vertices:
+                    continue
+                selected_weights = contact_weight[
+                    frame_index, selected_ids
+                ].detach()
+                hand_normal = initial_hand_normals[
+                    frame_index, selected_ids
+                ]
+                object_normal = functional.normalize(
+                    fixed_contact_normal[frame_index, selected_ids], dim=-1
+                )
+                # Pick the object-normal mode with the largest probability-
+                # weighted support from opposed HACO normals.
+                object_similarity = object_normal @ object_normal.T
+                opposition = hand_normal @ object_normal.T <= (
+                    -args.facing_component_opposed_min_cosine
+                )
+                support = (
+                    (object_similarity >= args.facing_component_object_normal_cosine)
+                    & opposition
+                ).to(selected_weights.dtype)
+                support_weight = support.T @ selected_weights
+                seed = int(support_weight.argmax())
+                object_gate = object_similarity[:, seed] >= (
+                    args.facing_component_object_normal_cosine
+                )
+                opposed_gate = (
+                    hand_normal * object_normal[seed]
+                ).sum(dim=-1) <= (
+                    -args.facing_component_opposed_min_cosine
+                )
+                compatible = object_gate & opposed_gate
+                compatible_local = torch.nonzero(
+                    compatible, as_tuple=False
+                ).flatten().cpu().numpy()
+                if len(compatible_local) < args.facing_component_min_vertices:
+                    continue
+
+                selected_np = selected_ids.cpu().numpy()
+                local_lookup = {
+                    int(vertex): local
+                    for local, vertex in enumerate(selected_np)
+                }
+                compatible_set = set(int(value) for value in compatible_local)
+                parent = np.arange(len(selected_np), dtype=np.int64)
+
+                def find(local_index: int) -> int:
+                    while parent[local_index] != local_index:
+                        parent[local_index] = parent[parent[local_index]]
+                        local_index = int(parent[local_index])
+                    return local_index
+
+                hand_normal_np = hand_normal.detach().cpu().numpy()
+                for first, second in edges:
+                    first_local = local_lookup.get(int(first))
+                    second_local = local_lookup.get(int(second))
+                    if (
+                        first_local is None
+                        or second_local is None
+                        or first_local not in compatible_set
+                        or second_local not in compatible_set
+                    ):
+                        continue
+                    if float(
+                        hand_normal_np[first_local] @ hand_normal_np[second_local]
+                    ) < args.facing_component_hand_normal_cosine:
+                        continue
+                    first_root = find(first_local)
+                    second_root = find(second_local)
+                    if first_root != second_root:
+                        parent[second_root] = first_root
+
+                components: dict[int, list[int]] = {}
+                for local_index in compatible_local:
+                    components.setdefault(find(int(local_index)), []).append(
+                        int(local_index)
+                    )
+                component = max(
+                    components.values(),
+                    key=lambda values: float(
+                        selected_weights[values].sum()
+                    ),
+                )
+                component_weight = selected_weights[component].sum()
+                total_weight = selected_weights.sum().clamp_min(1e-6)
+                support_fraction = component_weight / total_weight
+                if (
+                    len(component) < args.facing_component_min_vertices
+                    or float(support_fraction)
+                    < args.facing_component_min_weight_fraction
+                ):
+                    continue
+                component_ids = selected_ids[component]
+                facing_component_weight[
+                    frame_index, component_ids
+                ] = contact_weight[frame_index, component_ids]
+                voted_object_normal = functional.normalize(
+                    (
+                        fixed_contact_normal[frame_index, component_ids]
+                        * contact_weight[frame_index, component_ids][:, None]
+                    ).sum(dim=0, keepdim=True),
+                    dim=-1,
+                )[0]
+                facing_component_object_normal[
+                    frame_index, region_index
+                ] = voted_object_normal
+                facing_component_valid[frame_index, region_index] = True
+                facing_component_support_fraction[
+                    frame_index, region_index
+                ] = support_fraction
     for region_index in range(len(contact_region_names)):
         region_weights = clearance_reference_weight * contact_region_mask[
             region_index
@@ -2517,7 +2675,46 @@ def main() -> None:
             hand_normals = mano_vertex_normals(
                 refined, mano_faces, mirror_left
             )
-            if args.contact_facing_mode == "region_centroid":
+            if args.contact_facing_mode == "patch_normal_component":
+                assert contact_region_mask is not None
+                component_weight = (
+                    facing_component_weight[indices, None]
+                    * contact_region_mask[None]
+                )
+                component_denominator = component_weight.sum(
+                    dim=-1, keepdim=True
+                ).clamp_min(1e-6)
+                component_hand_normal = functional.normalize(
+                    (
+                        hand_normals[:, None]
+                        * component_weight[..., None]
+                    ).sum(dim=-2) / component_denominator,
+                    dim=-1,
+                )
+                # At contact, outward hand and object normals should oppose.
+                contact_facing_cosine = -(
+                    component_hand_normal
+                    * facing_component_object_normal[indices]
+                ).sum(dim=-1)
+                contact_facing_error = torch.clamp(
+                    args.contact_surface_facing_min_cosine
+                    - contact_facing_cosine,
+                    min=0.0,
+                ).square()
+                component_scale = (
+                    facing_component_valid[indices]
+                    * optimization_gate[indices, None]
+                    * frame_contact_scale[indices, None]
+                )
+                total_component_scale = (
+                    facing_component_valid
+                    * optimization_gate[:, None]
+                    * frame_contact_scale[:, None]
+                ).sum().clamp_min(1e-6)
+                chunk_contact_facing = (
+                    contact_facing_error * component_scale
+                ).sum() / total_component_scale
+            elif args.contact_facing_mode == "region_centroid":
                 assert contact_region_mask is not None
                 assert contact_region_active is not None
                 assert total_contact_region_scale is not None
@@ -3160,18 +3357,20 @@ def main() -> None:
     contact_region_facing_summary: dict[str, object] = {}
     if contact_region_mask is not None and contact_region_names:
         with torch.no_grad():
-            final_region_weight = (
-                contact_weight[:, None] * contact_region_mask[None]
-            )
+            if args.contact_facing_mode == "patch_normal_component":
+                final_region_weight = (
+                    facing_component_weight[:, None]
+                    * contact_region_mask[None]
+                )
+            else:
+                final_region_weight = (
+                    contact_weight[:, None] * contact_region_mask[None]
+                )
             final_region_denominator = final_region_weight.sum(
                 dim=-1, keepdim=True
             ).clamp_min(1e-6)
             final_hand_centroid = (
                 refined[:, None] * final_region_weight[..., None]
-            ).sum(dim=-2) / final_region_denominator
-            final_patch_centroid = (
-                refined_contact_point[:, None]
-                * final_region_weight[..., None]
             ).sum(dim=-2) / final_region_denominator
             final_region_normal = functional.normalize(
                 (
@@ -3180,19 +3379,27 @@ def main() -> None:
                 ).sum(dim=-2),
                 dim=-1,
             )
-            final_region_direction = functional.normalize(
-                final_patch_centroid - final_hand_centroid,
-                dim=-1,
-            )
-            final_region_cosine = (
-                final_region_normal * final_region_direction
-            ).sum(dim=-1)
+            if args.contact_facing_mode == "patch_normal_component":
+                final_region_cosine = -(
+                    final_region_normal * facing_component_object_normal
+                ).sum(dim=-1)
+            else:
+                final_patch_centroid = (
+                    refined_contact_point[:, None]
+                    * final_region_weight[..., None]
+                ).sum(dim=-2) / final_region_denominator
+                final_region_direction = functional.normalize(
+                    final_patch_centroid - final_hand_centroid,
+                    dim=-1,
+                )
+                final_region_cosine = (
+                    final_region_normal * final_region_direction
+                ).sum(dim=-1)
         refined_contact_region_facing_cosine_np = (
             final_region_cosine.cpu().numpy().astype(np.float32)
         )
         final_region_count = (
-            (contact_weight[:, None] > 0)
-            & contact_region_mask[None]
+            (final_region_weight > 0)
         ).sum(dim=-1).cpu().numpy()
         refined_contact_region_facing_cosine_np[
             final_region_count < args.contact_region_min_vertices
@@ -3419,12 +3626,27 @@ def main() -> None:
             "mode": args.contact_facing_mode,
             "minimum_cosine": args.contact_surface_facing_min_cosine,
             "interpretation": (
+                "A frozen connected HACO surface component is selected by "
+                "probability support and opposition to the fixed object-patch normal"
+                if args.contact_facing_mode == "patch_normal_component"
+                else
                 "Weighted region-normal dot direction from the HACO "
                 "component centroid to its object-patch centroid"
                 if args.contact_facing_mode == "region_centroid"
                 else "MANO outward normal dot normalized direction from the "
                 "selected HACO vertex to its object-patch target"
             ),
+            "component": {
+                "hand_normal_cosine": args.facing_component_hand_normal_cosine,
+                "object_normal_cosine": args.facing_component_object_normal_cosine,
+                "opposed_min_cosine": args.facing_component_opposed_min_cosine,
+                "minimum_vertices": args.facing_component_min_vertices,
+                "minimum_weight_fraction": args.facing_component_min_weight_fraction,
+                "valid_frames_by_region": {
+                    name: int(facing_component_valid[:, index].sum().cpu())
+                    for index, name in enumerate(contact_region_names)
+                },
+            },
             "refined_region_cosine": contact_region_facing_summary,
         },
         "clearance_regions": {
@@ -3603,6 +3825,18 @@ def main() -> None:
         "adaptive_contact_gate": adaptive_gate.cpu().numpy().astype(np.float32),
         "filtered_contact_mask": filtered_contact_mask_np,
         "filtered_contact_weight": filtered_contact_weight_np.astype(np.float16),
+        "contact_facing_component_weight": (
+            facing_component_weight.cpu().numpy().astype(np.float16)
+        ),
+        "contact_facing_component_object_normal_camera": (
+            facing_component_object_normal.cpu().numpy().astype(np.float32)
+        ),
+        "contact_facing_component_valid": (
+            facing_component_valid.cpu().numpy().astype(bool)
+        ),
+        "contact_facing_component_support_fraction": (
+            facing_component_support_fraction.cpu().numpy().astype(np.float32)
+        ),
         "clearance_reference_weight": (
             clearance_reference_weight.cpu().numpy().astype(np.float16)
         ),
