@@ -101,6 +101,13 @@ def main():
         valid = np.zeros(len(frame_indices), dtype=bool)
         bbox_confidence = np.zeros(len(frame_indices), dtype=np.float32)
         match_error = np.full(len(frame_indices), np.nan, dtype=np.float32)
+        detector_joint_uv = np.full(
+            (len(frame_indices), 21, 2), np.nan, dtype=np.float32
+        )
+        detector_bbox_xyxy = np.full(
+            (len(frame_indices), 4), np.nan, dtype=np.float32
+        )
+        detector_is_right = np.zeros(len(frame_indices), dtype=bool)
         try:
             for offset, frame in enumerate(frame_indices):
                 image_path, label_path, side = records[int(frame)]
@@ -118,6 +125,13 @@ def main():
                 valid[offset] = True
                 bbox_confidence[offset] = float(result.bbox_conf)
                 match_error[offset] = error
+                detector_joint_uv[offset] = np.asarray(
+                    result.keypoints_2d, dtype=np.float32
+                )
+                detector_bbox_xyxy[offset] = np.asarray(
+                    result.hand_bbox, dtype=np.float32
+                )[:4]
+                detector_is_right[offset] = bool(result.is_right)
             np.savez_compressed(
                 output,
                 cache_version=np.asarray("hand_visibility_detector_v1"),
@@ -127,6 +141,9 @@ def main():
                 visibility_valid=valid,
                 bbox_confidence=bbox_confidence,
                 matched_keypoint_error_px=match_error,
+                detector_joint_uv=detector_joint_uv,
+                detector_bbox_xyxy=detector_bbox_xyxy,
+                detector_is_right=detector_is_right,
                 joint_order=np.asarray(
                     "wrist_thumb_index_middle_ring_pinky_mano21"
                 ),
