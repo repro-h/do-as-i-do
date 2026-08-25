@@ -5,6 +5,7 @@ import argparse
 import json
 import random
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -108,6 +109,8 @@ def run_epoch(model, loader, device, args, optimizer=None):
     model.train(training)
     totals = {key: 0.0 for key in ("total", "absolute", "depth", "relative", "velocity", "acceleration")}
     translation_errors, depth_errors = [], []
+    axis_errors = {axis: [] for axis in ("x", "y", "z")}
+    stitched = defaultdict(list)
     batches = evaluated = 0
     for raw in tqdm(loader, desc="train" if training else "val"):
         batch = move(raw, device)
@@ -147,14 +150,82 @@ def run_epoch(model, loader, device, args, optimizer=None):
         error = (prediction - target).detach().cpu().numpy()
         translation_errors.append(np.linalg.norm(error, axis=-1)[mask])
         depth_errors.append(np.abs(error[..., 2])[mask])
+        for axis, axis_index in (("x", 0), ("y", 1), ("z", 2)):
+            axis_errors[axis].append(np.abs(error[..., axis_index])[mask])
+        if not training:
+            prediction_np = prediction.detach().cpu().numpy()
+            target_np = target.detach().cpu().numpy()
+            stream_np = batch["stream_index"].detach().cpu().numpy()
+            frame_np = batch["frame_index"].detach().cpu().numpy()
+            length = prediction_np.shape[1]
+            center_weight = 1.0 - np.abs(
+                np.linspace(-1.0, 1.0, length, dtype=np.float32)
+            )
+            center_weight = np.maximum(center_weight, 0.1)
+            for batch_index in range(prediction_np.shape[0]):
+                for local in range(length):
+                    for hand in range(prediction_np.shape[2]):
+                        if not mask[batch_index, local, hand]:
+                            continue
+                        key = (
+                            int(stream_np[batch_index]),
+                            int(frame_np[batch_index, local]),
+                            int(hand),
+                        )
+                        stitched[key].append((
+                            prediction_np[batch_index, local, hand],
+                            target_np[batch_index, local, hand],
+                            float(center_weight[local]),
+                        ))
         evaluated += int(mask.sum())
         batches += 1
-    return {
+    result = {
         **{key: value / max(batches, 1) for key, value in totals.items()},
         "translation_error": distribution(translation_errors),
         "depth_error": distribution(depth_errors),
+        "axis_error": {
+            axis: distribution(values) for axis, values in axis_errors.items()
+        },
         "evaluated_hands": evaluated,
     }
+    if stitched:
+        stitched_translation = []
+        stitched_depth = []
+        stitched_axes = {axis: [] for axis in ("x", "y", "z")}
+        overlap_disagreement = []
+        overlap_keys = 0
+        for samples in stitched.values():
+            weights = np.asarray([sample[2] for sample in samples], dtype=np.float64)
+            predictions = np.stack([sample[0] for sample in samples]).astype(np.float64)
+            target_value = np.asarray(samples[0][1], dtype=np.float64)
+            fused = (predictions * weights[:, None]).sum(axis=0) / weights.sum()
+            error_value = fused - target_value
+            stitched_translation.append(
+                np.asarray([np.linalg.norm(error_value)], dtype=np.float32)
+            )
+            stitched_depth.append(
+                np.asarray([abs(error_value[2])], dtype=np.float32)
+            )
+            for axis, axis_index in (("x", 0), ("y", 1), ("z", 2)):
+                stitched_axes[axis].append(
+                    np.asarray([abs(error_value[axis_index])], dtype=np.float32)
+                )
+            if len(samples) > 1:
+                overlap_keys += 1
+                disagreement = np.linalg.norm(predictions - fused[None], axis=-1)
+                overlap_disagreement.append(disagreement.astype(np.float32))
+        result["stitched"] = {
+            "unique_hands": len(stitched),
+            "translation_error": distribution(stitched_translation),
+            "depth_error": distribution(stitched_depth),
+            "axis_error": {
+                axis: distribution(values)
+                for axis, values in stitched_axes.items()
+            },
+            "overlap_frames": overlap_keys,
+            "overlap_disagreement": distribution(overlap_disagreement),
+        }
+    return result
 
 
 def make_dataset(args, split, training):
