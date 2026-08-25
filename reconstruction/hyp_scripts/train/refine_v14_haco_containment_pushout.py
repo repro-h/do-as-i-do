@@ -192,6 +192,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--w-clearance-tangential", type=float, default=0.0)
     parser.add_argument(
+        "--w-clearance-forward-motion",
+        type=float,
+        default=0.0,
+        help=(
+            "Penalize clearance-active MANO surface motion opposite to the "
+            "locked region push direction."
+        ),
+    )
+    parser.add_argument(
         "--clearance-tangential-budget-mm", type=float, default=2.0
     )
     parser.add_argument(
@@ -211,6 +220,7 @@ def parse_args() -> argparse.Namespace:
             "object_normal_region",
             "object_normal_full_region",
             "local_surface_opposed",
+            "fixed_patch_normal_clearance",
             "opposite_hand_normal",
         ),
         default="collision_point_side",
@@ -1900,7 +1910,10 @@ def main() -> None:
                 ).to(device)
                 collision_point = points[point_selector].mean(dim=0)
 
-                if args.contact_normal_pushout_mode == "local_surface_opposed":
+                if args.contact_normal_pushout_mode in (
+                    "local_surface_opposed",
+                    "fixed_patch_normal_clearance",
+                ):
                     local_object_normals = functional.normalize(
                         point_normals[point_selector], dim=-1
                     )
@@ -1984,6 +1997,13 @@ def main() -> None:
                         args.contact_normal_patch_side_min_cosine
                     ):
                         continue
+                    if args.contact_normal_pushout_mode == (
+                        "fixed_patch_normal_clearance"
+                    ):
+                        # The local surface cluster only validates that the
+                        # penetration belongs to the fixed patch side. Keep
+                        # the actual escape axis locked to that patch normal.
+                        voted_object_normal = reference_normal
                     mapped_face_vertices = mano_faces[dominant_face_index]
                     mapped_hand_normals = functional.normalize(
                         hand_normals[
@@ -2661,6 +2681,8 @@ def main() -> None:
         contact_normal_clearance_points = 0
         clearance_tangential_value = 0.0
         clearance_tangential_points = 0
+        clearance_forward_motion_value = 0.0
+        clearance_forward_motion_points = 0
         tangential_value = 0.0
         vertex_anchor_value = 0.0
         reprojection_value = 0.0
@@ -2891,6 +2913,7 @@ def main() -> None:
             chunk_object_normal_pushout_sum = torch.zeros((), device=device)
             chunk_contact_normal_clearance_sum = torch.zeros((), device=device)
             chunk_clearance_tangential_sum = torch.zeros((), device=device)
+            chunk_clearance_forward_motion_sum = torch.zeros((), device=device)
             for local_index, global_index_tensor in enumerate(indices):
                 global_index = int(global_index_tensor.item())
                 points = correspondence_points[global_index]
@@ -2971,6 +2994,23 @@ def main() -> None:
                     initial_triangles * barycentric[..., None]
                 ).sum(dim=-2)
                 surface_movement = surface - initial_surface
+                clearance_forward_motion = (
+                    surface_movement * locked_direction
+                ).sum(dim=-1)
+                clearance_backward_error = torch.relu(
+                    -clearance_forward_motion
+                ).square()
+                clearance_forward_motion_points += int(
+                    clearance_active.sum().detach().cpu()
+                )
+                chunk_clearance_forward_motion_sum = (
+                    chunk_clearance_forward_motion_sum
+                    + (
+                        clearance_backward_error
+                        * clearance_active.to(clearance_backward_error.dtype)
+                    ).sum()
+                    * frame_collision_scale[global_index]
+                )
                 locked_normal_movement = (
                     surface_movement * locked_direction
                 ).sum(dim=-1, keepdim=True) * locked_direction
@@ -3015,6 +3055,9 @@ def main() -> None:
             chunk_clearance_tangential = (
                 chunk_clearance_tangential_sum / total_collision_points
             )
+            chunk_clearance_forward_motion = (
+                chunk_clearance_forward_motion_sum / total_collision_points
+            )
             chunk_loss = (
                 args.w_contact * chunk_contact
                 + contact_facing_phase_scale
@@ -3029,6 +3072,8 @@ def main() -> None:
                 * chunk_contact_normal_clearance
                 + args.w_clearance_tangential
                 * chunk_clearance_tangential
+                + args.w_clearance_forward_motion
+                * chunk_clearance_forward_motion
                 + args.w_tangential * chunk_tangential
                 + args.w_vertex_anchor * chunk_vertex_anchor
                 + args.w_reprojection * chunk_reprojection
@@ -3048,6 +3093,9 @@ def main() -> None:
             )
             clearance_tangential_value += float(
                 chunk_clearance_tangential.detach()
+            )
+            clearance_forward_motion_value += float(
+                chunk_clearance_forward_motion.detach()
             )
             tangential_value += float(chunk_tangential.detach())
             vertex_anchor_value += float(chunk_vertex_anchor.detach())
@@ -3099,6 +3147,8 @@ def main() -> None:
             + args.w_contact_normal_pushout * contact_normal_pushout_value
             + args.w_contact_normal_clearance * contact_normal_clearance_value
             + args.w_clearance_tangential * clearance_tangential_value
+            + args.w_clearance_forward_motion
+            * clearance_forward_motion_value
             + args.w_tangential * tangential_value
             + args.w_vertex_anchor * vertex_anchor_value
             + args.w_reprojection * reprojection_value
@@ -3206,6 +3256,10 @@ def main() -> None:
                 ),
                 "clearance_tangential": clearance_tangential_value,
                 "clearance_tangential_points": clearance_tangential_points,
+                "clearance_forward_motion": clearance_forward_motion_value,
+                "clearance_forward_motion_points": (
+                    clearance_forward_motion_points
+                ),
                 "tangential": tangential_value,
                 "vertex_anchor": vertex_anchor_value,
                 "reprojection": reprojection_value,
@@ -3639,6 +3693,7 @@ def main() -> None:
             "contact_normal_pushout_mm": args.contact_normal_pushout_mm,
             "contact_normal_clearance": args.w_contact_normal_clearance,
             "clearance_tangential": args.w_clearance_tangential,
+            "clearance_forward_motion": args.w_clearance_forward_motion,
             "clearance_tangential_budget_mm": (
                 args.clearance_tangential_budget_mm
             ),
