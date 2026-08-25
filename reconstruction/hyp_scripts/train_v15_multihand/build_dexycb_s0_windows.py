@@ -36,7 +36,13 @@ def parse_args():
 
 def load_yaml(path):
     with path.open("r", encoding="utf-8") as handle:
-        return yaml.safe_load(handle)
+        try:
+            return yaml.safe_load(handle)
+        except yaml.constructor.ConstructorError:
+            # Official DexYCB calibration files contain !!python/tuple tags.
+            # These files are trusted local dataset metadata.
+            handle.seek(0)
+            return yaml.load(handle, Loader=yaml.UnsafeLoader)
 
 
 def camera_intrinsics(root, serial):
