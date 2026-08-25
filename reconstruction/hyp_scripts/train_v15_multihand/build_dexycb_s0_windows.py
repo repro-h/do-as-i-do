@@ -26,6 +26,10 @@ def parse_args():
     parser.add_argument("--window-size", type=int, default=16)
     parser.add_argument("--window-stride", type=int, default=8)
     parser.add_argument("--min-valid-frames", type=int, default=1)
+    parser.add_argument(
+        "--stream-id",
+        help="Optional subject__sequence__camera stream for a fast smoke manifest",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -103,12 +107,22 @@ def main():
 
     rows = {split: [] for split in outputs}
     stream_counts = {split: set() for split in outputs}
+    selected = None
+    if args.stream_id:
+        parts = args.stream_id.split("__")
+        if len(parts) != 3:
+            raise ValueError("stream-id must be subject__sequence__camera")
+        selected = tuple(parts)
     for subject_index, subject in enumerate(SUBJECTS):
+        if selected is not None and subject != selected[0]:
+            continue
         subject_dir = root / subject
         if not subject_dir.is_dir():
             continue
         sequences = sorted(path for path in subject_dir.iterdir() if path.is_dir())
         for sequence_index, sequence_dir in enumerate(sequences):
+            if selected is not None and sequence_dir.name != selected[1]:
+                continue
             split = split_for(subject_index, sequence_index)
             meta_path = sequence_dir / "meta.yml"
             if not meta_path.is_file():
@@ -117,6 +131,8 @@ def main():
             side = str(meta.get("mano_sides", [meta.get("hand_side", "unknown")])[0]).lower()
             for camera_dir in sorted(path for path in sequence_dir.iterdir() if path.is_dir()):
                 serial = camera_dir.name
+                if selected is not None and serial != selected[2]:
+                    continue
                 colors = sorted(camera_dir.glob("color_*.jpg"), key=frame_number)
                 if not colors:
                     colors = sorted(camera_dir.glob("color_*.png"), key=frame_number)
