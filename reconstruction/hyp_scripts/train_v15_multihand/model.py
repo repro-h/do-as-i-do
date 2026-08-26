@@ -129,12 +129,20 @@ class MultiHandPi3XTrajectoryModel(nn.Module):
             joint_valid.to(joint_uv.dtype)[..., None],
             visibility[..., None],
         ), dim=-1)
-        query = self.joint_encoder(metadata)
-        joint_ids = torch.arange(joints, device=query.device).view(1, 1, 1, joints)
-        query = query + self.joint_embedding(joint_ids)
-        query = torch.where(
-            joint_valid[..., None], query,
-            self.missing_embedding.view(1, 1, 1, 1, -1),
+        observed_query = self.joint_encoder(metadata)
+        joint_ids = torch.arange(
+            joints, device=observed_query.device
+        ).view(1, 1, 1, joints)
+        joint_identity = self.joint_embedding(joint_ids)
+        observed_query = observed_query + joint_identity
+        missing_query = (
+            self.missing_embedding.view(1, 1, 1, 1, -1)
+            + joint_identity
+        )
+        reliability = joint_valid.to(joint_uv.dtype) * visibility
+        query = (
+            reliability[..., None] * observed_query
+            + (1.0 - reliability[..., None]) * missing_query
         )
         global_query = self.hand_global_query.view(1, 1, 1, 1, -1).expand(
             batch_size, time, hands, 1, -1
@@ -150,11 +158,10 @@ class MultiHandPi3XTrajectoryModel(nn.Module):
             joint_uv.reshape(batch_size * time * hands, joints, 1, 2)
             - repeated_grid_uv[:, None]
         ).square().sum(dim=-1)
-        joint_bias = -self.spatial_bias * distance
-        joint_bias = torch.where(
-            joint_valid.reshape(batch_size * time * hands, joints, 1),
-            joint_bias,
-            torch.zeros_like(joint_bias),
+        joint_bias = (
+            -self.spatial_bias
+            * distance
+            * reliability.reshape(batch_size * time * hands, joints, 1)
         )
         global_bias = torch.zeros(
             batch_size * time * hands, 1, height * width,
@@ -182,7 +189,10 @@ class MultiHandPi3XTrajectoryModel(nn.Module):
         joint_tokens = attended[:, :, :, :joints]
         global_token = attended[:, :, :, -1]
         # Occluded joints retain a small contribution; they are not hard-deleted.
-        joint_weight = joint_valid.to(point.dtype) * (0.1 + 0.9 * visibility)
+        joint_weight = (
+            slot_valid[..., None].to(point.dtype)
+            * (0.1 + 0.9 * reliability)
+        )
         pooled = (joint_tokens * joint_weight[..., None]).sum(dim=3)
         pooled = pooled / joint_weight.sum(dim=3, keepdim=True).clamp_min(1.0)
         wrist = joint_tokens[:, :, :, 0]
@@ -219,7 +229,9 @@ class MultiHandPi3XTrajectoryModel(nn.Module):
             ).permute(0, 2, 1, 3)
             return translation, None
 
-        root_uv01 = (joint_uv[:, :, :, 0] + 1.0) * 0.5
+        # Missing detector frames use a temporally propagated ray anchor rather
+        # than leaking that frame's GT wrist location into output composition.
+        root_uv01 = (batch["ray_anchor_uv"] + 1.0) * 0.5
         image_wh = batch["image_wh"][:, :, None].expand(-1, -1, hands, -1)
         root_pixels = root_uv01 * (image_wh - 1.0).clamp_min(1.0)
         image_offset = torch.tanh(raw[..., :2]).reshape(

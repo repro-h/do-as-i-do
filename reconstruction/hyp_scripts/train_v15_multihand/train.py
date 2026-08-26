@@ -21,7 +21,7 @@ from dataset import DexYCBMultiHandWindowDataset, QueryNoise  # noqa: E402
 from model import MultiHandPi3XTrajectoryModel  # noqa: E402
 
 
-MODEL_VERSION = "v15_1_side_free_multihand_pi3x_ray_translation_v1"
+MODEL_VERSION = "v15_2_visibility_aware_multihand_pi3x_ray_translation_v1"
 
 
 def parse_args():
@@ -56,6 +56,10 @@ def parse_args():
     parser.add_argument("--joint-noise-px", type=float, default=2.0)
     parser.add_argument("--outlier-probability", type=float, default=0.03)
     parser.add_argument("--query-dropout", type=float, default=0.1)
+    parser.add_argument("--near-anchor-frames", type=int, default=4)
+    parser.add_argument("--max-anchor-frames", type=int, default=8)
+    parser.add_argument("--near-missing-weight", type=float, default=0.5)
+    parser.add_argument("--far-missing-weight", type=float, default=0.2)
     parser.add_argument("--w-depth", type=float, default=0.5)
     parser.add_argument("--w-relative", type=float, default=0.5)
     parser.add_argument("--w-velocity", type=float, default=0.05)
@@ -75,6 +79,14 @@ def parse_args():
     parser.add_argument("--audit-only", action="store_true")
     parser.add_argument("--checkpoint")
     parser.add_argument("--eval-only", action="store_true")
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb-project", default="do-as-i-do-v15-multihand")
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--wandb-name", default=None)
+    parser.add_argument(
+        "--wandb-mode", choices=("online", "offline", "disabled"),
+        default="online",
+    )
     return parser.parse_args()
 
 
@@ -84,6 +96,13 @@ def move(batch, device):
 
 def masked_mean(value, valid):
     weight = valid.to(value.dtype)
+    while weight.ndim < value.ndim:
+        weight = weight.unsqueeze(-1)
+    return (value * weight).sum() / weight.expand_as(value).sum().clamp_min(1.0)
+
+
+def weighted_mean(value, weight):
+    weight = weight.to(value.dtype)
     while weight.ndim < value.ndim:
         weight = weight.unsqueeze(-1)
     return (value * weight).sum() / weight.expand_as(value).sum().clamp_min(1.0)
@@ -103,6 +122,17 @@ def temporal_loss(prediction, target, valid, order, beta):
     return masked_mean(smooth_l1(pred - truth, beta), mask)
 
 
+def temporal_weighted_loss(prediction, target, weight, order, beta):
+    pred, truth, temporal_weight = prediction, target, weight
+    for _ in range(order):
+        pred = pred[:, 1:] - pred[:, :-1]
+        truth = truth[:, 1:] - truth[:, :-1]
+        temporal_weight = torch.minimum(
+            temporal_weight[:, 1:], temporal_weight[:, :-1]
+        )
+    return weighted_mean(smooth_l1(pred - truth, beta), temporal_weight)
+
+
 def distribution(values):
     if not values:
         return {"count": 0, "median_mm": None, "p90_mm": None, "max_mm": None}
@@ -113,6 +143,32 @@ def distribution(values):
         "p90_mm": float(np.percentile(array, 90)),
         "max_mm": float(np.max(array)),
     }
+
+
+def wandb_metrics(split, metrics):
+    result = {
+        f"{split}/{key}": metrics[key]
+        for key in (
+            "total", "absolute", "depth", "relative", "velocity",
+            "acceleration", "reprojection", "evaluated_hands",
+            "observed_hands", "missing_supervised_hands",
+            "unsupervised_target_hands",
+        )
+    }
+    for name in ("translation_error", "depth_error"):
+        for statistic in ("median_mm", "p90_mm", "max_mm"):
+            value = metrics[name].get(statistic)
+            if value is not None:
+                result[f"{split}/{name}/{statistic}"] = value
+    stitched = metrics.get("stitched")
+    if stitched:
+        result[f"{split}/stitched/unique_hands"] = stitched["unique_hands"]
+        for name in ("translation_error", "depth_error", "overlap_disagreement"):
+            for statistic in ("median_mm", "p90_mm"):
+                value = stitched[name].get(statistic)
+                if value is not None:
+                    result[f"{split}/stitched/{name}/{statistic}"] = value
+    return result
 
 
 def run_epoch(model, loader, device, args, optimizer=None):
@@ -126,24 +182,38 @@ def run_epoch(model, loader, device, args, optimizer=None):
     axis_errors = {axis: [] for axis in ("x", "y", "z")}
     stitched = defaultdict(list)
     batches = evaluated = 0
+    observed_hands = missing_supervised_hands = unsupervised_targets = 0
     for raw in tqdm(loader, desc="train" if training else "val"):
         batch = move(raw, device)
         valid = batch["target_valid"] & batch["hand_slot_valid"]
+        supervision_weight = batch["supervision_weight"] * valid.to(torch.float32)
+        supervised = supervision_weight > 0
+        observed = batch["observation_valid"] & valid
         target = batch["target_t"]
         with torch.set_grad_enabled(training):
             prediction, predicted_pixels = model(batch)
             beta = args.smooth_l1_beta_mm / 1000.0
-            absolute = masked_mean(smooth_l1(prediction - target, beta), valid)
-            depth = masked_mean(smooth_l1(prediction[..., 2] - target[..., 2], beta), valid)
-            weight = valid.to(target.dtype)[..., None]
+            absolute = weighted_mean(
+                smooth_l1(prediction - target, beta), supervision_weight
+            )
+            depth = weighted_mean(
+                smooth_l1(prediction[..., 2] - target[..., 2], beta),
+                supervision_weight,
+            )
+            weight = supervision_weight[..., None]
             denominator = weight.sum(dim=1, keepdim=True).clamp_min(1.0)
             pred_center = (prediction * weight).sum(dim=1, keepdim=True) / denominator
             target_center = (target * weight).sum(dim=1, keepdim=True) / denominator
-            relative = masked_mean(
-                smooth_l1((prediction - pred_center) - (target - target_center), beta), valid
+            relative = weighted_mean(
+                smooth_l1((prediction - pred_center) - (target - target_center), beta),
+                supervision_weight,
             )
-            velocity = temporal_loss(prediction, target, valid, 1, beta)
-            acceleration = temporal_loss(prediction, target, valid, 2, beta)
+            velocity = temporal_weighted_loss(
+                prediction, target, supervision_weight, 1, beta
+            )
+            acceleration = temporal_weighted_loss(
+                prediction, target, supervision_weight, 2, beta
+            )
             target_depth = target[..., 2].clamp_min(1e-6)
             intrinsics = batch["intrinsics"][:, :, None]
             target_pixels = torch.stack((
@@ -159,11 +229,11 @@ def run_epoch(model, loader, device, args, optimizer=None):
                     prediction[..., 1] / prediction[..., 2].clamp_min(1e-6)
                     * intrinsics[..., 1, 1] + intrinsics[..., 1, 2],
                 ), dim=-1)
-            reprojection = masked_mean(
+            reprojection = weighted_mean(
                 smooth_l1(
                     predicted_pixels - target_pixels,
                     args.reprojection_beta_px,
-                ), valid,
+                ), supervision_weight,
             )
             total = (
                 absolute + args.w_depth * depth + args.w_relative * relative
@@ -183,7 +253,7 @@ def run_epoch(model, loader, device, args, optimizer=None):
             ("reprojection", reprojection),
         ):
             totals[key] += float(value.detach())
-        mask = valid.detach().cpu().numpy().astype(bool)
+        mask = supervised.detach().cpu().numpy().astype(bool)
         error = (prediction - target).detach().cpu().numpy()
         translation_errors.append(np.linalg.norm(error, axis=-1)[mask])
         depth_errors.append(np.abs(error[..., 2])[mask])
@@ -216,6 +286,9 @@ def run_epoch(model, loader, device, args, optimizer=None):
                             float(center_weight[local]),
                         ))
         evaluated += int(mask.sum())
+        observed_hands += int(observed.sum().item())
+        missing_supervised_hands += int((supervised & ~observed).sum().item())
+        unsupervised_targets += int((valid & ~supervised).sum().item())
         batches += 1
     result = {
         **{key: value / max(batches, 1) for key, value in totals.items()},
@@ -225,6 +298,9 @@ def run_epoch(model, loader, device, args, optimizer=None):
             axis: distribution(values) for axis, values in axis_errors.items()
         },
         "evaluated_hands": evaluated,
+        "observed_hands": observed_hands,
+        "missing_supervised_hands": missing_supervised_hands,
+        "unsupervised_target_hands": unsupervised_targets,
     }
     if stitched:
         stitched_translation = []
@@ -283,6 +359,10 @@ def make_dataset(args, split, training):
         visibility_source=args.visibility_source,
         visibility_root=getattr(args, f"visibility_{split}_root"),
         track_root=getattr(args, f"track_{split}_root"),
+        near_anchor_frames=args.near_anchor_frames,
+        max_anchor_frames=args.max_anchor_frames,
+        near_missing_weight=args.near_missing_weight,
+        far_missing_weight=args.far_missing_weight,
     )
 
 
@@ -348,6 +428,22 @@ def main():
 
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    wandb_run = None
+    if args.wandb:
+        try:
+            import wandb
+        except ImportError as error:
+            raise RuntimeError(
+                "--wandb was requested but wandb is not installed"
+            ) from error
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_name,
+            mode=args.wandb_mode,
+            config=vars(args),
+            dir=str(out_dir),
+        )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     history = []
     best = float("inf")
@@ -358,6 +454,11 @@ def main():
         row = {"epoch": epoch, "train": train_metrics, "val": val_metrics}
         history.append(row)
         print(json.dumps(row))
+        if wandb_run is not None:
+            logged = {"epoch": epoch, "lr": optimizer.param_groups[0]["lr"]}
+            logged.update(wandb_metrics("train", train_metrics))
+            logged.update(wandb_metrics("val", val_metrics))
+            wandb_run.log(logged, step=epoch)
         payload = {
             "epoch": epoch,
             "model_version": MODEL_VERSION,
@@ -371,6 +472,9 @@ def main():
             torch.save(payload, out_dir / "best.pt")
         with (out_dir / "history.json").open("w", encoding="utf-8") as handle:
             json.dump(history, handle, indent=2)
+    if wandb_run is not None:
+        wandb_run.summary["best_val_total"] = best
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

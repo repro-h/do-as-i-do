@@ -90,6 +90,10 @@ class DexYCBMultiHandWindowDataset(Dataset):
         visibility_source="detector",
         visibility_root=None,
         track_root=None,
+        near_anchor_frames=4,
+        max_anchor_frames=8,
+        near_missing_weight=0.5,
+        far_missing_weight=0.2,
     ):
         self.rows = load_jsonl(windows)
         if not self.rows:
@@ -109,6 +113,10 @@ class DexYCBMultiHandWindowDataset(Dataset):
             None if track_root is None
             else Path(track_root).expanduser().resolve()
         )
+        self.near_anchor_frames = int(near_anchor_frames)
+        self.max_anchor_frames = int(max_anchor_frames)
+        self.near_missing_weight = float(near_missing_weight)
+        self.far_missing_weight = float(far_missing_weight)
         if self.visibility_source not in ("detector", "mask", "ones"):
             raise ValueError(f"Unknown visibility source: {self.visibility_source}")
         if self.visibility_source == "detector" and self.visibility_root is None:
@@ -131,6 +139,7 @@ class DexYCBMultiHandWindowDataset(Dataset):
         target_valid = np.zeros((time, hands), dtype=bool)
         hand_slot_valid = np.zeros((time, hands), dtype=bool)
         observation_valid = np.zeros((time, hands), dtype=bool)
+        detector_observation_valid = np.zeros((time, hands), dtype=bool)
         track_ids = np.full((time, hands), -1, dtype=np.int64)
         track_data = None
         track_index = {}
@@ -235,7 +244,10 @@ class DexYCBMultiHandWindowDataset(Dataset):
                 )
                 count = min(hands, len(values))
                 visibility[frame, :count] = np.where(
-                    values_valid[:count, None], values[:count], 0.5
+                    values_valid[:count, None], values[:count], 0.0
+                )
+                detector_observation_valid[frame, :count] = (
+                    values_valid[:count] & hand_slot_valid[frame, :count]
                 )
 
         if track_data is not None:
@@ -245,6 +257,40 @@ class DexYCBMultiHandWindowDataset(Dataset):
         clean_query_valid = query_valid.copy()
         if self.training:
             query_uv_px, query_valid = self.noise(query_uv_px, query_valid)
+
+        if self.visibility_source == "detector":
+            # GT joints remain supervision, but a failed detector must not expose
+            # their locations as query tokens. This matches inference behavior.
+            observation_valid &= detector_observation_valid
+            query_valid &= detector_observation_valid[..., None]
+
+        ray_anchor_uv_px = np.zeros((time, hands, 2), dtype=np.float32)
+        supervision_weight = np.zeros((time, hands), dtype=np.float32)
+        frame_axis = np.arange(time, dtype=np.float32)
+        for hand in range(hands):
+            observed = observation_valid[:, hand] & hand_slot_valid[:, hand]
+            anchors = np.flatnonzero(observed)
+            if len(anchors) == 0:
+                continue
+            for coordinate in range(2):
+                ray_anchor_uv_px[:, hand, coordinate] = np.interp(
+                    frame_axis,
+                    anchors.astype(np.float32),
+                    query_uv_px[anchors, hand, 0, coordinate],
+                )
+            distance = np.min(
+                np.abs(frame_axis[:, None] - anchors[None]), axis=1
+            )
+            supervision_weight[observed, hand] = 1.0
+            near = (~observed) & (distance <= self.near_anchor_frames)
+            far = (
+                (~observed)
+                & (distance > self.near_anchor_frames)
+                & (distance <= self.max_anchor_frames)
+            )
+            supervision_weight[near, hand] = self.near_missing_weight
+            supervision_weight[far, hand] = self.far_missing_weight
+        supervision_weight *= target_valid & hand_slot_valid
 
         dense_file = dense_path(row, self.pi3x_root)
         with np.load(str(dense_file), allow_pickle=False) as dense:
@@ -267,8 +313,12 @@ class DexYCBMultiHandWindowDataset(Dataset):
         scale = resized_wh / original_wh
         query_uv_px *= scale.reshape(1, 1, 1, 2)
         clean_query_uv_px *= scale.reshape(1, 1, 1, 2)
+        ray_anchor_uv_px *= scale.reshape(1, 1, 2)
         query_uv01 = query_uv_px / np.maximum(resized_wh - 1.0, 1.0).reshape(1, 1, 1, 2)
         clean_query_uv01 = clean_query_uv_px / np.maximum(resized_wh - 1.0, 1.0).reshape(1, 1, 1, 2)
+        ray_anchor_uv01 = ray_anchor_uv_px / np.maximum(
+            resized_wh - 1.0, 1.0
+        ).reshape(1, 1, 2)
         query_valid &= np.isfinite(query_uv01).all(axis=-1)
         query_valid &= (query_uv01 >= 0).all(axis=-1) & (query_uv01 <= 1).all(axis=-1)
 
@@ -296,10 +346,13 @@ class DexYCBMultiHandWindowDataset(Dataset):
             "joint_uv": torch.from_numpy(finite_float(query_uv01 * 2.0 - 1.0)),
             "joint_query_valid": torch.from_numpy(query_valid),
             "joint_visibility": torch.from_numpy(visibility),
+            "ray_anchor_uv": torch.from_numpy(finite_float(ray_anchor_uv01 * 2.0 - 1.0)),
             "clean_joint_uv": torch.from_numpy(finite_float(clean_query_uv01 * 2.0 - 1.0)),
             "clean_joint_valid": torch.from_numpy(clean_query_valid),
             "hand_slot_valid": torch.from_numpy(hand_slot_valid),
             "observation_valid": torch.from_numpy(observation_valid),
+            "detector_observation_valid": torch.from_numpy(detector_observation_valid),
+            "supervision_weight": torch.from_numpy(supervision_weight),
             "target_t": torch.from_numpy(target),
             "target_valid": torch.from_numpy(target_valid),
             "intrinsics": torch.from_numpy(finite_float(intrinsics)),

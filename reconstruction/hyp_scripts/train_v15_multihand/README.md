@@ -13,8 +13,21 @@ inference query provider. A later detector/WiLoR provider can emit the same
 Joint visibility comes from the external `hand_visibility_detector` as 21
 sigmoid probabilities. Export it once per stream with
 `export_hand_visibility.py`; training never runs that network online. Missing
-detections use neutral probability 0.5. `mask` and `ones` remain available only
-as ablations through `--visibility-source`.
+detections mask all GT joint queries and use a temporally propagated wrist ray
+anchor, so an unavailable GT location cannot leak into the model input. Their
+3D targets retain weight 0.5 within four frames of an observed anchor and 0.2
+within eight frames; targets farther from an anchor receive zero loss. These
+distances and weights are configurable with `--near-anchor-frames`,
+`--max-anchor-frames`, `--near-missing-weight`, and `--far-missing-weight`.
+`mask` and `ones` remain available only as ablations through
+`--visibility-source`.
+
+Joint validity remains per joint. A hand that is partly outside the image keeps
+its in-frame joint queries while out-of-frame joints become missing tokens.
+Each missing token retains its joint identity. For valid joints, visibility
+softly blends the observed and missing representations and scales the local
+Pi3X attention bias, so low-visibility joints rely less on the occluder's local
+feature without introducing a separate gating head.
 
 ## Stable hand slots
 
