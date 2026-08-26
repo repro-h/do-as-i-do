@@ -160,6 +160,14 @@ def wandb_metrics(split, metrics):
             value = metrics[name].get(statistic)
             if value is not None:
                 result[f"{split}/{name}/{statistic}"] = value
+    for group, values in metrics.get("by_observability", {}).items():
+        for name in ("translation_error", "depth_error"):
+            for statistic in ("median_mm", "p90_mm"):
+                value = values[name].get(statistic)
+                if value is not None:
+                    result[
+                        f"{split}/by_observability/{group}/{name}/{statistic}"
+                    ] = value
     stitched = metrics.get("stitched")
     if stitched:
         result[f"{split}/stitched/unique_hands"] = stitched["unique_hands"]
@@ -179,6 +187,10 @@ def run_epoch(model, loader, device, args, optimizer=None):
         "acceleration", "reprojection",
     )}
     translation_errors, depth_errors = [], []
+    grouped_errors = {
+        name: {"translation": [], "depth": []}
+        for name in ("observed", "missing_supervised", "unsupervised_target")
+    }
     axis_errors = {axis: [] for axis in ("x", "y", "z")}
     stitched = defaultdict(list)
     batches = evaluated = 0
@@ -254,9 +266,23 @@ def run_epoch(model, loader, device, args, optimizer=None):
         ):
             totals[key] += float(value.detach())
         mask = supervised.detach().cpu().numpy().astype(bool)
+        valid_np = valid.detach().cpu().numpy().astype(bool)
+        observed_np = observed.detach().cpu().numpy().astype(bool)
+        group_masks = {
+            "observed": mask & observed_np,
+            "missing_supervised": mask & ~observed_np,
+            "unsupervised_target": valid_np & ~mask,
+        }
         error = (prediction - target).detach().cpu().numpy()
-        translation_errors.append(np.linalg.norm(error, axis=-1)[mask])
-        depth_errors.append(np.abs(error[..., 2])[mask])
+        translation_error = np.linalg.norm(error, axis=-1)
+        depth_error = np.abs(error[..., 2])
+        translation_errors.append(translation_error[mask])
+        depth_errors.append(depth_error[mask])
+        for name, group_mask in group_masks.items():
+            grouped_errors[name]["translation"].append(
+                translation_error[group_mask]
+            )
+            grouped_errors[name]["depth"].append(depth_error[group_mask])
         for axis, axis_index in (("x", 0), ("y", 1), ("z", 2)):
             axis_errors[axis].append(np.abs(error[..., axis_index])[mask])
         if not training:
@@ -296,6 +322,13 @@ def run_epoch(model, loader, device, args, optimizer=None):
         "depth_error": distribution(depth_errors),
         "axis_error": {
             axis: distribution(values) for axis, values in axis_errors.items()
+        },
+        "by_observability": {
+            name: {
+                "translation_error": distribution(values["translation"]),
+                "depth_error": distribution(values["depth"]),
+            }
+            for name, values in grouped_errors.items()
         },
         "evaluated_hands": evaluated,
         "observed_hands": observed_hands,
