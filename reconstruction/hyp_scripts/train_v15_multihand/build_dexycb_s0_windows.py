@@ -72,13 +72,23 @@ def frame_number(path):
 def frame_is_valid(label_path):
     try:
         with np.load(str(label_path), allow_pickle=False) as data:
-            joint_2d = np.asarray(data["joint_2d"])[0]
-            joint_3d = np.asarray(data["joint_3d"])[0]
+            joint_2d = np.asarray(data["joint_2d"])
+            joint_3d = np.asarray(data["joint_3d"])
+            if joint_2d.ndim == 2:
+                joint_2d = joint_2d[None]
+            if joint_3d.ndim == 2:
+                joint_3d = joint_3d[None]
+            count = min(len(joint_2d), len(joint_3d))
+            joint_2d = joint_2d[:count]
+            joint_3d = joint_3d[:count]
         return bool(
-            np.isfinite(joint_2d).all()
-            and np.isfinite(joint_3d).all()
-            and joint_2d.shape == (21, 2)
-            and joint_3d.shape == (21, 3)
+            count > 0
+            and joint_2d.shape[1:] == (21, 2)
+            and joint_3d.shape[1:] == (21, 3)
+            and np.any(
+                np.isfinite(joint_2d).all(axis=(1, 2))
+                & np.isfinite(joint_3d).all(axis=(1, 2))
+            )
         )
     except (OSError, KeyError, IndexError, ValueError):
         return False
@@ -134,7 +144,11 @@ def main():
             if not meta_path.is_file():
                 continue
             meta = load_yaml(meta_path)
-            side = str(meta.get("mano_sides", [meta.get("hand_side", "unknown")])[0]).lower()
+            sides = list(
+                meta.get("mano_sides", [meta.get("hand_side", "unknown")])
+            )
+            sides = [str(value).lower() for value in sides]
+            side = sides[0] if sides else "unknown"
             for camera_dir in sorted(path for path in sequence_dir.iterdir() if path.is_dir()):
                 serial = camera_dir.name
                 if selected is not None and serial != selected[2]:
@@ -167,6 +181,7 @@ def main():
                         "sequence": sequence_dir.name,
                         "camera_serial": serial,
                         "hand_side_metadata_only": side,
+                        "hand_sides_metadata_only": sides,
                         "start": start,
                         "end": end,
                         "frame_indices": [item[0] for item in window],

@@ -16,6 +16,39 @@ sigmoid probabilities. Export it once per stream with
 detections use neutral probability 0.5. `mask` and `ones` remain available only
 as ablations through `--visibility-source`.
 
+## Stable hand slots
+
+`export_multihand_tracks.py` converts frame-level `[N,21,...]` annotations to
+stable `[T,H,21,...]` slots over the complete stream. Association uses side
+metadata when available, constant-velocity 2D joint prediction and one-to-one
+matching. It also separates `track_valid`, `observation_valid` and
+`target_valid`. Single-hand labels naturally occupy slot zero, so old DexYCB
+experiments remain compatible.
+
+```bash
+python export_multihand_tracks.py \
+  --windows /data2/hyp/full_v15/manifests/train_windows.jsonl \
+  --out-root /data2/hyp/full_v15/tracks/train \
+  --max-hands 4
+```
+
+For a real multi-hand visibility cache, pass the track root so all detections
+are matched one-to-one to stable slots:
+
+```bash
+python export_hand_visibility.py \
+  --windows /data2/hyp/full_v15/manifests/train_windows.jsonl \
+  --track-root /data2/hyp/full_v15/tracks/train \
+  --max-hands 4 \
+  --detector-root "$HAND_VISIBILITY_ROOT" \
+  --checkpoint "$VISIBILITY_CHECKPOINT" \
+  --out-root /data2/hyp/full_v15/visibility/train
+```
+
+Training consumes the caches through `--track-train-root` and
+`--track-val-root`. Without these flags, label order is used as a backward-
+compatible fallback; it is suitable for DexYCB single-hand data only.
+
 ## Coordinate contract
 
 - Images, 2D joints, intrinsics, Pi3X cache and 3D targets use original camera

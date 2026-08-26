@@ -23,10 +23,12 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--windows", required=True)
     parser.add_argument("--visibility-root", required=True)
+    parser.add_argument("--track-root")
     parser.add_argument("--stream-id", required=True)
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--max-frames", type=int, default=0)
+    parser.add_argument("--hand-slot", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -103,7 +105,29 @@ def main():
         detector_uv = np.asarray(cache["detector_joint_uv"], dtype=np.float32)
         boxes = np.asarray(cache["detector_bbox_xyxy"], dtype=np.float32)
         is_right = np.asarray(cache["detector_is_right"], dtype=bool)
+    if visibility.ndim == 3:
+        slot = args.hand_slot
+        if not 0 <= slot < visibility.shape[1]:
+            raise ValueError(f"hand-slot must be below {visibility.shape[1]}")
+        visibility = visibility[:, slot]
+        valid = valid[:, slot]
+        confidence = confidence[:, slot]
+        error = error[:, slot]
+        detector_uv = detector_uv[:, slot]
+        boxes = boxes[:, slot]
+        is_right = is_right[:, slot]
     cache_index = {int(frame): offset for offset, frame in enumerate(frame_indices)}
+    track_uv = {}
+    if args.track_root:
+        track_path = (
+            Path(args.track_root).expanduser().resolve()
+            / args.stream_id / "tracks.npz"
+        )
+        with np.load(str(track_path), allow_pickle=False) as track:
+            for offset, frame in enumerate(track["frame_indices"]):
+                track_uv[int(frame)] = np.asarray(
+                    track["joint_uv"][offset], dtype=np.float32
+                )
 
     out_dir = Path(args.out_dir).expanduser().resolve()
     if out_dir.exists() and any(out_dir.iterdir()) and not args.overwrite:
@@ -120,8 +144,18 @@ def main():
         if image is None:
             continue
         offset = cache_index[frame]
-        with np.load(label_path, allow_pickle=False) as label:
-            gt_uv = np.asarray(label["joint_2d"], dtype=np.float32)[0]
+        if frame in track_uv:
+            if args.hand_slot >= len(track_uv[frame]):
+                continue
+            gt_uv = track_uv[frame][args.hand_slot]
+        else:
+            with np.load(label_path, allow_pickle=False) as label:
+                gt_uv = np.asarray(label["joint_2d"], dtype=np.float32)
+                if gt_uv.ndim == 2:
+                    gt_uv = gt_uv[None]
+                if args.hand_slot >= len(gt_uv):
+                    continue
+                gt_uv = gt_uv[args.hand_slot]
         # GT is cyan and intentionally not visibility-coloured.
         for first, second in BONES:
             cv2.line(
@@ -174,4 +208,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

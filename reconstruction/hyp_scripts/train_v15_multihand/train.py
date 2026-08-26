@@ -32,6 +32,8 @@ def parse_args():
     parser.add_argument("--pi3x-val-root", required=True)
     parser.add_argument("--visibility-train-root")
     parser.add_argument("--visibility-val-root")
+    parser.add_argument("--track-train-root")
+    parser.add_argument("--track-val-root")
     parser.add_argument(
         "--visibility-source", choices=("detector", "mask", "ones"),
         default="detector",
@@ -192,6 +194,7 @@ def run_epoch(model, loader, device, args, optimizer=None):
             target_np = target.detach().cpu().numpy()
             stream_np = batch["stream_index"].detach().cpu().numpy()
             frame_np = batch["frame_index"].detach().cpu().numpy()
+            track_np = batch["track_id"].detach().cpu().numpy()
             length = prediction_np.shape[1]
             center_weight = 1.0 - np.abs(
                 np.linspace(-1.0, 1.0, length, dtype=np.float32)
@@ -205,7 +208,7 @@ def run_epoch(model, loader, device, args, optimizer=None):
                         key = (
                             int(stream_np[batch_index]),
                             int(frame_np[batch_index, local]),
-                            int(hand),
+                            int(track_np[batch_index, local, hand]),
                         )
                         stitched[key].append((
                             prediction_np[batch_index, local, hand],
@@ -279,6 +282,7 @@ def make_dataset(args, split, training):
         noise=noise,
         visibility_source=args.visibility_source,
         visibility_root=getattr(args, f"visibility_{split}_root"),
+        track_root=getattr(args, f"track_{split}_root"),
     )
 
 
@@ -302,6 +306,9 @@ def main():
         "coordinate_frame": "original_camera",
         "query_source": "dexycb_gt_2d_with_train_only_noise",
         "visibility_source": args.visibility_source,
+        "track_source": (
+            "multihand_cache" if args.track_train_root else "label_order_fallback"
+        ),
         "translation_parameterization": args.translation_parameterization,
         "max_window_size": args.max_window_size,
     }
