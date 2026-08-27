@@ -29,6 +29,8 @@ def parse_args():
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--hand-slot", type=int, default=0)
+    parser.add_argument("--show-probabilities", action="store_true")
+    parser.add_argument("--probability-decimals", type=int, default=2)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -60,7 +62,21 @@ def point(value):
     return tuple(np.round(value).astype(int).tolist())
 
 
-def draw_skeleton(image, joints, visibility):
+def outlined_text(image, text, origin, scale=0.32):
+    cv2.putText(
+        image, text, origin, cv2.FONT_HERSHEY_SIMPLEX,
+        scale, (20, 20, 20), 3, cv2.LINE_AA,
+    )
+    cv2.putText(
+        image, text, origin, cv2.FONT_HERSHEY_SIMPLEX,
+        scale, (255, 255, 255), 1, cv2.LINE_AA,
+    )
+
+
+def draw_skeleton(
+    image, joints, visibility, show_probabilities=False,
+    probability_decimals=2,
+):
     finite = np.isfinite(joints).all(axis=-1)
     for first, second in BONES:
         if not (finite[first] and finite[second]):
@@ -77,9 +93,11 @@ def draw_skeleton(image, joints, visibility):
             image, point(value), 4, visibility_color(visibility[index]),
             -1, cv2.LINE_AA,
         )
-        cv2.putText(
-            image, str(index), (point(value)[0] + 4, point(value)[1] - 3),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1, cv2.LINE_AA,
+        label = str(index)
+        if show_probabilities:
+            label += f":{float(visibility[index]):.{probability_decimals}f}"
+        outlined_text(
+            image, label, (point(value)[0] + 4, point(value)[1] - 3),
         )
 
 
@@ -165,7 +183,13 @@ def main():
         for value in gt_uv:
             cv2.circle(image, point(value), 2, (255, 220, 0), -1, cv2.LINE_AA)
         if valid[offset]:
-            draw_skeleton(image, detector_uv[offset], visibility[offset])
+            draw_skeleton(
+                image,
+                detector_uv[offset],
+                visibility[offset],
+                show_probabilities=args.show_probabilities,
+                probability_decimals=args.probability_decimals,
+            )
             x1, y1, x2, y2 = point(boxes[offset, :2]) + point(boxes[offset, 2:])
             cv2.rectangle(image, (x1, y1), (x2, y2), (255, 255, 255), 1)
         text = (
@@ -187,6 +211,8 @@ def main():
             (12, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
             (255, 255, 255), 1, cv2.LINE_AA,
         )
+        if not valid[offset]:
+            outlined_text(image, "detector=missing", (12, 68), scale=0.45)
         cv2.imwrite(str(out_dir / f"frame_{frame:06d}.jpg"), image)
         if writer is None:
             height, width = image.shape[:2]
