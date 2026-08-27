@@ -84,6 +84,22 @@ def load_rows(path):
         return [json.loads(line) for line in handle if line.strip()]
 
 
+def window_layout(rows):
+    lengths = sorted({len(row["frame_indices"]) for row in rows})
+    starts_by_stream = {}
+    for row in rows:
+        starts_by_stream.setdefault(row["stream_id"], []).append(int(row["start"]))
+    strides = set()
+    for starts in starts_by_stream.values():
+        ordered = sorted(set(starts))
+        strides.update(b - a for a, b in zip(ordered, ordered[1:]))
+    return {
+        "lengths": lengths,
+        "observed_start_strides": sorted(strides),
+        "streams": len(starts_by_stream),
+    }
+
+
 def make_dataset(args, split, training, provider):
     noise = QueryNoise(
         global_sigma_px=args.global_noise_px,
@@ -114,7 +130,11 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    rows = load_rows(args.train_windows) + load_rows(args.val_windows)
+    train_rows = load_rows(args.train_windows)
+    val_rows = load_rows(args.val_windows)
+    rows = train_rows + val_rows
+    if not train_rows or not val_rows:
+        raise RuntimeError("Training and validation manifests must both be non-empty")
     unique = {}
     for row in rows:
         length = len(row["frame_indices"])
@@ -156,6 +176,8 @@ def main():
         "pi3x_ram_gib": provider.nbytes / 2**30,
         "train_windows": len(train_data),
         "val_windows": len(val_data),
+        "train_window_layout": window_layout(train_rows),
+        "val_window_layout": window_layout(val_rows),
         "window_frames": int(sample["point_features"].shape[0]),
         "point_feature_shape": list(sample["point_features"].shape),
         "joint_query_shape": list(sample["joint_uv"].shape),

@@ -80,6 +80,10 @@ def infer_stream_id(sequence_dir):
 
 def main():
     args = parse_args()
+    if args.window_size <= 0:
+        raise ValueError("--window-size must be positive")
+    if args.window_stride <= 0:
+        raise ValueError("--window-stride must be positive")
     sequence_dir = Path(args.sequence_dir).expanduser().resolve()
     out_dir = Path(args.out_dir).expanduser().resolve()
     labels_dir = out_dir / "labels"
