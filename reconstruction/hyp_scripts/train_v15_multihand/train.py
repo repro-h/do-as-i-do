@@ -136,7 +136,17 @@ def temporal_weighted_loss(prediction, target, weight, order, beta):
 def distribution(values):
     if not values:
         return {"count": 0, "median_mm": None, "p90_mm": None, "max_mm": None}
-    array = np.concatenate(values) * 1000.0
+    arrays = [
+        np.asarray(value).reshape(-1)
+        for value in values
+        if np.asarray(value).size
+    ]
+    if not arrays:
+        return {"count": 0, "median_mm": None, "p90_mm": None, "max_mm": None}
+    array = np.concatenate(arrays)
+    array = array[np.isfinite(array)] * 1000.0
+    if array.size == 0:
+        return {"count": 0, "median_mm": None, "p90_mm": None, "max_mm": None}
     return {
         "count": int(array.size),
         "median_mm": float(np.median(array)),
