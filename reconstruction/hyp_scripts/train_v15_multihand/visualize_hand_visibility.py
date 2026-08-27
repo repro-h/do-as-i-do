@@ -31,6 +31,9 @@ def parse_args():
     parser.add_argument("--hand-slot", type=int, default=0)
     parser.add_argument("--show-probabilities", action="store_true")
     parser.add_argument("--probability-decimals", type=int, default=2)
+    parser.add_argument(
+        "--probability-layout", choices=("panel", "joint"), default="panel"
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -98,6 +101,35 @@ def draw_skeleton(
             label += f":{float(visibility[index]):.{probability_decimals}f}"
         outlined_text(
             image, label, (point(value)[0] + 4, point(value)[1] - 3),
+        )
+
+
+def draw_probability_panel(image, visibility, decimals=2):
+    columns = 3
+    rows = int(np.ceil(len(visibility) / columns))
+    cell_width, row_height = 104, 22
+    panel_width = columns * cell_width + 16
+    panel_height = rows * row_height + 16
+    height, width = image.shape[:2]
+    x0 = max(0, width - panel_width - 10)
+    y0 = 10
+    x1 = min(width, x0 + panel_width)
+    y1 = min(height, y0 + panel_height)
+    overlay = image.copy()
+    cv2.rectangle(overlay, (x0, y0), (x1, y1), (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.68, image, 0.32, 0.0, image)
+    for index, probability in enumerate(visibility):
+        column = index // rows
+        row = index % rows
+        x = x0 + 9 + column * cell_width
+        y = y0 + 18 + row * row_height
+        color = visibility_color(probability)
+        cv2.circle(image, (x + 5, y - 5), 5, color, -1, cv2.LINE_AA)
+        outlined_text(
+            image,
+            f"{index:02d}: {float(probability):.{decimals}f}",
+            (x + 15, y),
+            scale=0.36,
         )
 
 
@@ -187,11 +219,20 @@ def main():
                 image,
                 detector_uv[offset],
                 visibility[offset],
-                show_probabilities=args.show_probabilities,
+                show_probabilities=(
+                    args.show_probabilities
+                    and args.probability_layout == "joint"
+                ),
                 probability_decimals=args.probability_decimals,
             )
             x1, y1, x2, y2 = point(boxes[offset, :2]) + point(boxes[offset, 2:])
             cv2.rectangle(image, (x1, y1), (x2, y2), (255, 255, 255), 1)
+            if args.show_probabilities and args.probability_layout == "panel":
+                draw_probability_panel(
+                    image,
+                    visibility[offset],
+                    decimals=args.probability_decimals,
+                )
         text = (
             f"frame={frame:06d} valid={int(valid[offset])} "
             f"side={'R' if is_right[offset] else 'L'} "
