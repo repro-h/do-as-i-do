@@ -6,6 +6,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 
 def final_tensor(value):
@@ -149,6 +150,129 @@ class Pi3XWindowMaterializer:
             "coordinate_frame": np.asarray("original_camera"),
         }
 
+    def compact(self, row, joint_uv, patch_radius=1, global_grid_size=4):
+        """Run Pi3X once and transfer only local/global query candidates."""
+        from pi3_wilor_hand.geometry import resize_intrinsics
+        from pi3_wilor_hand.pi3_runner import load_images_for_pi3
+
+        image_paths = [
+            str(Path(path).expanduser().resolve())
+            for path in row["image_paths"]
+        ]
+        images, resized_wh, original_wh = load_images_for_pi3(
+            image_paths,
+            pixel_limit=self.pixel_limit,
+        )
+        intrinsics = np.asarray(row["intrinsics"], dtype=np.float32).reshape(3, 3)
+        resized_intrinsics = resize_intrinsics(intrinsics, original_wh, resized_wh)
+        image_batch = images[None].to(self.device)
+        intrinsics_batch = (
+            torch.from_numpy(resized_intrinsics)
+            .to(device=self.device, dtype=torch.float32)[None, None]
+            .repeat(1, len(image_paths), 1, 1)
+        )
+        self.captured.clear()
+        with torch.inference_mode():
+            outputs = self.reconstruction(image_batch, intrinsics=intrinsics_batch)
+        ret_point = self.captured.get("ret_point")
+        ret_metric = self.captured.get("ret_metric")
+        if ret_point is None or ret_metric is None:
+            raise RuntimeError("Pi3X decoder hooks did not capture both outputs")
+
+        resized_w, resized_h = (int(value) for value in resized_wh)
+        patch_h = resized_h // int(self.model.patch_size)
+        patch_w = resized_w // int(self.model.patch_size)
+        point_tokens = ret_point[:, int(self.model.patch_start_idx):]
+        expected = len(image_paths) * patch_h * patch_w
+        if point_tokens.numel() // point_tokens.shape[-1] != expected:
+            raise RuntimeError(
+                f"Unexpected point token shape {tuple(point_tokens.shape)} "
+                f"for {len(image_paths)}x{patch_h}x{patch_w}"
+            )
+        point = point_tokens.reshape(
+            len(image_paths), patch_h, patch_w, point_tokens.shape[-1]
+        )
+        query = torch.as_tensor(
+            joint_uv, dtype=torch.float32, device=self.device
+        )
+        if query.shape[0] != len(image_paths) or query.shape[-1] != 2:
+            raise ValueError(
+                f"Joint query shape {tuple(query.shape)} does not match "
+                f"{len(image_paths)} frames"
+            )
+
+        radius = int(patch_radius)
+        if radius < 0:
+            raise ValueError("patch_radius must be non-negative")
+        offsets = torch.stack(torch.meshgrid(
+            torch.arange(-radius, radius + 1, device=self.device),
+            torch.arange(-radius, radius + 1, device=self.device),
+            indexing="ij",
+        ), dim=-1).reshape(-1, 2)
+        center_x = torch.round((query[..., 0] + 1.0) * 0.5 * (patch_w - 1)).long()
+        center_y = torch.round((query[..., 1] + 1.0) * 0.5 * (patch_h - 1)).long()
+        sample_y = center_y[..., None] + offsets[:, 0]
+        sample_x = center_x[..., None] + offsets[:, 1]
+        sample_valid = (
+            (sample_x >= 0) & (sample_x < patch_w)
+            & (sample_y >= 0) & (sample_y < patch_h)
+        )
+        sample_x = sample_x.clamp(0, patch_w - 1)
+        sample_y = sample_y.clamp(0, patch_h - 1)
+        frame_index = torch.arange(
+            len(image_paths), device=self.device
+        ).view(-1, *([1] * (sample_x.ndim - 1))).expand_as(sample_x)
+        local_feature = point[frame_index, sample_y, sample_x]
+        local_uv = torch.stack((
+            sample_x.to(torch.float32) / max(patch_w - 1, 1) * 2.0 - 1.0,
+            sample_y.to(torch.float32) / max(patch_h - 1, 1) * 2.0 - 1.0,
+        ), dim=-1)
+
+        confidence = torch.sigmoid(outputs["conf"][0, ..., 0]).float()
+        confidence = F.interpolate(
+            confidence[:, None], size=(patch_h, patch_w),
+            mode="area",
+        )[:, 0]
+        local_confidence = confidence[frame_index, sample_y, sample_x]
+
+        global_size = int(global_grid_size)
+        if global_size <= 0:
+            raise ValueError("global_grid_size must be positive")
+        point_chw = point.permute(0, 3, 1, 2).float()
+        global_feature = F.adaptive_avg_pool2d(
+            point_chw, (global_size, global_size)
+        ).permute(0, 2, 3, 1).reshape(len(image_paths), -1, point.shape[-1])
+        global_confidence = F.adaptive_avg_pool2d(
+            confidence[:, None], (global_size, global_size)
+        )[:, 0].reshape(len(image_paths), -1)
+        axis = torch.linspace(-1.0, 1.0, global_size, device=self.device)
+        global_y, global_x = torch.meshgrid(axis, axis, indexing="ij")
+        global_uv = torch.stack((global_x, global_y), dim=-1).reshape(-1, 2)
+
+        result = {
+            "joint_patch_features": local_feature.float().cpu().numpy().astype(
+                self.feature_dtype
+            ),
+            "joint_patch_uv": local_uv.float().cpu().numpy().astype(np.float16),
+            "joint_patch_confidence": local_confidence.float().cpu().numpy().astype(
+                np.float16
+            ),
+            "joint_patch_valid": sample_valid.cpu().numpy(),
+            "global_features": global_feature.cpu().numpy().astype(self.feature_dtype),
+            "global_uv": global_uv.cpu().numpy().astype(np.float16),
+            "global_confidence": global_confidence.cpu().numpy().astype(np.float16),
+            "source_grid_hw": np.asarray([patch_h, patch_w], dtype=np.int32),
+            "metric_window_features": ret_metric.float().cpu().numpy().astype(
+                self.feature_dtype
+            ),
+            "intrinsics_resized": resized_intrinsics.astype(np.float32),
+            "resized_wh": np.asarray(resized_wh, dtype=np.int32),
+            "horizontal_mirror": np.asarray(False),
+            "coordinate_frame": np.asarray("original_camera"),
+        }
+        del outputs, point, point_tokens, local_feature, global_feature
+        return result
+
     def close(self):
         for hook in self.hooks:
             hook.remove()
@@ -173,3 +297,25 @@ class RamFeatureProvider:
             for value in payload.values()
             if isinstance(value, np.ndarray)
         )
+
+
+class DummyDenseProvider:
+    """Supply geometry metadata so labels/tracks can be decoded before Pi3X."""
+
+    def __call__(self, row):
+        with np.load(row["label_paths"][0], allow_pickle=False) as label:
+            height, width = np.asarray(label["seg"]).shape[:2]
+        time = len(row["frame_indices"])
+        return {
+            "geometry_patch_features": np.zeros((time, 1, 1, 1), np.float32),
+            "geometry_feature_grid_hw": np.asarray([1, 1], np.int32),
+            "metric_window_features": np.zeros((1, 1), np.float32),
+            "intrinsics_resized": np.asarray(row["intrinsics"], np.float32),
+            "resized_wh": np.asarray([width, height], np.int32),
+            "horizontal_mirror": np.asarray(False),
+            "coordinate_frame": np.asarray("original_camera"),
+        }
+
+
+class CompactFeatureProvider(RamFeatureProvider):
+    pass

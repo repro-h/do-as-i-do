@@ -176,3 +176,17 @@ This mode is intended for a sequence smoke or a host with enough RAM. The
 feature footprint grows approximately linearly with frames and clips; use the
 existing disk-cache V15 path for full-dataset training when the complete cache
 does not fit in host RAM.
+
+## V16.1 compact Pi3X candidates
+
+`train_v16_1_compact_pi3x.py` keeps Pi3X frozen and runs it once per unique
+manifest clip. Before transferring anything to host RAM, it gathers a fixed
+local candidate patch around every clean 2D joint and adaptive global context
+tokens, then releases the dense decoder grid. The local attention, visibility
+and missing-token fusion, temporal transformer, and translation heads remain
+trainable. No Pi3X feature file is written to disk.
+
+The clip length still comes from the manifest. `--joint-patch-radius 1` keeps a
+3x3 candidate neighborhood and `--global-grid-size 4` keeps 16 global tokens.
+Set `--max-hands` to the actual dataset maximum because compact memory scales
+linearly with hand slots (DexYCB: 1, this H2O smoke: 2).
