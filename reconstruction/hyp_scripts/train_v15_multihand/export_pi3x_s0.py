@@ -53,7 +53,9 @@ def load_rows(path):
 
 
 def group_streams(rows):
-    streams = defaultdict(lambda: {"frames": {}, "intrinsics": None})
+    streams = defaultdict(
+        lambda: {"frames": {}, "intrinsics": None, "object_label": None}
+    )
     for row in rows:
         stream = streams[row["stream_id"]]
         intrinsics = np.asarray(row["intrinsics"], dtype=np.float32).reshape(3, 3)
@@ -61,6 +63,12 @@ def group_streams(rows):
             stream["intrinsics"] = intrinsics
         elif not np.allclose(stream["intrinsics"], intrinsics):
             raise ValueError(f"Intrinsics change within {row['stream_id']}")
+        if "object_label" in row:
+            label = int(row["object_label"])
+            if stream["object_label"] is None:
+                stream["object_label"] = label
+            elif stream["object_label"] != label:
+                raise ValueError(f"Object label changes within {row['stream_id']}")
         for frame, image, label in zip(
             row["frame_indices"], row["image_paths"], row["label_paths"]
         ):
@@ -155,7 +163,10 @@ def write_inputs(stream_id, stream, stream_out):
     intrinsics.write_text(json.dumps({
         "intrinsics": np.asarray(stream["intrinsics"]).tolist()
     }, indent=2), encoding="utf-8")
-    return frame_map, intrinsics, object_label(frames[0]["image_path"])
+    label = stream["object_label"]
+    if label is None:
+        label = object_label(frames[0]["image_path"])
+    return frame_map, intrinsics, label
 
 
 def main():

@@ -146,3 +146,19 @@ produces starts `0,8,...,56,58` and nine independently inferred overlapping
 windows. Larger windows are supported by the exporter. Training and inference
 must use the same context regime; for windows above 64 frames, also pass a
 sufficient `--max-window-size` to `train.py`.
+
+## H2O two-hand smoke
+
+`build_h2o_sequence_windows.py` adapts one H2O camera sequence to the same
+`[T,H,21,...]` label and window contract. H2O stores left then right hand in
+camera coordinates and meters. The adapter projects both hands with the native
+camera intrinsics and keeps their original image coordinates. It writes a zero
+segmentation only to carry image dimensions; use detector visibility and the
+minimal Pi3X cache, so this placeholder never supplies a hand mask.
+
+```bash
+python build_h2o_sequence_windows.py \
+  --sequence-dir /data2/hyp/data/H2O/subject1_ego/h1/0/cam4 \
+  --out-dir /data2/hyp/test_v15/h2o_subject1_h1_0_cam4 \
+  --split val --window-size 16 --window-stride 8 --overwrite
+```
