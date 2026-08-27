@@ -94,11 +94,16 @@ class DexYCBMultiHandWindowDataset(Dataset):
         max_anchor_frames=8,
         near_missing_weight=0.5,
         far_missing_weight=0.2,
+        dense_provider=None,
     ):
         self.rows = load_jsonl(windows)
         if not self.rows:
             raise RuntimeError(f"No windows in {windows}")
-        self.pi3x_root = Path(pi3x_root).expanduser().resolve()
+        self.pi3x_root = (
+            None if pi3x_root is None
+            else Path(pi3x_root).expanduser().resolve()
+        )
+        self.dense_provider = dense_provider
         self.max_hands = int(max_hands)
         self.training = bool(training)
         self.noise = noise if noise is not None else QueryNoise()
@@ -292,11 +297,19 @@ class DexYCBMultiHandWindowDataset(Dataset):
             supervision_weight[far, hand] = self.far_missing_weight
         supervision_weight *= target_valid & hand_slot_valid
 
-        dense_file = dense_path(row, self.pi3x_root)
-        with np.load(str(dense_file), allow_pickle=False) as dense:
+        dense_file = None
+        if self.dense_provider is None:
+            dense_file = dense_path(row, self.pi3x_root)
+            dense_context = np.load(str(dense_file), allow_pickle=False)
+        else:
+            dense_context = self.dense_provider(row)
+        try:
+            dense = dense_context
             mirrored = bool(np.asarray(dense.get("horizontal_mirror", False)).item())
             if self.require_original_camera and mirrored:
-                raise ValueError(f"V15 requires original-camera Pi3X cache: {dense_file}")
+                raise ValueError(
+                    f"V15 requires original-camera Pi3X features: {dense_file or 'RAM'}"
+                )
             point_features = finite_float(dense["geometry_patch_features"])
             grid_hw = tuple(int(x) for x in np.asarray(dense["geometry_feature_grid_hw"]).reshape(2))
             resized_wh = np.asarray(dense["resized_wh"], dtype=np.float32).reshape(2)
@@ -306,6 +319,9 @@ class DexYCBMultiHandWindowDataset(Dataset):
                 raise KeyError(f"{dense_file} lacks metric_window_features")
             metric = finite_float(metric.reshape(-1, metric.shape[-1]).mean(axis=0))
             confidence = np.asarray(dense.get("confidence", []), dtype=np.float32)
+        finally:
+            if self.dense_provider is None:
+                dense_context.close()
 
         if point_features.shape[:3] != (time, grid_hw[0], grid_hw[1]):
             raise ValueError(f"Pi3X/window shape mismatch: {dense_file}")

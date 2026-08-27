@@ -162,3 +162,17 @@ python build_h2o_sequence_windows.py \
   --out-dir /data2/hyp/test_v15/h2o_subject1_h1_0_cam4 \
   --split val --window-size 16 --window-stride 8 --overwrite
 ```
+
+## V16 online Pi3X clips
+
+`train_v16_online_pi3x.py` is independent of the disk-cache training path. It
+runs frozen Pi3X exactly once for every unique manifest clip, keeps the decoder
+features in host RAM, releases Pi3X GPU memory, and then trains the trajectory
+head for all epochs. Existing Pi3X exports are neither read nor modified.
+
+Clip length is controlled by the manifest builder. For example, use
+`--window-size 100 --window-stride 50` and set `--max-window-size 128` in V16.
+This mode is intended for a sequence smoke or a host with enough RAM. The
+feature footprint grows approximately linearly with frames and clips; use the
+existing disk-cache V15 path for full-dataset training when the complete cache
+does not fit in host RAM.
