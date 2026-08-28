@@ -4,6 +4,7 @@
 import argparse
 import json
 import pickle
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -215,6 +216,12 @@ def main():
     summary_path = out_dir / "summary.json"
     if not args.overwrite and (manifest_path.exists() or summary_path.exists()):
         raise FileExistsError(f"Output exists; pass --overwrite: {out_dir}")
+    if args.overwrite:
+        for generated_dir in (out_dir / "labels", out_dir / "overlay"):
+            if generated_dir.exists():
+                shutil.rmtree(generated_dir)
+        manifest_path.unlink(missing_ok=True)
+        summary_path.unlink(missing_ok=True)
     if not sequence_dir.is_dir():
         raise FileNotFoundError(sequence_dir)
     if not annotation_path.is_file():
