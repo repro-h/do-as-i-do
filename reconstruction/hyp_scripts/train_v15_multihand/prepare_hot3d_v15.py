@@ -23,6 +23,14 @@ SMPLX_MANO_TO_WRIST_FIRST = np.asarray(
     dtype=np.int64,
 )
 
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (0, 9), (9, 10), (10, 11), (11, 12),
+    (0, 13), (13, 14), (14, 15), (15, 16),
+    (0, 17), (17, 18), (18, 19), (19, 20),
+]
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -47,6 +55,7 @@ def parse_args():
     parser.add_argument("--window-stride", type=int, default=8)
     parser.add_argument("--min-valid-frames", type=int, default=1)
     parser.add_argument("--jpeg-quality", type=int, default=95)
+    parser.add_argument("--overlay-count", type=int, default=12)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -113,6 +122,49 @@ def project_points(calibration, points):
         if projected is not None:
             uv[index] = np.asarray(projected, dtype=np.float32)
     return uv
+
+
+def write_overlay(image_path, label_path, output_path):
+    from PIL import Image, ImageDraw
+
+    image = Image.open(image_path).convert("RGB")
+    draw = ImageDraw.Draw(image)
+    width, height = image.size
+    with np.load(label_path, allow_pickle=False) as data:
+        joints = np.asarray(data["joint_2d"], dtype=np.float32)
+        sides = np.asarray(data["hand_sides"]).reshape(-1)
+    colors = {"left": (0, 220, 255), "right": (255, 70, 180)}
+    for hand, uv in enumerate(joints):
+        side = str(sides[hand]) if hand < len(sides) else "unknown"
+        color = colors.get(side, (255, 220, 0))
+        valid = (
+            np.isfinite(uv).all(axis=-1)
+            & (uv[:, 0] >= 0) & (uv[:, 0] < width)
+            & (uv[:, 1] >= 0) & (uv[:, 1] < height)
+        )
+        for first, second in HAND_CONNECTIONS:
+            if valid[first] and valid[second]:
+                draw.line(
+                    [tuple(uv[first]), tuple(uv[second])],
+                    fill=color,
+                    width=3,
+                )
+        for joint, point in enumerate(uv):
+            if not valid[joint]:
+                continue
+            radius = 5 if joint == 0 else 3
+            x, y = float(point[0]), float(point[1])
+            draw.ellipse(
+                (x - radius, y - radius, x + radius, y + radius),
+                fill=color,
+                outline=(0, 0, 0),
+            )
+        visible = uv[valid]
+        if len(visible):
+            x, y = visible.min(axis=0)
+            draw.text((float(x), max(0.0, float(y) - 14)), side, fill=color)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output_path, quality=95)
 
 
 def metadata_has_gt(metadata):
@@ -202,6 +254,11 @@ def main():
     records = []
     side_counts = {"left": 0, "right": 0}
     skipped_images = 0
+    hand_delta_ms = []
+    device_delta_ms = []
+    joint_count = 0
+    joint_in_frame_count = 0
+    wrist_depths_m = []
     for frame_index, timestamp_ns in enumerate(timestamps):
         raw_image = device.get_image(timestamp_ns, stream_id)
         if raw_image is None:
@@ -232,8 +289,10 @@ def main():
         device_pose_dt_ns = None
         if device_pose is not None:
             device_pose_dt_ns = int(device_pose.time_delta_ns)
+            device_delta_ms.append(abs(device_pose_dt_ns) / 1e6)
         if hand_poses is not None:
             hand_pose_dt_ns = int(hand_poses.time_delta_ns)
+            hand_delta_ms.append(abs(hand_pose_dt_ns) / 1e6)
         if device_pose is not None and hand_poses is not None:
             T_world_camera = device_pose.pose3d.T_world_device @ T_device_camera
             T_camera_world = T_world_camera.inverse()
@@ -254,7 +313,16 @@ def main():
                     )
                 landmarks_world = landmarks_world[SMPLX_MANO_TO_WRIST_FIRST]
                 landmarks_camera = transform_points(T_camera_world, landmarks_world)
+                if np.isfinite(landmarks_camera[0]).all():
+                    wrist_depths_m.append(float(landmarks_camera[0, 2]))
                 uv = project_points(linear_calibration, landmarks_camera)
+                finite = np.isfinite(uv).all(axis=-1)
+                joint_count += int(finite.sum())
+                joint_in_frame_count += int((
+                    finite
+                    & (uv[:, 0] >= 0) & (uv[:, 0] < width)
+                    & (uv[:, 1] >= 0) & (uv[:, 1] < height)
+                ).sum())
                 side = pose.handedness_label()
                 joint_2d.append(uv)
                 joint_3d.append(landmarks_camera)
@@ -319,6 +387,23 @@ def main():
     with manifest_path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+    overlay_records = [record for record in records if record["valid_hands"] > 0]
+    if args.overlay_count > 0 and overlay_records:
+        indices = np.linspace(
+            0, len(overlay_records) - 1,
+            min(args.overlay_count, len(overlay_records)),
+            dtype=np.int64,
+        )
+        for output_index, record_index in enumerate(np.unique(indices)):
+            record = overlay_records[int(record_index)]
+            write_overlay(
+                record["image_path"],
+                record["label_path"],
+                out_dir / "overlay" / f"{output_index:03d}_frame_{record['frame_index']:06d}.jpg",
+            )
+    hand_delta = np.asarray(hand_delta_ms, dtype=np.float64)
+    device_delta = np.asarray(device_delta_ms, dtype=np.float64)
+    wrist_depth = np.asarray(wrist_depths_m, dtype=np.float64)
     summary = {
         "schema_version": "hot3d_aria_v15_export_v1",
         "sequence": sequence_dir.name,
@@ -333,6 +418,25 @@ def main():
         "skipped_images": skipped_images,
         "frames_with_hands": sum(record["valid_hands"] > 0 for record in records),
         "hand_instances": side_counts,
+        "joint_in_frame_fraction": (
+            float(joint_in_frame_count / joint_count) if joint_count else 0.0
+        ),
+        "wrist_depth_m": {
+            "median": float(np.median(wrist_depth)) if len(wrist_depth) else None,
+            "p10": float(np.percentile(wrist_depth, 10)) if len(wrist_depth) else None,
+            "p90": float(np.percentile(wrist_depth, 90)) if len(wrist_depth) else None,
+        },
+        "hand_pose_delta_ms": {
+            "median": float(np.median(hand_delta)) if len(hand_delta) else None,
+            "p90": float(np.percentile(hand_delta, 90)) if len(hand_delta) else None,
+            "max": float(hand_delta.max()) if len(hand_delta) else None,
+        },
+        "device_pose_delta_ms": {
+            "median": float(np.median(device_delta)) if len(device_delta) else None,
+            "p90": float(np.percentile(device_delta, 90)) if len(device_delta) else None,
+            "max": float(device_delta.max()) if len(device_delta) else None,
+        },
+        "overlay_count": len(list((out_dir / "overlay").glob("*.jpg"))),
         "frame_stride": args.frame_stride,
         "window_size": args.window_size,
         "window_stride": args.window_stride,
