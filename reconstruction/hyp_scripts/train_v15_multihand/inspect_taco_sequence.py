@@ -15,6 +15,7 @@ def parse_args():
     parser.add_argument("--taco-root", required=True)
     parser.add_argument("--triplet")
     parser.add_argument("--sequence")
+    parser.add_argument("--decode-all", action="store_true")
     parser.add_argument("--out-json")
     return parser.parse_args()
 
@@ -76,7 +77,7 @@ def choose_video(root, triplet, sequence):
     raise RuntimeError("No complete egocentric TACO sequence found")
 
 
-def video_summary(path):
+def video_summary(path, decode_all=False):
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
         raise RuntimeError(f"Could not open {path}")
@@ -87,8 +88,14 @@ def video_summary(path):
         "height": int(round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))),
     }
     ok, frame = capture.read()
+    if decode_all:
+        decoded_frames = int(ok)
+        while ok:
+            ok, _ = capture.read()
+            decoded_frames += int(ok)
+        result["decoded_frames"] = decoded_frames
     capture.release()
-    result["first_frame_readable"] = bool(ok and frame is not None)
+    result["first_frame_readable"] = frame is not None
     return result
 
 
@@ -108,7 +115,7 @@ def main():
         "triplet": triplet,
         "sequence": sequence,
         "video_path": str(video),
-        "video": video_summary(video),
+        "video": video_summary(video, args.decode_all),
         "intrinsics": array_summary(intrinsics),
         "intrinsics_value": np.asarray(intrinsics).tolist(),
         "extrinsics": array_summary(extrinsics),
@@ -118,7 +125,9 @@ def main():
         "right_shape": pickle_summary(hand_root / "right_hand_shape.pkl"),
     }
     counts = {
-        "video": report["video"]["frames"],
+        "video": report["video"].get(
+            "decoded_frames", report["video"]["frames"]
+        ),
         "extrinsics": int(extrinsics.shape[0]),
         "left_pose": int(report["left_pose"].get("count", 0)),
         "right_pose": int(report["right_pose"].get("count", 0)),

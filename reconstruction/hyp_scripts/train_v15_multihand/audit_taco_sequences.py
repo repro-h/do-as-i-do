@@ -8,6 +8,7 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 
@@ -51,6 +52,15 @@ def frame_count(path):
         return 0
 
 
+def video_frame_count(path):
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        return 0
+    count = int(round(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+    capture.release()
+    return count
+
+
 def discover(root, official):
     rows = []
     video_root = root / "Egocentric_RGB_Videos"
@@ -66,15 +76,24 @@ def discover(root, official):
             hand_root / "left_hand.pkl", hand_root / "left_hand_shape.pkl",
             hand_root / "right_hand.pkl", hand_root / "right_hand_shape.pkl",
         ]
+        annotation_frames = frame_count(extrinsics)
+        video_frames = video_frame_count(video)
+        files_complete = all(path.is_file() for path in required)
+        frame_counts_match = (
+            annotation_frames > 0 and video_frames == annotation_frames
+        )
         rows.append({
             "sequence": sequence,
             "triplet": triplet,
             "official_split": official.get(sequence, "unknown"),
-            "frames": frame_count(extrinsics),
+            "frames": video_frames if frame_counts_match else 0,
+            "video_frames": video_frames,
+            "annotation_frames": annotation_frames,
+            "frame_counts_match": frame_counts_match,
             "video": str(video),
             "hand_root": str(hand_root),
             "camera_root": str(camera_root),
-            "complete": all(path.is_file() for path in required),
+            "complete": files_complete and frame_counts_match,
         })
     return rows
 
@@ -166,6 +185,9 @@ def main():
         "discovered_ego_sequences": len(rows),
         "complete_ego_sequences": len(complete),
         "unknown_split_sequences": sum(row["official_split"] == "unknown" for row in rows),
+        "frame_mismatch_sequences": sum(
+            not row["frame_counts_match"] for row in rows
+        ),
         "official_split_counts": split_counts,
         "selection": {
             "train": {"sequences": len(train), "frames": sum(row["frames"] for row in train)},
