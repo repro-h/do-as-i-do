@@ -103,7 +103,7 @@ def create_mano_models(model_folder):
         "model_path": str(model_folder),
         "model_type": "mano",
         "use_pca": False,
-        "flat_hand_mean": False,
+        "flat_hand_mean": True,
         "num_betas": 10,
         "batch_size": 1,
     }
@@ -120,7 +120,6 @@ def mano_joints_world(model, pose_quaternion, betas, translation):
             global_orient=rotation[:, 0],
             hand_pose=rotation[:, 1:].reshape(1, 45),
             betas=tensor(betas).reshape(1, 10),
-            transl=tensor(translation).reshape(1, 3),
             return_verts=True,
         )
     joints = output.joints[0].detach().cpu().numpy().astype(np.float32)
@@ -130,7 +129,11 @@ def mano_joints_world(model, pose_quaternion, betas, translation):
         joints = np.concatenate([joints, fingertips], axis=0)
     if joints.shape[0] < 21:
         raise ValueError(f"MANO returned {joints.shape}; expected at least 21 joints")
-    return joints[:21][SMPLX_MANO_TO_WRIST_FIRST]
+    # OakInk2 uses manotorch with center_idx=0, then adds __tsl after the MANO
+    # forward pass. Reproduce that convention with smplx explicitly.
+    translation = tensor(translation).reshape(3).numpy()
+    joints = joints[:21] - joints[0:1] + translation[None]
+    return joints[SMPLX_MANO_TO_WRIST_FIRST]
 
 
 def transform_points(transform, points):
