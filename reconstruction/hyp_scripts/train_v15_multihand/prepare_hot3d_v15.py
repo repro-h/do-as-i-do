@@ -193,6 +193,25 @@ def main():
     code_root = hot3d_python_root(args.hot3d_code_root)
     sys.path.insert(0, str(code_root))
 
+    # HOT3D imports its Quest provider eagerly, even for Aria sequences.  The
+    # Quest-only pyvrs2 package is not published for every Python environment,
+    # so provide an import placeholder that fails only if Quest is instantiated.
+    try:
+        import pyvrs2  # noqa: F401
+    except ImportError:
+        import types
+
+        class _UnavailableQuestReader:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError(
+                    "pyvrs2 is required for Quest sequences; this exporter "
+                    "currently supports HOT3D Aria recording.vrs sequences"
+                )
+
+        pyvrs2_stub = types.ModuleType("pyvrs2")
+        pyvrs2_stub.SyncVRSReader = _UnavailableQuestReader
+        sys.modules["pyvrs2"] = pyvrs2_stub
+
     from dataset_api import Hot3dDataProvider
     from data_loaders.mano_layer import MANOHandModel
     from projectaria_tools.core.calibration import (
