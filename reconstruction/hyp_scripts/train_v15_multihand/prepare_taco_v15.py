@@ -122,7 +122,12 @@ def mano_joints_world(backend, model, side, pose, betas, translation):
     betas = torch.from_numpy(as_numpy(betas).reshape(1, 10))
     if backend == "manopth":
         with torch.no_grad():
-            _, joints = model(pose, betas)
+            result = model(pose, betas)
+        if not isinstance(result, (tuple, list)) or len(result) < 2:
+            raise TypeError(
+                "TACO ManoLayer must return at least (vertices, joints)"
+            )
+        joints = result[1]
         joints = joints[0].detach().cpu().numpy().astype(np.float32) / 1000.0
         joints += as_numpy(translation).reshape(1, 3)
         return joints
