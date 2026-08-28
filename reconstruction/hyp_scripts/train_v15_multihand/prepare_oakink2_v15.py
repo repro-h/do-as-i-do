@@ -305,6 +305,7 @@ def main():
         label_path = label_dir / f"{output_index:06d}.npz"
         np.savez_compressed(
             label_path,
+            seg=np.zeros((height, width), dtype=np.uint8),
             joint_2d=np.asarray(joint_2d, dtype=np.float32),
             joint_3d=np.asarray(joint_3d, dtype=np.float32),
             joint_in_frame=np.asarray(joint_in_frame, dtype=bool),

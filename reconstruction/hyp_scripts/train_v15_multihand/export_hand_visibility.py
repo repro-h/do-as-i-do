@@ -89,9 +89,24 @@ def side_code(value):
 def label_targets(label_path, side_metadata, max_hands):
     with np.load(label_path, allow_pickle=False) as data:
         target = np.asarray(data["joint_2d"], dtype=np.float32)
+        joint_in_frame = (
+            np.asarray(data["joint_in_frame"], dtype=bool)
+            if "joint_in_frame" in data.files else None
+        )
     if target.ndim == 2:
         target = target[None]
     target = target[:max_hands]
+    if joint_in_frame is not None:
+        if joint_in_frame.ndim == 1:
+            joint_in_frame = joint_in_frame[None]
+        joint_in_frame = joint_in_frame[:len(target)]
+        if joint_in_frame.shape != target.shape[:-1]:
+            raise ValueError(
+                f"joint_in_frame shape {joint_in_frame.shape} does not match "
+                f"joint_2d shape {target.shape}"
+            )
+        target = target.copy()
+        target[~joint_in_frame] = np.nan
     valid = np.isfinite(target).all(axis=-1).any(axis=-1)
     values = side_metadata if isinstance(side_metadata, list) else [side_metadata]
     sides = np.full(len(target), -1, dtype=np.int8)
