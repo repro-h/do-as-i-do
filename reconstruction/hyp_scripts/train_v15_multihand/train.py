@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from tqdm import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -42,6 +42,10 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--train-windows-per-dataset", type=int, default=0,
+        help="Per-epoch dataset budget; zero keeps ordinary shuffled sampling",
+    )
     parser.add_argument("--max-hands", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -88,6 +92,45 @@ def parse_args():
         default="online",
     )
     return parser.parse_args()
+
+
+def row_dataset(row):
+    if row.get("dataset"):
+        return str(row["dataset"])
+    schema = str(row.get("schema_version", "unknown"))
+    return schema.split("_", 1)[0]
+
+
+class DatasetStreamBalancedSampler(Sampler):
+    """Draw an equal per-dataset budget while weighting streams equally."""
+
+    def __init__(self, rows, samples_per_dataset, seed=0):
+        self.samples_per_dataset = int(samples_per_dataset)
+        if self.samples_per_dataset <= 0:
+            raise ValueError("samples_per_dataset must be positive")
+        grouped = defaultdict(lambda: defaultdict(list))
+        for index, row in enumerate(rows):
+            grouped[row_dataset(row)][str(row["stream_id"])].append(index)
+        self.grouped = {
+            dataset: dict(streams) for dataset, streams in grouped.items()
+        }
+        self.seed = int(seed)
+        self.iteration = 0
+
+    def __len__(self):
+        return self.samples_per_dataset * len(self.grouped)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.iteration)
+        self.iteration += 1
+        selected = []
+        for streams in self.grouped.values():
+            names = sorted(streams)
+            for _ in range(self.samples_per_dataset):
+                stream = rng.choice(names)
+                selected.append(rng.choice(streams[stream]))
+        rng.shuffle(selected)
+        return iter(selected)
 
 
 def move(batch, device):
@@ -434,6 +477,8 @@ def main():
         ),
         "translation_parameterization": args.translation_parameterization,
         "max_window_size": args.max_window_size,
+        "train_datasets": sorted({row_dataset(row) for row in train_data.rows}),
+        "train_windows_per_dataset": args.train_windows_per_dataset,
     }
     print(json.dumps(audit, indent=2))
     if args.audit_only:
@@ -457,8 +502,15 @@ def main():
         model.load_state_dict(checkpoint["model"])
     if args.data_parallel and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
+    train_sampler = (
+        DatasetStreamBalancedSampler(
+            train_data.rows, args.train_windows_per_dataset, args.seed
+        )
+        if args.train_windows_per_dataset > 0 else None
+    )
     train_loader = DataLoader(
-        train_data, batch_size=args.batch_size, shuffle=True,
+        train_data, batch_size=args.batch_size,
+        shuffle=train_sampler is None, sampler=train_sampler,
         num_workers=args.num_workers, pin_memory=True, drop_last=True,
     )
     val_loader = DataLoader(

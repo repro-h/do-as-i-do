@@ -117,11 +117,20 @@ def main():
             )
         flags, uv, xyz = read_hands(poses[frame], intrinsics)
         side_valid += flags.astype(np.int64)
+        joint_in_frame = (
+            flags[:, None]
+            & np.isfinite(uv).all(axis=-1)
+            & (uv[..., 0] >= 0) & (uv[..., 0] < width)
+            & (uv[..., 1] >= 0) & (uv[..., 1] < height)
+        )
+        observation_valid = joint_in_frame.any(axis=-1)
         label = labels_dir / f"labels_{frame:06d}.npz"
         np.savez_compressed(
             label,
             joint_2d=uv,
             joint_3d=xyz,
+            joint_in_frame=joint_in_frame,
+            observation_valid=observation_valid,
             hand_sides=SIDES,
             is_right=np.asarray([False, True]),
             hand_valid=flags,
