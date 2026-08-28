@@ -3,6 +3,7 @@ set -euo pipefail
 
 wait_pid=""
 wait_status=""
+wait_status_key="failed"
 gpu=""
 log=""
 status=""
@@ -12,6 +13,7 @@ usage() {
   cat <<'EOF'
 Usage: wait_for_pid_then_run.sh \
   --wait-pid PID --wait-status JSON --gpu ID \
+  [--wait-status-key KEY] \
   --log FILE --status-json FILE [--interval SEC] -- command [args...]
 
 Waits for an existing process to exit, verifies that its exporter status has
@@ -24,6 +26,7 @@ while (($#)); do
   case "$1" in
     --wait-pid) wait_pid="$2"; shift 2 ;;
     --wait-status) wait_status="$2"; shift 2 ;;
+    --wait-status-key) wait_status_key="$2"; shift 2 ;;
     --gpu) gpu="$2"; shift 2 ;;
     --log) log="$2"; shift 2 ;;
     --status-json) status="$2"; shift 2 ;;
@@ -55,7 +58,9 @@ if [[ ! -f "$wait_status" ]]; then
   echo "Previous process exited without status: $wait_status" >&2
   exit 1
 fi
-if ! grep -Eq '"failed"[[:space:]]*:[[:space:]]*0([,}]|$)' "$wait_status"; then
+if ! grep -Eq \
+  "\"${wait_status_key}\"[[:space:]]*:[[:space:]]*0([,}]|$)" \
+  "$wait_status"; then
   echo "Previous shard did not complete cleanly: $wait_status" >&2
   cat "$wait_status" >&2
   exit 1
