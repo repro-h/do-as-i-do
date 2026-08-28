@@ -62,6 +62,11 @@ def parse_args():
     parser.add_argument("--window-stride", type=int, default=8)
     parser.add_argument("--min-valid-frames", type=int, default=1)
     parser.add_argument("--overlay-count", type=int, default=12)
+    parser.add_argument(
+        "--overlay-require",
+        choices=("any", "both", "left", "right"),
+        default="any",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -316,6 +321,8 @@ def main():
             "image_path": str(image_path),
             "label_path": str(label_path),
             "valid_hands": int(sum(observation_valid)),
+            "left_observed": bool(observation_valid[0]),
+            "right_observed": bool(observation_valid[1]),
         })
 
     stream_id = f"{sequence_dir.name}__oakink2_{args.camera}"
@@ -347,7 +354,17 @@ def main():
         for row in rows:
             handle.write(json.dumps(row, separators=(",", ":")) + "\n")
 
-    observable_records = [record for record in records if record["valid_hands"] > 0]
+    if args.overlay_require == "both":
+        observable_records = [
+            record for record in records
+            if record["left_observed"] and record["right_observed"]
+        ]
+    elif args.overlay_require == "left":
+        observable_records = [record for record in records if record["left_observed"]]
+    elif args.overlay_require == "right":
+        observable_records = [record for record in records if record["right_observed"]]
+    else:
+        observable_records = [record for record in records if record["valid_hands"] > 0]
     if args.overlay_count > 0 and observable_records:
         indices = np.linspace(
             0,
@@ -391,6 +408,8 @@ def main():
         "wrist_depth_m": distribution(wrist_depths),
         "windows": len(rows),
         "overlay_count": len(list((out_dir / "overlay").glob("*.jpg"))),
+        "overlay_require": args.overlay_require,
+        "overlay_candidate_frames": len(observable_records),
         "frame_stride": args.frame_stride,
         "start_index": args.start_index,
         "window_size": args.window_size,
