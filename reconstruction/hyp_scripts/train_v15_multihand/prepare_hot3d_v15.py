@@ -15,6 +15,19 @@ from pathlib import Path
 import numpy as np
 
 
+# Legacy MANO pickle files import chumpy while unpickling. Chumpy still expects
+# scalar aliases removed by NumPy 2, so restore only those compatibility names.
+for _name, _value in {
+    "float_": np.float64,
+    "complex_": np.complex128,
+    "int_": np.int64,
+    "object_": np.dtype("O").type,
+    "str_": np.dtype("U").type,
+}.items():
+    if not hasattr(np, _name):
+        setattr(np, _name, _value)
+
+
 # smplx MANO joints before HOT3D's display-oriented joint mapper:
 # wrist, index/middle/pinky/ring/thumb x3, then thumb/index/... fingertips.
 SMPLX_MANO_TO_WRIST_FIRST = np.asarray(
