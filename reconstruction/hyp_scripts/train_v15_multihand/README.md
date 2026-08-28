@@ -190,3 +190,26 @@ The clip length still comes from the manifest. `--joint-patch-radius 1` keeps a
 3x3 candidate neighborhood and `--global-grid-size 4` keeps 16 global tokens.
 Set `--max-hands` to the actual dataset maximum because compact memory scales
 linearly with hand slots (DexYCB: 1, this H2O smoke: 2).
+
+## HOT3D Aria adapter
+
+`prepare_hot3d_v15.py` uses the official HOT3D `Hot3dDataProvider` and Project
+Aria VRS reader. It decodes RGB stream `214-1`, rectifies it to a fixed linear
+camera model, transforms MANO GT landmarks from world to RGB-camera
+coordinates, and writes the existing V15 image/label/window contract. Left
+hands remain in original camera coordinates. MANO landmarks are explicitly
+reordered to the wrist-first 21-joint convention.
+
+```bash
+python prepare_hot3d_v15.py \
+  --sequence-dir /data2/hyp/data/HOT3D/data/P0015_3f46732d \
+  --hot3d-code-root /data2/hyp/data/tools/hot3d \
+  --mano-model-folder /home/mengxiangting/nas/mengxt/Projects/Pi3_WiLoR_Hand/mano_data/mano \
+  --out-dir /data2/hyp/data/HOT3D/processed_v15/P0015_3f46732d \
+  --split train --stream-id 214-1 --frame-stride 3 \
+  --window-size 16 --window-stride 8 --overwrite
+```
+
+The generated labels contain a zero segmentation placeholder. Build stable
+slots with `export_multihand_tracks.py` and use detector visibility; do not use
+the placeholder as mask-derived visibility.
