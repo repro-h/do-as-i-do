@@ -30,6 +30,9 @@ SMPLX_MANO_TO_WRIST_FIRST = np.asarray(
     dtype=np.int64,
 )
 
+# MANO v1.2 fingertip vertices in thumb/index/middle/ring/pinky order.
+MANO_FINGERTIP_VERTICES = np.asarray([744, 320, 443, 555, 672], dtype=np.int64)
+
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
     (0, 5), (5, 6), (6, 7), (7, 8),
@@ -121,6 +124,10 @@ def mano_joints_world(model, pose_quaternion, betas, translation):
             return_verts=True,
         )
     joints = output.joints[0].detach().cpu().numpy().astype(np.float32)
+    if joints.shape[0] == 16:
+        vertices = output.vertices[0].detach().cpu().numpy().astype(np.float32)
+        fingertips = vertices[MANO_FINGERTIP_VERTICES]
+        joints = np.concatenate([joints, fingertips], axis=0)
     if joints.shape[0] < 21:
         raise ValueError(f"MANO returned {joints.shape}; expected at least 21 joints")
     return joints[:21][SMPLX_MANO_TO_WRIST_FIRST]
