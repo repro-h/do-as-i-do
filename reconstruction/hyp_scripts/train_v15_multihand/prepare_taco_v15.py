@@ -5,6 +5,7 @@ import argparse
 import json
 import pickle
 import shutil
+import sys
 from pathlib import Path
 
 import cv2
@@ -29,9 +30,6 @@ SMPLX_MANO_TO_WRIST_FIRST = np.asarray(
      10, 11, 12, 19, 7, 8, 9, 20],
     dtype=np.int64,
 )
-MANO_FINGERTIP_VERTICES = np.asarray(
-    [744, 320, 443, 555, 672], dtype=np.int64
-)
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
     (0, 5), (5, 6), (6, 7), (7, 8),
@@ -47,6 +45,7 @@ def parse_args():
     parser.add_argument("--triplet", required=True)
     parser.add_argument("--sequence", required=True)
     parser.add_argument("--mano-model-folder", required=True)
+    parser.add_argument("--taco-code-root")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--split", default="train")
     parser.add_argument("--max-frames", type=int, default=0)
@@ -75,13 +74,35 @@ def load_pickle(path):
         return pickle.load(handle)
 
 
-def create_mano_models(model_folder):
-    import smplx
-
+def create_mano_models(model_folder, taco_code_root=None):
     model_folder = Path(model_folder).expanduser().resolve()
     for filename in ("MANO_LEFT.pkl", "MANO_RIGHT.pkl"):
         if not (model_folder / filename).is_file():
             raise FileNotFoundError(model_folder / filename)
+    if taco_code_root:
+        dataset_utils = (
+            Path(taco_code_root).expanduser().resolve() / "dataset_utils"
+        )
+        if not dataset_utils.is_dir():
+            raise FileNotFoundError(dataset_utils)
+        sys.path.insert(0, str(dataset_utils / "manopth"))
+        sys.path.insert(0, str(dataset_utils))
+        from manopth.manopth.manolayer import ManoLayer
+
+        return "manopth", {
+            side: ManoLayer(
+                mano_root=str(model_folder),
+                use_pca=False,
+                ncomps=45,
+                side=side,
+                center_idx=0,
+                flat_hand_mean=True,
+            ).eval()
+            for side in ("left", "right")
+        }
+
+    import smplx
+
     common = {
         "model_path": str(model_folder),
         "model_type": "mano",
@@ -90,15 +111,22 @@ def create_mano_models(model_folder):
         "num_betas": 10,
         "batch_size": 1,
     }
-    return {
+    return "smplx", {
         "left": smplx.create(is_rhand=False, **common).eval(),
         "right": smplx.create(is_rhand=True, **common).eval(),
     }
 
 
-def mano_joints_world(model, pose, betas, translation):
+def mano_joints_world(backend, model, side, pose, betas, translation):
     pose = torch.from_numpy(as_numpy(pose).reshape(1, 48))
     betas = torch.from_numpy(as_numpy(betas).reshape(1, 10))
+    if backend == "manopth":
+        with torch.no_grad():
+            _, joints = model(pose, betas)
+        joints = joints[0].detach().cpu().numpy().astype(np.float32) / 1000.0
+        joints += as_numpy(translation).reshape(1, 3)
+        return joints
+
     with torch.no_grad():
         output = model(
             global_orient=pose[:, :3],
@@ -109,9 +137,11 @@ def mano_joints_world(model, pose, betas, translation):
     joints = output.joints[0].detach().cpu().numpy().astype(np.float32)
     if joints.shape[0] == 16:
         vertices = output.vertices[0].detach().cpu().numpy().astype(np.float32)
-        joints = np.concatenate(
-            [joints, vertices[MANO_FINGERTIP_VERTICES]], axis=0
-        )
+        tip_ids = {
+            "right": np.asarray([745, 317, 444, 556, 673]),
+            "left": np.asarray([745, 317, 445, 556, 673]),
+        }[side]
+        joints = np.concatenate([joints, vertices[tip_ids]], axis=0)
     if joints.shape[0] < 21:
         raise ValueError(f"MANO returned {joints.shape}; expected 21 joints")
     # TACO's official manopth loader uses center_idx=0 and adds hand_trans.
@@ -236,7 +266,9 @@ def main():
     if len(set(counts.values())) != 1:
         raise RuntimeError(f"TACO annotation frame mismatch: {counts}")
 
-    models = create_mano_models(args.mano_model_folder)
+    mano_backend, models = create_mano_models(
+        args.mano_model_folder, args.taco_code_root
+    )
     for path in generated[:2]:
         path.mkdir(parents=True, exist_ok=True)
     capture = cv2.VideoCapture(str(video_path))
@@ -273,7 +305,8 @@ def main():
         for side in ("left", "right"):
             item = poses[side][pose_keys[side][decoded]]
             joints_world = mano_joints_world(
-                models[side], item["hand_pose"], betas[side], item["hand_trans"]
+                mano_backend, models[side], side,
+                item["hand_pose"], betas[side], item["hand_trans"]
             )
             joints_camera = transform_points(extrinsics[decoded], joints_world)
             uv = project_points(intrinsics, joints_camera)
@@ -393,6 +426,7 @@ def main():
         "extrinsics_convention": "world_to_camera_T_c_w",
         "joint_order": "wrist_thumb_index_middle_ring_pinky_21",
         "horizontal_mirror": False,
+        "mano_backend": mano_backend,
         "annotation_frames": annotation_count,
         "exported_frames": len(records),
         "observed_hand_instances": observed_hands,
