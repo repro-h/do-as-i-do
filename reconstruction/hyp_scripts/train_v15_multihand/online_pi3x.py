@@ -35,6 +35,46 @@ def row_key(row):
     )
 
 
+def row_intrinsics(row):
+    """Return one camera matrix per frame from a row or its label files."""
+    time = len(row["frame_indices"])
+    if "intrinsics" in row:
+        intrinsics = np.asarray(row["intrinsics"], dtype=np.float32)
+        if intrinsics.shape == (3, 3):
+            return np.broadcast_to(intrinsics[None], (time, 3, 3)).copy()
+        if intrinsics.shape == (time, 3, 3):
+            return intrinsics.copy()
+        raise ValueError(
+            f"Unexpected manifest intrinsics shape {intrinsics.shape} for "
+            f"{row_key(row)}"
+        )
+
+    matrices = []
+    for label_path in row["label_paths"]:
+        path = Path(label_path).expanduser().resolve()
+        with np.load(str(path), allow_pickle=False) as data:
+            if "intrinsics" not in data.files:
+                raise KeyError(
+                    f"Neither manifest nor label provides intrinsics: {label_path}"
+                )
+            matrix = np.asarray(data["intrinsics"], dtype=np.float32).reshape(3, 3)
+        matrices.append(matrix)
+    if len(matrices) != time:
+        raise ValueError(
+            f"Loaded {len(matrices)} intrinsics for {time} frames in {row_key(row)}"
+        )
+    return np.stack(matrices)
+
+
+def resized_row_intrinsics(row, original_wh, resized_wh):
+    from pi3_wilor_hand.geometry import resize_intrinsics
+
+    return np.stack([
+        resize_intrinsics(matrix, original_wh, resized_wh)
+        for matrix in row_intrinsics(row)
+    ]).astype(np.float32)
+
+
 def compact_cache_path(root, row):
     return (
         Path(root).expanduser().resolve()
@@ -161,7 +201,6 @@ class Pi3XWindowMaterializer:
         self.captured["ret_metric"] = final_tensor(output).detach()
 
     def __call__(self, row):
-        from pi3_wilor_hand.geometry import resize_intrinsics
         from pi3_wilor_hand.pi3_runner import load_images_for_pi3
 
         image_paths = [
@@ -172,17 +211,13 @@ class Pi3XWindowMaterializer:
             image_paths,
             pixel_limit=self.pixel_limit,
         )
-        intrinsics = np.asarray(row["intrinsics"], dtype=np.float32).reshape(3, 3)
-        resized_intrinsics = resize_intrinsics(
-            intrinsics,
-            original_wh,
-            resized_wh,
+        resized_intrinsics = resized_row_intrinsics(
+            row, original_wh, resized_wh
         )
         image_batch = images[None].to(self.device)
         intrinsics_batch = (
             torch.from_numpy(resized_intrinsics)
-            .to(device=self.device, dtype=torch.float32)[None, None]
-            .repeat(1, len(image_paths), 1, 1)
+            .to(device=self.device, dtype=torch.float32)[None]
         )
         self.captured.clear()
         with torch.inference_mode():
@@ -235,7 +270,6 @@ class Pi3XWindowMaterializer:
 
     def compact(self, row, joint_uv, patch_radius=1, global_grid_size=4):
         """Run Pi3X once and transfer only local/global query candidates."""
-        from pi3_wilor_hand.geometry import resize_intrinsics
         from pi3_wilor_hand.pi3_runner import load_images_for_pi3
 
         image_paths = [
@@ -246,13 +280,13 @@ class Pi3XWindowMaterializer:
             image_paths,
             pixel_limit=self.pixel_limit,
         )
-        intrinsics = np.asarray(row["intrinsics"], dtype=np.float32).reshape(3, 3)
-        resized_intrinsics = resize_intrinsics(intrinsics, original_wh, resized_wh)
+        resized_intrinsics = resized_row_intrinsics(
+            row, original_wh, resized_wh
+        )
         image_batch = images[None].to(self.device)
         intrinsics_batch = (
             torch.from_numpy(resized_intrinsics)
-            .to(device=self.device, dtype=torch.float32)[None, None]
-            .repeat(1, len(image_paths), 1, 1)
+            .to(device=self.device, dtype=torch.float32)[None]
         )
         self.captured.clear()
         with torch.inference_mode():
@@ -393,7 +427,7 @@ class DummyDenseProvider:
             "geometry_patch_features": np.zeros((time, 1, 1, 1), np.float32),
             "geometry_feature_grid_hw": np.asarray([1, 1], np.int32),
             "metric_window_features": np.zeros((1, 1), np.float32),
-            "intrinsics_resized": np.asarray(row["intrinsics"], np.float32),
+            "intrinsics_resized": row_intrinsics(row),
             "resized_wh": np.asarray([width, height], np.int32),
             "horizontal_mirror": np.asarray(False),
             "coordinate_frame": np.asarray("original_camera"),
