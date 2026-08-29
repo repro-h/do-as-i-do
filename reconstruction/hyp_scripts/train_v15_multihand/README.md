@@ -191,6 +191,14 @@ The clip length still comes from the manifest. `--joint-patch-radius 1` keeps a
 Set `--max-hands` to the actual dataset maximum because compact memory scales
 linearly with hand slots (DexYCB: 1, this H2O smoke: 2).
 
+For full-dataset training, use `export_compact_pi3x_cache.py` to write these
+same compact candidates to disk. The exporter is resumable and supports
+`--num-shards`/`--shard-index`. Then pass the resulting directory through
+`--compact-cache-root` to `train_v16_1_compact_pi3x.py`. In disk mode the
+training process does not load or run Pi3X; workers load one compact window at
+a time. The cache is configuration-specific: `--max-hands`,
+`--joint-patch-radius`, and `--global-grid-size` must match export and training.
+
 ## HOT3D Aria adapter
 
 `prepare_hot3d_v15.py` uses the official HOT3D `Hot3dDataProvider` and Project

@@ -1,5 +1,6 @@
-"""Frozen Pi3X inference materialized once per manifest window in host RAM."""
+"""Frozen Pi3X inference and RAM/disk feature providers."""
 
+import os
 import sys
 from pathlib import Path
 
@@ -32,6 +33,88 @@ def row_key(row):
         int(row["start"]),
         int(row["end"]),
     )
+
+
+def compact_cache_path(root, row):
+    return (
+        Path(root).expanduser().resolve()
+        / str(row["stream_id"])
+        / "windows"
+        / f"window_{int(row['start']):06d}_{int(row['end']):06d}.npz"
+    )
+
+
+COMPACT_CACHE_KEYS = (
+    "joint_patch_features",
+    "joint_patch_uv",
+    "joint_patch_confidence",
+    "joint_patch_valid",
+    "global_features",
+    "global_uv",
+    "global_confidence",
+    "source_grid_hw",
+    "metric_window_features",
+    "intrinsics_resized",
+    "resized_wh",
+    "horizontal_mirror",
+    "coordinate_frame",
+)
+
+
+def valid_compact_cache(path, row, patch_radius=None, global_grid_size=None):
+    path = Path(path)
+    if not path.is_file():
+        return False
+    try:
+        with np.load(str(path), allow_pickle=False) as data:
+            if not set(COMPACT_CACHE_KEYS).issubset(data.files):
+                return False
+            if str(data["stream_id"].item()) != str(row["stream_id"]):
+                return False
+            if int(data["start"].item()) != int(row["start"]):
+                return False
+            if int(data["end"].item()) != int(row["end"]):
+                return False
+            if not np.array_equal(
+                np.asarray(data["frame_indices"], dtype=np.int64),
+                np.asarray(row["frame_indices"], dtype=np.int64),
+            ):
+                return False
+            if patch_radius is not None and int(
+                data["joint_patch_radius"].item()
+            ) != int(patch_radius):
+                return False
+            if global_grid_size is not None and int(
+                data["global_grid_size"].item()
+            ) != int(global_grid_size):
+                return False
+            return True
+    except (OSError, KeyError, ValueError):
+        return False
+
+
+def write_compact_cache(
+    path, row, payload, joint_uv, patch_radius, global_grid_size,
+):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp.npz")
+    content = {key: np.asarray(payload[key]) for key in COMPACT_CACHE_KEYS}
+    content.update({
+        "cache_version": np.asarray("compact_pi3x_window_v1"),
+        "stream_id": np.asarray(str(row["stream_id"])),
+        "start": np.int64(row["start"]),
+        "end": np.int64(row["end"]),
+        "frame_indices": np.asarray(row["frame_indices"], dtype=np.int64),
+        "joint_uv_clean": np.asarray(joint_uv, dtype=np.float32),
+        "joint_patch_radius": np.int32(patch_radius),
+        "global_grid_size": np.int32(global_grid_size),
+    })
+    try:
+        np.savez(str(temporary), **content)
+        os.replace(str(temporary), str(path))
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 class Pi3XWindowMaterializer:
@@ -319,3 +402,24 @@ class DummyDenseProvider:
 
 class CompactFeatureProvider(RamFeatureProvider):
     pass
+
+
+class DiskCompactFeatureProvider:
+    def __init__(self, root, patch_radius=None, global_grid_size=None):
+        self.root = Path(root).expanduser().resolve()
+        self.patch_radius = patch_radius
+        self.global_grid_size = global_grid_size
+
+    def path(self, row):
+        return compact_cache_path(self.root, row)
+
+    def __call__(self, row):
+        path = self.path(row)
+        if not valid_compact_cache(
+            path, row, self.patch_radius, self.global_grid_size
+        ):
+            raise FileNotFoundError(
+                f"Missing or incompatible compact Pi3X cache: {path}"
+            )
+        with np.load(str(path), allow_pickle=False) as data:
+            return {key: np.asarray(data[key]).copy() for key in COMPACT_CACHE_KEYS}

@@ -21,6 +21,7 @@ from compact_model import CompactMultiHandPi3XTrajectoryModel  # noqa: E402
 from dataset import DexYCBMultiHandWindowDataset, QueryNoise  # noqa: E402
 from online_pi3x import (  # noqa: E402
     CompactFeatureProvider,
+    DiskCompactFeatureProvider,
     DummyDenseProvider,
     Pi3XWindowMaterializer,
     row_key,
@@ -43,6 +44,10 @@ def parse_args():
     parser.add_argument("--hand-uni-root", required=True)
     parser.add_argument("--pi3-root", required=True)
     parser.add_argument("--pi3x-checkpoint", required=True)
+    parser.add_argument(
+        "--compact-cache-root",
+        help="Read precomputed compact window caches instead of running Pi3X",
+    )
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -137,58 +142,84 @@ def main():
         "train": metadata_dataset(args, "train", False),
         "val": metadata_dataset(args, "val", False),
     }
-    print("Materializing compact Pi3X candidates once per unique clip", flush=True)
-    extractor = Pi3XWindowMaterializer(
-        args.hand_uni_root,
-        args.pi3_root,
-        args.pi3x_checkpoint,
-        device=args.device,
-        pixel_limit=args.pixel_limit,
-        feature_dtype=args.feature_dtype,
-    )
-    payloads = {}
-    try:
-        total = sum(len(dataset) for dataset in clean_sets.values())
-        progress = tqdm(total=total, desc="Pi3X/compact-RAM")
-        for dataset in clean_sets.values():
-            for index, row in enumerate(dataset.rows):
-                key = row_key(row)
-                if key not in payloads:
-                    metadata = dataset[index]
-                    payloads[key] = extractor.compact(
-                        row,
-                        metadata["joint_uv"].numpy(),
-                        patch_radius=args.joint_patch_radius,
-                        global_grid_size=args.global_grid_size,
-                    )
-                progress.update(1)
-        progress.close()
-    finally:
-        extractor.close()
-
-    provider = CompactFeatureProvider(payloads)
+    payloads = None
+    if args.compact_cache_root:
+        provider = DiskCompactFeatureProvider(
+            args.compact_cache_root,
+            patch_radius=args.joint_patch_radius,
+            global_grid_size=args.global_grid_size,
+        )
+        print(f"Reading compact Pi3X caches from {provider.root}", flush=True)
+    else:
+        print(
+            "Materializing compact Pi3X candidates once per unique clip",
+            flush=True,
+        )
+        extractor = Pi3XWindowMaterializer(
+            args.hand_uni_root,
+            args.pi3_root,
+            args.pi3x_checkpoint,
+            device=args.device,
+            pixel_limit=args.pixel_limit,
+            feature_dtype=args.feature_dtype,
+        )
+        payloads = {}
+        try:
+            total = sum(len(dataset) for dataset in clean_sets.values())
+            progress = tqdm(total=total, desc="Pi3X/compact-RAM")
+            for dataset in clean_sets.values():
+                for index, row in enumerate(dataset.rows):
+                    key = row_key(row)
+                    if key not in payloads:
+                        metadata = dataset[index]
+                        payloads[key] = extractor.compact(
+                            row,
+                            metadata["joint_uv"].numpy(),
+                            patch_radius=args.joint_patch_radius,
+                            global_grid_size=args.global_grid_size,
+                        )
+                    progress.update(1)
+            progress.close()
+        finally:
+            extractor.close()
+        provider = CompactFeatureProvider(payloads)
     train_metadata = metadata_dataset(args, "train", True)
     val_metadata = metadata_dataset(args, "val", False)
     train_data = CompactWindowDataset(train_metadata, provider)
     val_data = CompactWindowDataset(val_metadata, provider)
     sample = train_data[0]
-    dense_equivalent = 0
-    for payload in payloads.values():
-        feature = payload["joint_patch_features"]
-        time, _, _, _, channels = feature.shape
-        grid_h, grid_w = np.asarray(payload["source_grid_hw"]).reshape(2)
-        dense_equivalent += (
-            time * int(grid_h) * int(grid_w) * channels * feature.dtype.itemsize
-        )
+    dense_equivalent = None
+    if payloads is not None:
+        dense_equivalent = 0
+        for payload in payloads.values():
+            feature = payload["joint_patch_features"]
+            time, _, _, _, channels = feature.shape
+            grid_h, grid_w = np.asarray(payload["source_grid_hw"]).reshape(2)
+            dense_equivalent += (
+                time * int(grid_h) * int(grid_w)
+                * channels * feature.dtype.itemsize
+            )
     audit = {
         "model_version": MODEL_VERSION,
-        "pi3x_execution": "once_per_unique_clip_then_compact_host_ram",
-        "disk_feature_export": False,
-        "unique_pi3x_clips": len(payloads),
-        "compact_ram_gib": provider.nbytes / 2**30,
-        "dense_feature_equivalent_gib": dense_equivalent / 2**30,
+        "pi3x_execution": (
+            "precomputed_compact_disk_cache"
+            if args.compact_cache_root
+            else "once_per_unique_clip_then_compact_host_ram"
+        ),
+        "disk_feature_export": bool(args.compact_cache_root),
+        "unique_pi3x_clips": None if payloads is None else len(payloads),
+        "compact_ram_gib": (
+            None if payloads is None else provider.nbytes / 2**30
+        ),
+        "compact_cache_root": (
+            str(provider.root) if args.compact_cache_root else None
+        ),
+        "dense_feature_equivalent_gib": (
+            None if dense_equivalent is None else dense_equivalent / 2**30
+        ),
         "compression_ratio": (
-            dense_equivalent / provider.nbytes if provider.nbytes else None
+            dense_equivalent / provider.nbytes
+            if payloads is not None and provider.nbytes else None
         ),
         "joint_patch_radius": args.joint_patch_radius,
         "joint_candidates": int(sample["joint_patch_features"].shape[-2]),
