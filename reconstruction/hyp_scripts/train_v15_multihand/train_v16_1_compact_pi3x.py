@@ -61,6 +61,7 @@ def parse_args():
     parser.add_argument("--joint-patch-radius", type=int, default=1)
     parser.add_argument("--global-grid-size", type=int, default=4)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--data-parallel", action="store_true")
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--token-dim", type=int, default=128)
@@ -236,6 +237,8 @@ def main():
         "train_datasets": sorted({row_dataset(row) for row in train_rows}),
         "val_datasets": sorted({row_dataset(row) for row in val_rows}),
         "train_windows_per_dataset": args.train_windows_per_dataset,
+        "data_parallel_requested": args.data_parallel,
+        "visible_cuda_devices": torch.cuda.device_count(),
     }
     print(json.dumps(audit, indent=2), flush=True)
     if args.audit_only:
@@ -254,6 +257,14 @@ def main():
         translation_parameterization=args.translation_parameterization,
         max_image_offset_fraction=args.max_image_offset_fraction,
     ).to(device)
+    if args.data_parallel:
+        if device.type != "cuda":
+            raise ValueError("--data-parallel requires --device cuda")
+        if torch.cuda.device_count() < 2:
+            raise RuntimeError(
+                "--data-parallel requires at least two visible CUDA devices"
+            )
+        model = torch.nn.DataParallel(model)
     sampler = (
         DatasetStreamBalancedSampler(
             train_data.rows, args.train_windows_per_dataset, args.seed
