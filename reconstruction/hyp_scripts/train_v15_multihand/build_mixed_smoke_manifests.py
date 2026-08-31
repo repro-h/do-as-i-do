@@ -48,10 +48,7 @@ def attach_paths(row, dataset, visibility_root, track_root):
     return row
 
 
-def supervised_instances(rows, visibility_path, tracks_path):
-    requested_frames = {
-        int(frame) for row in rows for frame in row["frame_indices"]
-    }
+def supervised_instances_by_row(rows, visibility_path, tracks_path):
     with np.load(str(visibility_path), allow_pickle=False) as visibility:
         visibility_frames = np.asarray(visibility["frame_indices"], dtype=np.int64)
         visibility_valid = np.asarray(visibility["visibility_valid"], dtype=bool)
@@ -69,16 +66,22 @@ def supervised_instances(rows, visibility_path, tracks_path):
         int(frame): index for index, frame in enumerate(visibility_frames)
     }
     track_index = {int(frame): index for index, frame in enumerate(track_frames)}
-    count = 0
-    for frame in requested_frames:
-        if frame not in visibility_index or frame not in track_index:
-            continue
-        visible = visibility_valid[visibility_index[frame]]
-        observed = observation_valid[track_index[frame]]
-        target = target_valid[track_index[frame]]
-        hands = min(len(visible), len(observed), len(target))
-        count += int((visible[:hands] & observed[:hands] & target[:hands]).sum())
-    return count
+    counts = []
+    for row in rows:
+        count = 0
+        for frame in row["frame_indices"]:
+            frame = int(frame)
+            if frame not in visibility_index or frame not in track_index:
+                continue
+            visible = visibility_valid[visibility_index[frame]]
+            observed = observation_valid[track_index[frame]]
+            target = target_valid[track_index[frame]]
+            hands = min(len(visible), len(observed), len(target))
+            count += int(
+                (visible[:hands] & observed[:hands] & target[:hands]).sum()
+            )
+        counts.append(count)
+    return counts
 
 
 def select_split(entry, split, stream_limit, windows_per_stream, rng):
@@ -110,10 +113,22 @@ def select_split(entry, split, stream_limit, windows_per_stream, rng):
     selected_rows = []
     validated_streams = []
     supervised_by_stream = {}
+    rejected_windows_by_stream = {}
     for stream in complete:
         if stream_limit > 0 and len(validated_streams) >= stream_limit:
             break
-        selected = evenly_spaced(grouped[stream], windows_per_stream)
+        visibility = visibility_root / stream / "visibility_cache.npz"
+        tracks = track_root / stream / "tracks.npz"
+        stream_rows = sorted(
+            grouped[stream], key=lambda row: (int(row["start"]), int(row["end"]))
+        )
+        counts = supervised_instances_by_row(stream_rows, visibility, tracks)
+        eligible = [row for row, count in zip(stream_rows, counts) if count > 0]
+        rejected_windows_by_stream[stream] = len(stream_rows) - len(eligible)
+        if not eligible:
+            rejected[stream] = ["no_detector_supervised_windows"]
+            continue
+        selected = evenly_spaced(eligible, windows_per_stream)
         missing_labels = sorted({
             str(Path(path).expanduser())
             for row in selected for path in row.get("label_paths", [])
@@ -122,12 +137,9 @@ def select_split(entry, split, stream_limit, windows_per_stream, rng):
         if missing_labels:
             rejected[stream] = [f"selected_labels:{len(missing_labels)}"]
             continue
-        visibility = visibility_root / stream / "visibility_cache.npz"
-        tracks = track_root / stream / "tracks.npz"
-        supervised = supervised_instances(selected, visibility, tracks)
-        if supervised == 0:
-            rejected[stream] = ["no_detector_supervised_instances"]
-            continue
+        supervised = sum(
+            supervised_instances_by_row(selected, visibility, tracks)
+        )
         validated_streams.append(stream)
         supervised_by_stream[stream] = supervised
         for row in selected:
@@ -141,6 +153,7 @@ def select_split(entry, split, stream_limit, windows_per_stream, rng):
         "complete_streams": len(complete),
         "selected_streams": validated_streams,
         "supervised_instances_by_stream": supervised_by_stream,
+        "zero_supervision_windows_by_stream": rejected_windows_by_stream,
         "windows": len(selected_rows),
         "rejected_streams": rejected,
     }
