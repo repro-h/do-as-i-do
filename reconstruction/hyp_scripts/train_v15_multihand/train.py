@@ -232,7 +232,7 @@ def wandb_metrics(split, metrics):
     return result
 
 
-def run_epoch(model, loader, device, args, optimizer=None):
+def run_epoch(model, loader, device, args, optimizer=None, dataset_names=None):
     training = optimizer is not None
     model.train(training)
     totals = {key: 0.0 for key in (
@@ -243,6 +243,10 @@ def run_epoch(model, loader, device, args, optimizer=None):
     grouped_errors = {
         name: {"translation": [], "depth": []}
         for name in ("observed", "missing_supervised", "unsupervised_target")
+    }
+    dataset_errors = {
+        name: {"translation": [], "depth": []}
+        for name in (dataset_names or [])
     }
     axis_errors = {axis: [] for axis in ("x", "y", "z")}
     stitched = defaultdict(list)
@@ -336,6 +340,14 @@ def run_epoch(model, loader, device, args, optimizer=None):
                 translation_error[group_mask]
             )
             grouped_errors[name]["depth"].append(depth_error[group_mask])
+        if dataset_errors:
+            dataset_index = batch["dataset_index"].detach().cpu().numpy()
+            for index, name in enumerate(dataset_names):
+                dataset_mask = mask & (dataset_index[:, None, None] == index)
+                dataset_errors[name]["translation"].append(
+                    translation_error[dataset_mask]
+                )
+                dataset_errors[name]["depth"].append(depth_error[dataset_mask])
         for axis, axis_index in (("x", 0), ("y", 1), ("z", 2)):
             axis_errors[axis].append(np.abs(error[..., axis_index])[mask])
         if not training:
@@ -382,6 +394,13 @@ def run_epoch(model, loader, device, args, optimizer=None):
                 "depth_error": distribution(values["depth"]),
             }
             for name, values in grouped_errors.items()
+        },
+        "by_dataset": {
+            name: {
+                "translation_error": distribution(values["translation"]),
+                "depth_error": distribution(values["depth"]),
+            }
+            for name, values in dataset_errors.items()
         },
         "evaluated_hands": evaluated,
         "observed_hands": observed_hands,

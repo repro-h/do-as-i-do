@@ -199,6 +199,16 @@ training process does not load or run Pi3X; workers load one compact window at
 a time. The cache is configuration-specific: `--max-hands`,
 `--joint-patch-radius`, and `--global-grid-size` must match export and training.
 
+For mixed-dataset training, first run `build_mixed_smoke_manifests.py` with a
+JSON config whose `datasets` entries provide `name`, `{train,val}_windows`,
+`visibility_{train,val}_root`, and `track_{train,val}_root`. A dataset may omit
+all validation fields (for example, H2O when all selected sequences are kept in
+training). The generated rows carry explicit `visibility_npz`, `tracks_npz`,
+and `dataset` fields, so the compact exporter and trainer no longer assume one
+shared auxiliary-cache root. Use `--train-windows-per-dataset N` during mixed
+training to draw the same epoch budget from each dataset and weight its streams
+equally. Validation output includes `by_dataset` translation and depth errors.
+
 ## HOT3D Aria adapter
 
 `prepare_hot3d_v15.py` uses the official HOT3D `Hot3dDataProvider` and Project

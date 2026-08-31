@@ -26,6 +26,18 @@ def dense_path(row, root):
     ).resolve()
 
 
+def auxiliary_cache_path(row, row_key, root, filename):
+    """Resolve a per-stream cache, allowing mixed-dataset row overrides."""
+    explicit = row.get(row_key)
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    if root is None:
+        raise KeyError(
+            f"Row {row.get('stream_id')} lacks {row_key} and no root was given"
+        )
+    return (root / row["stream_id"] / filename).resolve()
+
+
 def mask_visibility(mask, uv, radius):
     """Local visible-hand occupancy; this is a proxy, not occlusion GT."""
     height, width = mask.shape
@@ -125,9 +137,23 @@ class DexYCBMultiHandWindowDataset(Dataset):
         if self.visibility_source not in ("detector", "mask", "ones"):
             raise ValueError(f"Unknown visibility source: {self.visibility_source}")
         if self.visibility_source == "detector" and self.visibility_root is None:
-            raise ValueError("visibility_root is required for detector visibility")
-        streams = sorted({row["stream_id"] for row in self.rows})
+            missing = [row["stream_id"] for row in self.rows if not row.get("visibility_npz")]
+            if missing:
+                raise ValueError(
+                    "visibility_root is required unless every row has visibility_npz; "
+                    f"first missing stream: {missing[0]}"
+                )
+        streams = sorted({
+            f"{row.get('dataset', 'unknown')}::{row['stream_id']}"
+            for row in self.rows
+        })
         self.stream_indices = {stream: index for index, stream in enumerate(streams)}
+        self.dataset_names = sorted({
+            str(row.get("dataset", "unknown")) for row in self.rows
+        })
+        self.dataset_indices = {
+            name: index for index, name in enumerate(self.dataset_names)
+        }
 
     def __len__(self):
         return len(self.rows)
@@ -148,8 +174,10 @@ class DexYCBMultiHandWindowDataset(Dataset):
         track_ids = np.full((time, hands), -1, dtype=np.int64)
         track_data = None
         track_index = {}
-        if self.track_root is not None:
-            track_file = self.track_root / row["stream_id"] / "tracks.npz"
+        if self.track_root is not None or row.get("tracks_npz"):
+            track_file = auxiliary_cache_path(
+                row, "tracks_npz", self.track_root, "tracks.npz"
+            )
             track_data = np.load(str(track_file), allow_pickle=False)
             track_frames = np.asarray(track_data["frame_indices"], dtype=np.int64)
             track_index = {
@@ -157,8 +185,11 @@ class DexYCBMultiHandWindowDataset(Dataset):
             }
         detector_visibility = {}
         if self.visibility_source == "detector":
-            visibility_file = (
-                self.visibility_root / row["stream_id"] / "visibility_cache.npz"
+            visibility_file = auxiliary_cache_path(
+                row,
+                "visibility_npz",
+                self.visibility_root,
+                "visibility_cache.npz",
             )
             with np.load(str(visibility_file), allow_pickle=False) as cache:
                 cache_frames = np.asarray(cache["frame_indices"], dtype=np.int64)
@@ -375,7 +406,12 @@ class DexYCBMultiHandWindowDataset(Dataset):
             "image_wh": torch.from_numpy(
                 np.broadcast_to(resized_wh[None], (time, 2)).copy()
             ),
-            "stream_index": torch.tensor(self.stream_indices[row["stream_id"]]),
+            "stream_index": torch.tensor(self.stream_indices[
+                f"{row.get('dataset', 'unknown')}::{row['stream_id']}"
+            ]),
+            "dataset_index": torch.tensor(self.dataset_indices[
+                str(row.get("dataset", "unknown"))
+            ]),
             "frame_index": torch.tensor(row["frame_indices"], dtype=torch.long),
             "track_id": torch.from_numpy(track_ids),
         }

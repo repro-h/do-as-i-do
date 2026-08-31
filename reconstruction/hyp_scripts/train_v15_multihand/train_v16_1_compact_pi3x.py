@@ -26,7 +26,7 @@ from online_pi3x import (  # noqa: E402
     Pi3XWindowMaterializer,
     row_key,
 )
-from train import run_epoch  # noqa: E402
+from train import DatasetStreamBalancedSampler, row_dataset, run_epoch  # noqa: E402
 from train_v16_online_pi3x import load_rows, window_layout  # noqa: E402
 
 
@@ -37,10 +37,10 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-windows", required=True)
     parser.add_argument("--val-windows", required=True)
-    parser.add_argument("--visibility-train-root", required=True)
-    parser.add_argument("--visibility-val-root", required=True)
-    parser.add_argument("--track-train-root", required=True)
-    parser.add_argument("--track-val-root", required=True)
+    parser.add_argument("--visibility-train-root")
+    parser.add_argument("--visibility-val-root")
+    parser.add_argument("--track-train-root")
+    parser.add_argument("--track-val-root")
     parser.add_argument("--hand-uni-root", required=True)
     parser.add_argument("--pi3-root", required=True)
     parser.add_argument("--pi3x-checkpoint", required=True)
@@ -90,6 +90,10 @@ def parse_args():
     )
     parser.add_argument("--max-image-offset-fraction", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--train-windows-per-dataset", type=int, default=0,
+        help="Equal per-dataset epoch budget; zero uses ordinary window shuffle",
+    )
     parser.add_argument("--audit-only", action="store_true")
     return parser.parse_args()
 
@@ -229,6 +233,9 @@ def main():
         "joint_patch_shape": list(sample["joint_patch_features"].shape),
         "global_feature_shape": list(sample["global_features"].shape),
         "visibility_source": "separate_detector_cache",
+        "train_datasets": sorted({row_dataset(row) for row in train_rows}),
+        "val_datasets": sorted({row_dataset(row) for row in val_rows}),
+        "train_windows_per_dataset": args.train_windows_per_dataset,
     }
     print(json.dumps(audit, indent=2), flush=True)
     if args.audit_only:
@@ -247,8 +254,15 @@ def main():
         translation_parameterization=args.translation_parameterization,
         max_image_offset_fraction=args.max_image_offset_fraction,
     ).to(device)
+    sampler = (
+        DatasetStreamBalancedSampler(
+            train_data.rows, args.train_windows_per_dataset, args.seed
+        )
+        if args.train_windows_per_dataset > 0 else None
+    )
     train_loader = DataLoader(
-        train_data, batch_size=args.batch_size, shuffle=True,
+        train_data, batch_size=args.batch_size, shuffle=sampler is None,
+        sampler=sampler,
         num_workers=args.num_workers, pin_memory=True, drop_last=True,
     )
     val_loader = DataLoader(
@@ -264,8 +278,14 @@ def main():
     best = float("inf")
     for epoch in range(1, args.epochs + 1):
         print(f"\n===== epoch {epoch} =====", flush=True)
-        train_metrics = run_epoch(model, train_loader, device, args, optimizer)
-        val_metrics = run_epoch(model, val_loader, device, args)
+        train_metrics = run_epoch(
+            model, train_loader, device, args, optimizer,
+            dataset_names=train_metadata.dataset_names,
+        )
+        val_metrics = run_epoch(
+            model, val_loader, device, args,
+            dataset_names=val_metadata.dataset_names,
+        )
         epoch_row = {"epoch": epoch, "train": train_metrics, "val": val_metrics}
         history.append(epoch_row)
         print(json.dumps(epoch_row), flush=True)

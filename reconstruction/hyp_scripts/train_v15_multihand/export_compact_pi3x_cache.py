@@ -30,8 +30,14 @@ from train_v16_online_pi3x import load_rows  # noqa: E402
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--windows", required=True)
-    parser.add_argument("--visibility-root", required=True)
-    parser.add_argument("--track-root", required=True)
+    parser.add_argument(
+        "--visibility-root",
+        help="Fallback root; mixed manifests may provide visibility_npz per row",
+    )
+    parser.add_argument(
+        "--track-root",
+        help="Fallback root; mixed manifests may provide tracks_npz per row",
+    )
     parser.add_argument("--hand-uni-root", required=True)
     parser.add_argument("--pi3-root", required=True)
     parser.add_argument("--pi3x-checkpoint", required=True)
