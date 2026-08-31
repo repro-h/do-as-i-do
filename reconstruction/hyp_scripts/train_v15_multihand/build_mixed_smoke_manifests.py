@@ -66,12 +66,6 @@ def select_split(entry, split, stream_limit, windows_per_stream, rng):
             missing.append("visibility")
         if not tracks.is_file():
             missing.append("tracks")
-        missing_labels = sum(
-            not Path(path).expanduser().is_file()
-            for row in rows for path in row.get("label_paths", [])
-        )
-        if missing_labels:
-            missing.append(f"labels:{missing_labels}")
         if missing:
             rejected[stream] = missing
         else:
@@ -80,8 +74,19 @@ def select_split(entry, split, stream_limit, windows_per_stream, rng):
     rng.shuffle(complete)
     selected_streams = complete[:stream_limit] if stream_limit > 0 else complete
     selected_rows = []
+    validated_streams = []
     for stream in selected_streams:
-        for row in evenly_spaced(grouped[stream], windows_per_stream):
+        selected = evenly_spaced(grouped[stream], windows_per_stream)
+        missing_labels = sorted({
+            str(Path(path).expanduser())
+            for row in selected for path in row.get("label_paths", [])
+            if not Path(path).expanduser().is_file()
+        })
+        if missing_labels:
+            rejected[stream] = [f"selected_labels:{len(missing_labels)}"]
+            continue
+        validated_streams.append(stream)
+        for row in selected:
             selected_rows.append(attach_paths(
                 row, entry["name"], visibility_root, track_root
             ))
@@ -90,7 +95,7 @@ def select_split(entry, split, stream_limit, windows_per_stream, rng):
         "manifest": str(Path(manifest_value).expanduser().resolve()),
         "candidate_streams": len(grouped),
         "complete_streams": len(complete),
-        "selected_streams": selected_streams,
+        "selected_streams": validated_streams,
         "windows": len(selected_rows),
         "rejected_streams": rejected,
     }
@@ -134,20 +139,24 @@ def main():
             dataset_report[split] = split_report
         report["datasets"][entry["name"]] = dataset_report
 
-    if not outputs["train"] or not outputs["val"]:
-        raise RuntimeError("Mixed smoke needs non-empty train and validation rows")
     rng.shuffle(outputs["train"])
     outputs["val"].sort(
         key=lambda row: (row["dataset"], row["stream_id"], row["start"])
     )
     for split in ("train", "val"):
         path = out_dir / f"{split}_windows.jsonl"
-        write_jsonl(path, outputs[split], args.overwrite)
+        if outputs[split]:
+            write_jsonl(path, outputs[split], args.overwrite)
         report[f"{split}_windows"] = len(outputs[split])
-        report[f"{split}_output"] = str(path)
+        report[f"{split}_output"] = str(path) if outputs[split] else None
     report_path = out_dir / "selection_report.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report, indent=2))
+    if not outputs["train"] or not outputs["val"]:
+        raise RuntimeError(
+            "Mixed smoke needs non-empty train and validation rows; inspect "
+            f"{report_path} for rejected streams and cache roots"
+        )
 
 
 if __name__ == "__main__":
