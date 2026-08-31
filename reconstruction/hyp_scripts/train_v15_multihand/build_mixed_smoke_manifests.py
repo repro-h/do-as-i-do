@@ -7,6 +7,8 @@ import random
 from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -46,6 +48,39 @@ def attach_paths(row, dataset, visibility_root, track_root):
     return row
 
 
+def supervised_instances(rows, visibility_path, tracks_path):
+    requested_frames = {
+        int(frame) for row in rows for frame in row["frame_indices"]
+    }
+    with np.load(str(visibility_path), allow_pickle=False) as visibility:
+        visibility_frames = np.asarray(visibility["frame_indices"], dtype=np.int64)
+        visibility_valid = np.asarray(visibility["visibility_valid"], dtype=bool)
+    with np.load(str(tracks_path), allow_pickle=False) as tracks:
+        track_frames = np.asarray(tracks["frame_indices"], dtype=np.int64)
+        observation_valid = np.asarray(tracks["observation_valid"], dtype=bool)
+        target_valid = np.asarray(tracks["target_valid"], dtype=bool)
+    if visibility_valid.ndim == 1:
+        visibility_valid = visibility_valid[:, None]
+    if observation_valid.ndim == 1:
+        observation_valid = observation_valid[:, None]
+    if target_valid.ndim == 1:
+        target_valid = target_valid[:, None]
+    visibility_index = {
+        int(frame): index for index, frame in enumerate(visibility_frames)
+    }
+    track_index = {int(frame): index for index, frame in enumerate(track_frames)}
+    count = 0
+    for frame in requested_frames:
+        if frame not in visibility_index or frame not in track_index:
+            continue
+        visible = visibility_valid[visibility_index[frame]]
+        observed = observation_valid[track_index[frame]]
+        target = target_valid[track_index[frame]]
+        hands = min(len(visible), len(observed), len(target))
+        count += int((visible[:hands] & observed[:hands] & target[:hands]).sum())
+    return count
+
+
 def select_split(entry, split, stream_limit, windows_per_stream, rng):
     manifest_value = entry.get(f"{split}_windows")
     if not manifest_value:
@@ -72,10 +107,12 @@ def select_split(entry, split, stream_limit, windows_per_stream, rng):
             complete.append(stream)
 
     rng.shuffle(complete)
-    selected_streams = complete[:stream_limit] if stream_limit > 0 else complete
     selected_rows = []
     validated_streams = []
-    for stream in selected_streams:
+    supervised_by_stream = {}
+    for stream in complete:
+        if stream_limit > 0 and len(validated_streams) >= stream_limit:
+            break
         selected = evenly_spaced(grouped[stream], windows_per_stream)
         missing_labels = sorted({
             str(Path(path).expanduser())
@@ -85,7 +122,14 @@ def select_split(entry, split, stream_limit, windows_per_stream, rng):
         if missing_labels:
             rejected[stream] = [f"selected_labels:{len(missing_labels)}"]
             continue
+        visibility = visibility_root / stream / "visibility_cache.npz"
+        tracks = track_root / stream / "tracks.npz"
+        supervised = supervised_instances(selected, visibility, tracks)
+        if supervised == 0:
+            rejected[stream] = ["no_detector_supervised_instances"]
+            continue
         validated_streams.append(stream)
+        supervised_by_stream[stream] = supervised
         for row in selected:
             selected_rows.append(attach_paths(
                 row, entry["name"], visibility_root, track_root
@@ -96,6 +140,7 @@ def select_split(entry, split, stream_limit, windows_per_stream, rng):
         "candidate_streams": len(grouped),
         "complete_streams": len(complete),
         "selected_streams": validated_streams,
+        "supervised_instances_by_stream": supervised_by_stream,
         "windows": len(selected_rows),
         "rejected_streams": rejected,
     }
