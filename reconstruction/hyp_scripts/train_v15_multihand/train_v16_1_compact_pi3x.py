@@ -4,6 +4,7 @@
 import argparse
 import json
 import random
+import shutil
 import sys
 from pathlib import Path
 
@@ -64,6 +65,14 @@ def parse_args():
     parser.add_argument("--data-parallel", action="store_true")
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--resume-checkpoint")
+    parser.add_argument("--resume-optimizer", action="store_true")
+    parser.add_argument(
+        "--lr-scheduler", choices=("none", "cosine", "plateau"), default="none"
+    )
+    parser.add_argument("--min-lr", type=float, default=1e-5)
+    parser.add_argument("--scheduler-patience", type=int, default=2)
+    parser.add_argument("--scheduler-factor", type=float, default=0.5)
     parser.add_argument("--token-dim", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=192)
     parser.add_argument("--heads", type=int, default=4)
@@ -107,6 +116,17 @@ def noise_from_args(args):
         outlier_probability=args.outlier_probability,
         dropout_probability=args.query_dropout,
     )
+
+
+def load_model_state(model, state):
+    """Load checkpoints across DataParallel and single-device wrappers."""
+    target_has_module = all(key.startswith("module.") for key in model.state_dict())
+    source_has_module = all(key.startswith("module.") for key in state)
+    if source_has_module and not target_has_module:
+        state = {key.removeprefix("module."): value for key, value in state.items()}
+    elif target_has_module and not source_has_module:
+        state = {f"module.{key}": value for key, value in state.items()}
+    model.load_state_dict(state)
 
 
 def metadata_dataset(args, split, training):
@@ -247,6 +267,8 @@ def main():
         "train_windows_per_dataset": args.train_windows_per_dataset,
         "data_parallel_requested": args.data_parallel,
         "visible_cuda_devices": torch.cuda.device_count(),
+        "resume_checkpoint": args.resume_checkpoint,
+        "lr_scheduler": args.lr_scheduler,
     }
     print(json.dumps(audit, indent=2), flush=True)
     if args.audit_only:
@@ -293,10 +315,58 @@ def main():
     )
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    history = []
+    resume = None
+    start_epoch = 1
     best = float("inf")
-    for epoch in range(1, args.epochs + 1):
+    if args.resume_checkpoint:
+        resume_path = Path(args.resume_checkpoint).expanduser().resolve()
+        resume = torch.load(str(resume_path), map_location="cpu", weights_only=False)
+        load_model_state(model, resume["model"])
+        start_epoch = int(resume.get("epoch", 0)) + 1
+        if args.resume_optimizer:
+            if "optimizer" not in resume:
+                raise KeyError(
+                    f"{resume_path} lacks optimizer state; omit --resume-optimizer"
+                )
+            optimizer.load_state_dict(resume["optimizer"])
+            for group in optimizer.param_groups:
+                group["lr"] = args.lr
+        source_val = resume.get("val", {})
+        best = float(source_val.get("total", float("inf")))
+        destination = out_dir / "best.pt"
+        if resume_path != destination:
+            shutil.copy2(resume_path, destination)
+        print(
+            f"Resumed model from {resume_path} at epoch {start_epoch - 1}; "
+            f"optimizer={'restored' if args.resume_optimizer else 'fresh'}, "
+            f"lr={args.lr:g}",
+            flush=True,
+        )
+
+    scheduler = None
+    if args.lr_scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(args.epochs, 1), eta_min=args.min_lr
+        )
+    elif args.lr_scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=args.scheduler_factor,
+            patience=args.scheduler_patience,
+            min_lr=args.min_lr,
+        )
+    if (
+        args.resume_optimizer
+        and scheduler is not None
+        and resume is not None
+        and resume.get("scheduler") is not None
+    ):
+        scheduler.load_state_dict(resume["scheduler"])
+    history = []
+    for epoch in range(start_epoch, start_epoch + args.epochs):
         print(f"\n===== epoch {epoch} =====", flush=True)
+        epoch_lr = float(optimizer.param_groups[0]["lr"])
         train_metrics = run_epoch(
             model, train_loader, device, args, optimizer,
             dataset_names=train_metadata.dataset_names,
@@ -305,16 +375,30 @@ def main():
             model, val_loader, device, args,
             dataset_names=val_metadata.dataset_names,
         )
-        epoch_row = {"epoch": epoch, "train": train_metrics, "val": val_metrics}
+        epoch_row = {
+            "epoch": epoch,
+            "lr": epoch_lr,
+            "train": train_metrics,
+            "val": val_metrics,
+        }
         history.append(epoch_row)
         print(json.dumps(epoch_row), flush=True)
+        if scheduler is not None:
+            if args.lr_scheduler == "plateau":
+                scheduler.step(val_metrics["total"])
+            else:
+                scheduler.step()
         checkpoint = {
             "epoch": epoch,
             "model_version": MODEL_VERSION,
             "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": None if scheduler is None else scheduler.state_dict(),
             "args": vars(args),
             "audit": audit,
             "val": val_metrics,
+            "lr": epoch_lr,
+            "next_lr": float(optimizer.param_groups[0]["lr"]),
         }
         torch.save(checkpoint, out_dir / "last.pt")
         if val_metrics["total"] < best:
