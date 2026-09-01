@@ -54,13 +54,18 @@ def unique_stream_frames(rows):
     return streams
 
 
-def valid_cache(path, stream_id, expected_frames, max_hands, require_multihand):
+def valid_cache(
+    path, stream_id, expected_frames, max_hands, require_multihand,
+    track_path=None,
+):
     try:
         with np.load(path, allow_pickle=False) as data:
             required = {
                 "frame_indices", "joint_visibility", "visibility_valid",
                 "bbox_confidence", "detector_joint_uv",
             }
+            if require_multihand:
+                required.add("track_ids")
             if not required.issubset(data.files):
                 return False
             frames = np.asarray(data["frame_indices"], dtype=np.int64)
@@ -76,6 +81,16 @@ def valid_cache(path, stream_id, expected_frames, max_hands, require_multihand):
             legacy_shape &= valid.shape == (len(frames),)
             if not multi_shape and (require_multihand or not legacy_shape):
                 return False
+            if require_multihand:
+                track_ids = np.asarray(data["track_ids"], dtype=np.int64)
+                if track_ids.shape != valid.shape:
+                    return False
+                if valid.any() and not np.all(track_ids[valid] >= 0):
+                    return False
+                if track_path is None or not track_path.is_file():
+                    return False
+                if path.stat().st_mtime_ns < track_path.stat().st_mtime_ns:
+                    return False
             return bool(np.isfinite(visibility).all())
     except (OSError, KeyError, ValueError):
         return False
@@ -164,9 +179,14 @@ def main():
     for stream_id, records in items:
         expected = np.asarray(sorted(records), dtype=np.int64)
         output = out_root / stream_id / "visibility_cache.npz"
+        track_path = (
+            None if track_root is None
+            else track_root / stream_id / "tracks.npz"
+        )
         if not args.overwrite and valid_cache(
             output, stream_id, expected, args.max_hands,
             require_multihand=track_root is not None,
+            track_path=track_path,
         ):
             cached.append(stream_id)
         else:
