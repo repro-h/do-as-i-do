@@ -193,6 +193,14 @@ def main():
     train_data = CompactWindowDataset(train_metadata, provider)
     val_data = CompactWindowDataset(val_metadata, provider)
     sample = train_data[0]
+    compact_thj = tuple(sample["joint_patch_features"].shape[:3])
+    query_thj = tuple(sample["joint_uv"].shape[:3])
+    if compact_thj != query_thj:
+        raise ValueError(
+            "Compact Pi3X/query shape mismatch: "
+            f"cache [T,H,J]={compact_thj}, metadata [T,H,J]={query_thj}. "
+            "Set --max-hands to the value used during compact cache export."
+        )
     dense_equivalent = None
     if payloads is not None:
         dense_equivalent = 0
