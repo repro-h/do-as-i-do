@@ -23,6 +23,8 @@ def parse_args():
     parser.add_argument("--train-count", type=int, default=32)
     parser.add_argument("--val-count", type=int, default=8)
     parser.add_argument("--test-count-per-split", type=int, default=8)
+    parser.add_argument("--existing-train")
+    parser.add_argument("--existing-val")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -138,6 +140,47 @@ def write_jsonl(path, rows, local_split):
             handle.write(json.dumps(value, separators=(",", ":")) + "\n")
 
 
+def load_jsonl(path):
+    if not path:
+        return []
+    with Path(path).open("r", encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def extend_diverse_sample(rows, count, seed, existing):
+    if len(existing) > count:
+        raise ValueError(
+            f"Existing selection has {len(existing)} rows, exceeding target {count}"
+        )
+    existing_ids = {row["sequence"] for row in existing}
+    if len(existing_ids) != len(existing):
+        raise ValueError("Existing selection contains duplicate sequences")
+    groups = defaultdict(list)
+    totals = defaultdict(int)
+    for row in existing:
+        totals[row["triplet"]] += 1
+    for row in rows:
+        if row["sequence"] not in existing_ids:
+            groups[row["triplet"]].append(row)
+    for triplet, values in groups.items():
+        values.sort(key=lambda row: stable_key(seed, triplet, row["sequence"]))
+
+    selected = list(existing)
+    while len(selected) < count:
+        available = [triplet for triplet, values in groups.items() if values]
+        if not available:
+            break
+        triplet = min(
+            available,
+            key=lambda value: (
+                totals[value], stable_key(seed, "triplet", value)
+            ),
+        )
+        selected.append(groups[triplet].pop(0))
+        totals[triplet] += 1
+    return selected
+
+
 def main():
     args = parse_args()
     root = Path(args.taco_root).expanduser().resolve()
@@ -150,13 +193,20 @@ def main():
         for split in ("train", *TEST_SPLITS)
     }
 
-    train = diverse_sample(by_split["train"], args.train_count, args.seed)
+    existing_train = load_jsonl(args.existing_train)
+    existing_val = load_jsonl(args.existing_val)
+    reserved_val_ids = {row["sequence"] for row in existing_val}
+    train_pool = [
+        row for row in by_split["train"]
+        if row["sequence"] not in reserved_val_ids
+    ]
+    train = extend_diverse_sample(
+        train_pool, args.train_count, args.seed, existing_train
+    )
     train_ids = {row["sequence"] for row in train}
     remaining = [row for row in by_split["train"] if row["sequence"] not in train_ids]
-    train_triplets = {row["triplet"] for row in train}
-    val = diverse_sample(
-        remaining, args.val_count, args.seed + 1,
-        preferred_triplets=train_triplets,
+    val = extend_diverse_sample(
+        remaining, args.val_count, args.seed + 1, existing_val
     )
     tests = {
         split: diverse_sample(
@@ -167,10 +217,18 @@ def main():
     }
 
     selection_root = out_root / "selections"
-    write_jsonl(selection_root / "train_32.jsonl", train, "train")
-    write_jsonl(selection_root / "val_8.jsonl", val, "val")
+    write_jsonl(
+        selection_root / f"train_{args.train_count}.jsonl", train, "train"
+    )
+    write_jsonl(
+        selection_root / f"val_{args.val_count}.jsonl", val, "val"
+    )
     for split, selected in tests.items():
-        write_jsonl(selection_root / f"{split}_8.jsonl", selected, split)
+        write_jsonl(
+            selection_root / f"{split}_{args.test_count_per_split}.jsonl",
+            selected,
+            split,
+        )
 
     split_counts = {
         split: {
@@ -196,6 +254,10 @@ def main():
                 split: {"sequences": len(selected), "frames": sum(row["frames"] for row in selected)}
                 for split, selected in tests.items()
             },
+        },
+        "preserved_selection": {
+            "train": len(existing_train),
+            "val": len(existing_val),
         },
         "train_triplets": len({row["triplet"] for row in train}),
         "val_triplets": len({row["triplet"] for row in val}),
