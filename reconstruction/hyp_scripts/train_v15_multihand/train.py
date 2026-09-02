@@ -232,7 +232,15 @@ def wandb_metrics(split, metrics):
     return result
 
 
-def run_epoch(model, loader, device, args, optimizer=None, dataset_names=None):
+def run_epoch(
+    model,
+    loader,
+    device,
+    args,
+    optimizer=None,
+    dataset_names=None,
+    stream_names=None,
+):
     training = optimizer is not None
     model.train(training)
     totals = {key: 0.0 for key in (
@@ -411,20 +419,36 @@ def run_epoch(model, loader, device, args, optimizer=None, dataset_names=None):
         stitched_translation = []
         stitched_depth = []
         stitched_axes = {axis: [] for axis in ("x", "y", "z")}
+        stream_errors = defaultdict(lambda: {
+            "translation": [],
+            "depth": [],
+        })
         overlap_disagreement = []
         overlap_keys = 0
-        for samples in stitched.values():
+        for stitch_key, samples in stitched.items():
             weights = np.asarray([sample[2] for sample in samples], dtype=np.float64)
             predictions = np.stack([sample[0] for sample in samples]).astype(np.float64)
             target_value = np.asarray(samples[0][1], dtype=np.float64)
             fused = (predictions * weights[:, None]).sum(axis=0) / weights.sum()
             error_value = fused - target_value
+            translation_value = float(np.linalg.norm(error_value))
+            depth_value = float(abs(error_value[2]))
             stitched_translation.append(
-                np.asarray([np.linalg.norm(error_value)], dtype=np.float32)
+                np.asarray([translation_value], dtype=np.float32)
             )
             stitched_depth.append(
-                np.asarray([abs(error_value[2])], dtype=np.float32)
+                np.asarray([depth_value], dtype=np.float32)
             )
+            if stream_names is not None:
+                stream_name = stream_names.get(
+                    int(stitch_key[0]), str(int(stitch_key[0]))
+                )
+                stream_errors[stream_name]["translation"].append(
+                    np.asarray([translation_value], dtype=np.float32)
+                )
+                stream_errors[stream_name]["depth"].append(
+                    np.asarray([depth_value], dtype=np.float32)
+                )
             for axis, axis_index in (("x", 0), ("y", 1), ("z", 2)):
                 stitched_axes[axis].append(
                     np.asarray([abs(error_value[axis_index])], dtype=np.float32)
@@ -444,6 +468,14 @@ def run_epoch(model, loader, device, args, optimizer=None, dataset_names=None):
             "overlap_frames": overlap_keys,
             "overlap_disagreement": distribution(overlap_disagreement),
         }
+        if stream_names is not None:
+            result["by_stream"] = {
+                name: {
+                    "translation_error": distribution(values["translation"]),
+                    "depth_error": distribution(values["depth"]),
+                }
+                for name, values in sorted(stream_errors.items())
+            }
     return result
 
 

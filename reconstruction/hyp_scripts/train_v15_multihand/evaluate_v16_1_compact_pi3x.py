@@ -126,6 +126,10 @@ def main():
         device,
         loss_args,
         dataset_names=metadata.dataset_names,
+        stream_names={
+            index: name
+            for name, index in metadata.stream_indices.items()
+        },
     )
     result = {
         "checkpoint": str(checkpoint_path),
