@@ -10,6 +10,7 @@ out_root=""
 gpus=""
 batch_size=32
 num_workers=8
+dexycb_visibility_root=""
 
 usage() {
   cat <<'EOF'
@@ -27,6 +28,8 @@ Required:
 Optional:
   --batch-size N    Default: 32
   --num-workers N   Default: 8
+  --dexycb-visibility-root DIR
+                    Override DexYCB visibility cache root
 
 Evaluates DexYCB S0 test followed by TACO test_1 through test_4.
 EOF
@@ -43,6 +46,7 @@ while (($#)); do
     --gpus) gpus="$2"; shift 2 ;;
     --batch-size) batch_size="$2"; shift 2 ;;
     --num-workers) num_workers="$2"; shift 2 ;;
+    --dexycb-visibility-root) dexycb_visibility_root="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -62,6 +66,7 @@ for path in "$python_bin" "$eval_script" "$checkpoint"; do
   fi
 done
 mkdir -p "$out_root"
+dexycb_visibility_root=${dexycb_visibility_root:-"$full_v15/visibility/test"}
 
 run_eval() {
   local name=$1
@@ -93,7 +98,7 @@ run_eval() {
 run_eval \
   dexycb_s0 \
   "$full_v15/manifests/test_windows.jsonl" \
-  "$full_v15/visibility/test" \
+  "$dexycb_visibility_root" \
   "$full_v15/tracks/test" \
   "$full_root/test/dexycb/compact_cache"
 
