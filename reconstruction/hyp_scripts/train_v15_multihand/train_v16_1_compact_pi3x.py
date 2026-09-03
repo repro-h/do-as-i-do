@@ -332,9 +332,20 @@ def main():
             for group in optimizer.param_groups:
                 group["lr"] = args.lr
         source_val = resume.get("val", {})
-        best = float(source_val.get("total", float("inf")))
+        loss_keys = (
+            "w_depth", "w_relative", "w_velocity", "w_acceleration",
+            "w_reprojection", "smooth_l1_beta_mm", "reprojection_beta_px",
+        )
+        same_objective = all(
+            resume.get("args", {}).get(key) == getattr(args, key)
+            for key in loss_keys
+        )
+        if same_objective:
+            best = float(source_val.get("total", float("inf")))
+        else:
+            print("Loss configuration changed; resetting best validation loss", flush=True)
         destination = out_dir / "best.pt"
-        if resume_path != destination:
+        if same_objective and resume_path != destination:
             shutil.copy2(resume_path, destination)
         print(
             f"Resumed model from {resume_path} at epoch {start_epoch - 1}; "
