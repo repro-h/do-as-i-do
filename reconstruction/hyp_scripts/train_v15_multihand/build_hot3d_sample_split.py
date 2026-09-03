@@ -15,6 +15,7 @@ def parse_args():
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--val-count", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--fixed-split", help="JSON with explicit train_sequences and val_sequences")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -109,6 +110,17 @@ def main():
         rng.shuffle(remaining)
         validation.extend(remaining[:args.val_count - len(validation)])
 
+    if args.fixed_split:
+        fixed = json.loads(Path(args.fixed_split).read_text(encoding="utf-8"))
+        training = fixed["train_sequences"]
+        validation = fixed["val_sequences"]
+        if (
+            len(training) != len(set(training))
+            or len(validation) != len(set(validation))
+            or set(training) & set(validation)
+            or set(training) | set(validation) != set(sequences)
+        ):
+            raise ValueError("Fixed split must partition the requested sequences exactly")
     validation_set = set(validation)
     training = [item for item in sequences if item not in validation_set]
     train_rows = [row for item in training for row in rows_by_sequence[item]]

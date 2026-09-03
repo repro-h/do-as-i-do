@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import trimesh
 from PIL import Image, ImageDraw
 from torch.utils.data import DataLoader
 
@@ -41,6 +42,8 @@ def parse_args():
     parser.add_argument("--base-checkpoint", required=True)
     parser.add_argument("--tail-checkpoint", required=True)
     parser.add_argument("--out-root", required=True)
+    parser.add_argument("--object-cache", default=None)
+    parser.add_argument("--object-point-stride", type=int, default=20)
     parser.add_argument("--sequence", action="append", required=True)
     parser.add_argument("--frames-per-sequence", type=int, default=24)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -181,6 +184,52 @@ def draw_skeleton(draw, pixels, valid, color, width):
         draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color)
 
 
+def load_object_cache(path):
+    if path is None:
+        return None
+    with np.load(path, allow_pickle=False) as data:
+        required = {
+            "frame_indices",
+            "tool_pose_object_to_world",
+            "target_pose_object_to_world",
+            "extrinsics_world_to_camera",
+            "intrinsics",
+            "tool_mesh",
+            "target_mesh",
+        }
+        missing = sorted(required.difference(data.files))
+        if missing:
+            raise KeyError(f"Object cache missing keys: {missing}")
+        cache = {key: data[key].copy() for key in required}
+    cache["frame_lookup"] = {
+        int(frame): index
+        for index, frame in enumerate(cache["frame_indices"])
+    }
+    cache["tool_vertices"], _ = object_mesh(cache["tool_mesh"])
+    cache["target_vertices"], _ = object_mesh(cache["target_mesh"])
+    return cache
+
+
+def object_mesh(path):
+    mesh = trimesh.load(str(path), process=False)
+    return np.asarray(mesh.vertices, dtype=np.float32), np.asarray(mesh.faces)
+
+
+def project_object(vertices, object_pose, extrinsic, intrinsics):
+    world = vertices @ object_pose[:3, :3].T + object_pose[:3, 3]
+    camera = world @ extrinsic[:3, :3].T + extrinsic[:3, 3]
+    return project(camera, intrinsics)
+
+
+def draw_object(draw, vertices, object_pose, extrinsic, intrinsics, color, stride):
+    pixels, valid = project_object(
+        vertices[::max(1, stride)], object_pose, extrinsic, intrinsics
+    )
+    for point in pixels[valid]:
+        x, y = map(float, point)
+        draw.ellipse((x - 1, y - 1, x + 1, y + 1), fill=color)
+
+
 def contact_sheet(paths, output, columns=4):
     images = [Image.open(path).convert("RGB") for path in paths]
     if not images:
@@ -240,6 +289,7 @@ def main():
         pin_memory=True,
     )
     device = torch.device(args.device)
+    object_cache = load_object_cache(args.object_cache)
     base, base_epoch = infer(Path(args.base_checkpoint), sample, loader, device)
     tail, tail_epoch = infer(Path(args.tail_checkpoint), sample, loader, device)
 
@@ -310,6 +360,28 @@ def main():
             text = [
                 f"frame={frame} GT=green base{base_epoch}=orange tail{tail_epoch}=blue"
             ]
+            if object_cache is not None:
+                object_index = object_cache["frame_lookup"].get(int(frame))
+                if object_index is not None:
+                    draw_object(
+                        draw,
+                        object_cache["tool_vertices"],
+                        object_cache["tool_pose_object_to_world"][object_index],
+                        object_cache["extrinsics_world_to_camera"][object_index],
+                        intrinsics,
+                        (255, 175, 20),
+                        args.object_point_stride,
+                    )
+                    draw_object(
+                        draw,
+                        object_cache["target_vertices"],
+                        object_cache["target_pose_object_to_world"][object_index],
+                        object_cache["extrinsics_world_to_camera"][object_index],
+                        intrinsics,
+                        (35, 120, 255),
+                        args.object_point_stride,
+                    )
+                    text.append("objects: tool=orange target=blue")
             samples = [item for item in candidates if item[0][1] == frame]
             for key, base_error, tail_error in samples:
                 joints = track_joints(
