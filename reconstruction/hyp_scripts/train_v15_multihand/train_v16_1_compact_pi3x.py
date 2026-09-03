@@ -304,7 +304,7 @@ def main():
     train_loader = DataLoader(
         train_data, batch_size=args.batch_size, shuffle=sampler is None,
         sampler=sampler,
-        num_workers=args.num_workers, pin_memory=True, drop_last=True,
+        num_workers=args.num_workers, pin_memory=True, drop_last=sampler is not None,
     )
     val_loader = DataLoader(
         val_data, batch_size=args.batch_size, shuffle=False,
