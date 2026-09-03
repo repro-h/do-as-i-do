@@ -108,14 +108,14 @@ def mano_local_geometry(backend, model, side, pose, betas):
     return vertices - wrist, joints - wrist
 
 
-def load_predictions(args, rows, stream_id):
+def load_predictions(args, rows, stream_id, *, filtered_path=None):
     import torch
     from torch.utils.data import DataLoader
 
     selected_rows = [row for row in rows if row["stream_id"] == stream_id]
     if not selected_rows:
         raise RuntimeError(f"Sequence is absent from manifest: {stream_id}")
-    filtered = Path(args.object_cache).with_name("selected_windows.jsonl")
+    filtered = Path(filtered_path) if filtered_path is not None else Path(args.object_cache).with_name("selected_windows.jsonl")
     filtered.write_text(
         "".join(json_line(row) for row in selected_rows), encoding="utf-8"
     )
