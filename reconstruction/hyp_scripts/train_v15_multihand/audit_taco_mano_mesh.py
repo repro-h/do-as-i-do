@@ -48,6 +48,7 @@ def main():
     parser.add_argument("--triplet", required=True)
     parser.add_argument("--sequence", required=True)
     parser.add_argument("--out-dir", required=True)
+    parser.add_argument("--diagnostic-frames", type=int, nargs="+", help="Render pose/shape controls for these zero-based video frames")
     args = parser.parse_args()
 
     # Import the actual viewer implementation so this audit checks its decoding.
@@ -55,6 +56,7 @@ def main():
     from visualize_taco_v16_mano_object import mano_faces, mano_local_geometry
     import torch
     import trimesh
+    from taco_mano_diagnostics import camera_rigidity, export_rgb_frames, render_shape_controls
 
     code_root = Path(args.taco_code_root).expanduser().resolve()
     root = Path(args.taco_root).expanduser().resolve()
@@ -88,12 +90,20 @@ def main():
         "settings": {"use_pca": False, "flat_hand_mean": True, "center_idx": 0},
         "sides": {},
     }
+    requested_frames = sorted(set(args.diagnostic_frames or []))
+    if any(frame < 0 for frame in requested_frames):
+        raise ValueError("Diagnostic frame indices must be nonnegative")
+    extrinsics_path = root / "Egocentric_Camera_Parameters" / args.triplet / args.sequence / "egocentric_frame_extrinsic.npy"
+    extrinsics = np.load(extrinsics_path, allow_pickle=False)
+    report["camera_rigidity"] = camera_rigidity(extrinsics)
     for side in ("left", "right"):
         hand_root = root / "Hand_Poses" / args.triplet / args.sequence
         poses = load_pickle(hand_root / f"{side}_hand.pkl")
         betas = as_numpy(load_pickle(hand_root / f"{side}_hand_shape.pkl")["hand_shape"])
         if not poses:
             raise ValueError(f"Empty hand poses: {side}")
+        if len(poses) != len(extrinsics) or any(frame >= len(poses) for frame in requested_frames):
+            raise ValueError(f"Frame count/index mismatch for {side}: poses={len(poses)}, cameras={len(extrinsics)}, requested={requested_frames}")
         viewer = viewer_models[side]
         official = official_models[side]
         viewer_faces = mano_faces(viewer, 778)
@@ -103,6 +113,7 @@ def main():
         per_frame = []
         raw_poses = []
         pose_shapes = set()
+        diagnostic_outputs = []
         for index, key in enumerate(sorted(poses, key=str)):
             pose = as_numpy(poses[key]["hand_pose"])
             if pose.size != 48 or not np.isfinite(pose).all():
@@ -111,6 +122,34 @@ def main():
             raw_poses.append(pose.reshape(48))
             vv, vj = mano_local_geometry("smplx", viewer, side, pose, betas)
             ov, oj = official_geometry(official, pose, betas)
+            if index in requested_frames:
+                # Keep local rotations untouched and remove only global orientation.
+                canonical_pose = pose.reshape(48).copy()
+                canonical_pose[:3] = 0
+                zero_pose = np.zeros(48, dtype=np.float32)
+                zero_shape = np.zeros(10, dtype=np.float32)
+                variants = []
+                for name, control_pose, control_shape in (
+                    ("dataset_pose_dataset_shape", canonical_pose, betas),
+                    ("dataset_pose_zero_shape", canonical_pose, zero_shape),
+                    ("zero_pose_dataset_shape", zero_pose, betas),
+                    ("zero_pose_zero_shape", zero_pose, zero_shape),
+                ):
+                    control_vertices, _ = official_geometry(official, control_pose, control_shape)
+                    variants.append((name, control_vertices))
+                    trimesh.Trimesh(vertices=control_vertices, faces=official_faces, process=False).export(
+                        out / f"{side}_frame_{index:06d}_{name}.obj"
+                    )
+                sheet = out / f"{side}_frame_{index:06d}_shape_controls.png"
+                render_shape_controls(variants, official_faces, sheet, f"{args.sequence} | {side} | frame={index} | key={key}")
+                # Save the actual camera-space mesh without diagnostic pose changes.
+                translation = as_numpy(poses[key]["hand_trans"]).reshape(3)
+                world_vertices = ov + translation
+                camera_vertices = world_vertices @ extrinsics[index, :3, :3].T + extrinsics[index, :3, 3]
+                trimesh.Trimesh(vertices=camera_vertices, faces=official_faces, process=False).export(
+                    out / f"{side}_frame_{index:06d}_official_camera.obj"
+                )
+                diagnostic_outputs.append(str(sheet))
             for name, value in zip(collected, (vv, ov, vj, oj)):
                 collected[name].append(value)
             per_frame.append({
@@ -139,6 +178,8 @@ def main():
                 )
         report["sides"][side] = {
             "frames": len(poses), "faces": face_report,
+            "shape_values": betas.reshape(-1).tolist(),
+            "diagnostic_images": diagnostic_outputs,
             "raw_hand_pose": {
                 "shapes": sorted(pose_shapes),
                 "min": float(np.min(raw_poses)),
@@ -151,6 +192,9 @@ def main():
             "worst_frame": worst, "controls": controls,
         }
         (out / f"{side}_per_frame.json").write_text(json.dumps(per_frame, indent=2), encoding="utf-8")
+    report["rgb_frames"] = export_rgb_frames(
+        root / "Egocentric_RGB_Videos" / args.triplet / args.sequence / "color.mp4", requested_frames, out,
+    )
     (out / "summary.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report, indent=2), flush=True)
     print(f"Mesh comparison saved to {out}", flush=True)
