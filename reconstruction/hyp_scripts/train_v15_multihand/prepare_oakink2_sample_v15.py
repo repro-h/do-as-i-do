@@ -28,6 +28,10 @@ def parse_args():
     parser.add_argument("--sequence-list")
     parser.add_argument("--cameras", nargs="+", choices=CAMERAS, default=["egocentric"])
     parser.add_argument("--val-fraction", type=float, default=0.25)
+    parser.add_argument(
+        "--val-subjects", nargs="+",
+        help="Fixed validation subjects; otherwise reuse an existing status.json split.",
+    )
     parser.add_argument("--frame-stride", type=int, default=1)
     parser.add_argument("--window-size", type=int, default=16)
     parser.add_argument("--window-stride", type=int, default=8)
@@ -102,12 +106,39 @@ def output_is_current(manifest):
         return False
 
 
+def resolve_split(sequences, out_root, val_fraction, val_subjects=None):
+    status_path = out_root / "status.json"
+    previous_subjects = None
+    if status_path.is_file():
+        previous = json.loads(status_path.read_text(encoding="utf-8"))
+        previous_subjects = previous.get("val_subjects")
+        if not previous_subjects:
+            raise ValueError(f"Existing status has no validation subjects: {status_path}")
+    if val_subjects is not None and previous_subjects is not None:
+        if set(val_subjects) != set(previous_subjects):
+            raise ValueError(
+                "Validation subjects differ from the existing output; "
+                "use a new output root for a different split"
+            )
+    fixed = val_subjects if val_subjects is not None else previous_subjects
+    if fixed is None:
+        return subject_split(sequences, val_fraction)
+    fixed = sorted(set(fixed))
+    split = {
+        sequence: ("val" if subject_id(sequence) in fixed else "train")
+        for sequence in sequences
+    }
+    return split, fixed
+
+
 def main():
     args = parse_args()
     oak_root = Path(args.oakink2_root).expanduser().resolve()
     out_root = Path(args.out_root).expanduser().resolve()
     sequences, annotations = discover_sequences(oak_root, args.sequence_list)
-    split_by_sequence, val_subjects = subject_split(sequences, args.val_fraction)
+    split_by_sequence, val_subjects = resolve_split(
+        sequences, out_root, args.val_fraction, args.val_subjects
+    )
     converter = Path(__file__).with_name("prepare_oakink2_v15.py")
     merged = {"train": [], "val": []}
     failures = []
