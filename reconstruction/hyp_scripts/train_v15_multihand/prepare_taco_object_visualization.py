@@ -33,8 +33,10 @@ def mesh_data(path, scale):
     )
 
 
-def project(vertices, pose, intrinsics):
-    points = vertices @ pose[:3, :3].T + pose[:3, 3]
+def project(vertices, object_pose, extrinsic, intrinsics):
+    # TACO object poses are object-local -> world; camera extrinsics are world -> camera.
+    world_points = vertices @ object_pose[:3, :3].T + object_pose[:3, 3]
+    points = world_points @ extrinsic[:3, :3].T + extrinsic[:3, 3]
     pixels = np.full((len(points), 2), np.nan, dtype=np.float32)
     valid = np.isfinite(points).all(axis=1) & (points[:, 2] > 1e-6)
     if valid.any():
@@ -43,8 +45,8 @@ def project(vertices, pose, intrinsics):
     return pixels, valid
 
 
-def draw_mesh(image, vertices, faces, pose, intrinsics, color):
-    pixels, valid = project(vertices, pose, intrinsics)
+def draw_mesh(image, vertices, faces, object_pose, extrinsic, intrinsics, color):
+    pixels, valid = project(vertices, object_pose, extrinsic, intrinsics)
     height, width = image.shape[:2]
     stride = max(1, len(faces) // 2500)
     for face in faces[::stride]:
@@ -90,6 +92,17 @@ def main():
     intrinsics = np.asarray(
         np.loadtxt(camera_root / "egocentric_intrinsic.txt"), dtype=np.float32
     )
+    extrinsics = np.asarray(
+        np.load(camera_root / "egocentric_frame_extrinsic.npy", allow_pickle=False),
+        dtype=np.float32,
+    )
+    if extrinsics.ndim != 3 or extrinsics.shape[1:] != (4, 4):
+        raise ValueError(f"Invalid egocentric extrinsic shape: {extrinsics.shape}")
+    if len(extrinsics) != len(tool_pose):
+        raise ValueError(
+            "Pose/extrinsic lengths differ: "
+            f"{tool_pose.shape[0]} vs {extrinsics.shape[0]}"
+        )
     tool_vertices, tool_faces = mesh_data(
         mesh_root / f"{args.tool_id}_cm.obj", args.mesh_scale
     )
@@ -100,8 +113,9 @@ def main():
     np.savez_compressed(
         out_root / "object_cache.npz",
         frame_indices=np.arange(len(tool_pose), dtype=np.int32),
-        tool_pose_camera=tool_pose,
-        target_pose_camera=target_pose,
+        tool_pose_object_to_world=tool_pose,
+        target_pose_object_to_world=target_pose,
+        extrinsics_world_to_camera=extrinsics,
         intrinsics=intrinsics,
         mesh_scale=np.float32(args.mesh_scale),
         tool_mesh=np.asarray(str(mesh_root / f"{args.tool_id}_cm.obj")),
@@ -123,11 +137,11 @@ def main():
                 continue
             draw_mesh(
                 image, tool_vertices, tool_faces, tool_pose[frame_index],
-                intrinsics, (0, 180, 255),
+                extrinsics[frame_index], intrinsics, (0, 180, 255),
             )
             draw_mesh(
                 image, target_vertices, target_faces, target_pose[frame_index],
-                intrinsics, (255, 120, 0),
+                extrinsics[frame_index], intrinsics, (255, 120, 0),
             )
             cv2.putText(
                 image,
@@ -154,6 +168,8 @@ def main():
         "target_mesh": str(mesh_root / f"{args.target_id}_cm.obj"),
         "mesh_scale": args.mesh_scale,
         "coordinate_frame": "taco_egocentric_camera",
+        "extrinsics": str(camera_root / "egocentric_frame_extrinsic.npy"),
+        "pose_convention": "object_local_to_world_then_world_to_camera",
         "overlay_count": len(list(overlay_dir.glob("*.jpg"))),
         "cache": str(out_root / "object_cache.npz"),
     }
