@@ -2,6 +2,7 @@
 """Viser viewer for TACO GT/predicted MANO hands and GT object meshes."""
 
 import argparse
+import json
 import pickle
 import sys
 import threading
@@ -9,7 +10,6 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-import cv2
 import numpy as np
 import trimesh
 import viser
@@ -21,9 +21,11 @@ if str(SCRIPT_DIR) not in sys.path:
 from compact_dataset import CompactWindowDataset  # noqa: E402
 from dataset import DexYCBMultiHandWindowDataset, QueryNoise  # noqa: E402
 from online_pi3x import DiskCompactFeatureProvider, DummyDenseProvider  # noqa: E402
-from prepare_taco_v15 import create_mano_models  # noqa: E402
+from prepare_taco_v15 import (  # noqa: E402
+    SMPLX_MANO_TO_WRIST_FIRST,
+    create_mano_models,
+)
 from train import move  # noqa: E402
-from train_v16_1_compact_pi3x import load_model_state  # noqa: E402
 from visualize_taco_translation_predictions import make_model  # noqa: E402
 
 
@@ -33,18 +35,18 @@ def parse_args():
     parser.add_argument("--triplet", required=True)
     parser.add_argument("--sequence", required=True)
     parser.add_argument("--mano-model-folder", required=True)
+    parser.add_argument("--taco-code-root", help="Use the same TACO manopth backend as preprocessing")
     parser.add_argument("--windows", required=True)
     parser.add_argument("--visibility-root", required=True)
     parser.add_argument("--track-root", required=True)
     parser.add_argument("--compact-cache-root", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--object-cache", required=True)
-    parser.add_argument("--out-frame-dir", default=None)
     parser.add_argument("--max-hands", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--port", type=int, default=17893)
+    parser.add_argument("--port", type=int, default=8100)
     return parser.parse_args()
 
 
@@ -58,7 +60,23 @@ def transform_points(transform, points):
     return points @ np.asarray(transform[:3, :3]).T + np.asarray(transform[:3, 3])
 
 
-def mano_local_vertices(backend, model, pose, betas):
+def mano_faces(model, vertex_count):
+    faces = getattr(model, "faces", None)
+    if faces is None:
+        faces = getattr(model, "th_faces", None)
+    if faces is None:
+        raise ValueError("MANO model has neither faces nor th_faces")
+    if hasattr(faces, "detach"):
+        faces = faces.detach().cpu().numpy()
+    faces = np.asarray(faces, dtype=np.int64)
+    if faces.ndim != 2 or faces.shape[1] != 3 or not len(faces):
+        raise ValueError(f"Invalid MANO faces shape: {faces.shape}")
+    if faces.min() < 0 or faces.max() >= vertex_count:
+        raise ValueError("MANO faces index outside vertex array")
+    return faces.astype(np.uint32)
+
+
+def mano_local_geometry(backend, model, side, pose, betas):
     pose = np.asarray(pose, dtype=np.float32).reshape(1, 48)
     betas = np.asarray(betas, dtype=np.float32).reshape(1, 10)
     import torch
@@ -79,7 +97,15 @@ def mano_local_vertices(backend, model, pose, betas):
             )
             vertices = output.vertices[0].detach().cpu().numpy().astype(np.float32)
             joints = output.joints[0].detach().cpu().numpy().astype(np.float32)
-    return vertices - joints[0:1]
+    wrist = joints[0:1].copy()
+    if backend != "manopth":
+        if len(joints) == 16:
+            tips = [745, 317, 444 if side == "right" else 445, 556, 673]
+            joints = np.concatenate((joints, vertices[tips]), axis=0)
+        joints = joints[:21][SMPLX_MANO_TO_WRIST_FIRST]
+    if joints.shape != (21, 3):
+        raise ValueError(f"Unexpected MANO joint shape: {joints.shape}")
+    return vertices - wrist, joints - wrist
 
 
 def load_predictions(args, rows, stream_id):
@@ -93,6 +119,8 @@ def load_predictions(args, rows, stream_id):
     filtered.write_text(
         "".join(json_line(row) for row in selected_rows), encoding="utf-8"
     )
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    config = checkpoint.get("args", {})
     metadata = DexYCBMultiHandWindowDataset(
         filtered,
         None,
@@ -102,6 +130,10 @@ def load_predictions(args, rows, stream_id):
         visibility_source="detector",
         visibility_root=args.visibility_root,
         track_root=args.track_root,
+        near_anchor_frames=config.get("near_anchor_frames", 4),
+        max_anchor_frames=config.get("max_anchor_frames", 8),
+        near_missing_weight=config.get("near_missing_weight", 0.5),
+        far_missing_weight=config.get("far_missing_weight", 0.2),
         dense_provider=DummyDenseProvider(),
     )
     provider = DiskCompactFeatureProvider(args.compact_cache_root)
@@ -114,7 +146,6 @@ def load_predictions(args, rows, stream_id):
         pin_memory=True,
     )
     sample = dataset[0]
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     device = torch.device(args.device)
     model = make_model(checkpoint, sample, device)
     predictions = defaultdict(list)
@@ -156,29 +187,48 @@ def load_predictions(args, rows, stream_id):
             ).astype(np.float32),
             "target": values[0][1].astype(np.float32),
         }
-    return fused, metadata
+    return fused
 
 
 def json_line(row):
-    import json
     return json.dumps(row, separators=(",", ":")) + "\n"
+
+
+def update_mesh(server, handles, path, vertices, faces, color, visible, opacity):
+    valid = vertices is not None and np.isfinite(vertices).all()
+    if not visible or not valid:
+        if path in handles:
+            handles[path].visible = False
+        return
+    handles[path] = server.scene.add_mesh_simple(
+        path, vertices=np.asarray(vertices, dtype=np.float32),
+        faces=faces, color=color, opacity=opacity, side="double",
+    )
+    handles[path].visible = True
+
+
+def error_summary(values):
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    return {
+        "count": int(values.size),
+        "median_mm": float(np.median(values)) if values.size else None,
+        "max_mm": float(values.max()) if values.size else None,
+    }
 
 
 def main():
     args = parse_args()
-    import json
 
     stream_id = f"taco__{args.sequence}"
     root = Path(args.taco_root).expanduser().resolve()
     object_cache_path = Path(args.object_cache).expanduser().resolve()
-    with object_cache_path.open("rb"):
-        pass
     rows = [
         json.loads(line)
         for line in Path(args.windows).read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    predictions, metadata = load_predictions(args, rows, stream_id)
+    predictions = load_predictions(args, rows, stream_id)
 
     with np.load(object_cache_path, allow_pickle=False) as data:
         object_data = {key: data[key].copy() for key in data.files}
@@ -196,13 +246,20 @@ def main():
         track_frames = track["frame_indices"].copy()
         track_ids = track["track_ids"].copy()
         track_sides = track["hand_side"].copy()
+        track_xyz = track["joint_xyz"].copy()
     frame_to_track = {}
+    reference_joints = {}
     for frame_index, frame in enumerate(track_frames):
         for slot in range(track_ids.shape[1]):
             track_id = int(track_ids[frame_index, slot])
             side = int(track_sides[frame_index, slot])
             if track_id >= 0 and side in (0, 1):
-                frame_to_track[(int(frame), track_id)] = ("left" if side == 0 else "right")
+                side_name = "left" if side == 0 else "right"
+                frame_to_track[(int(frame), track_id)] = side_name
+                side_key = (int(frame), side_name)
+                if side_key in reference_joints:
+                    raise ValueError(f"Ambiguous TACO hand-side mapping: {side_key}")
+                reference_joints[side_key] = track_xyz[frame_index, slot]
 
     hand_root = root / "Hand_Poses" / args.triplet / args.sequence
     hand_pose = {side: load_pickle(hand_root / f"{side}_hand.pkl") for side in ("left", "right")}
@@ -210,137 +267,155 @@ def main():
         side: load_pickle(hand_root / f"{side}_hand_shape.pkl")["hand_shape"]
         for side in ("left", "right")
     }
-    camera_root = root / "Egocentric_Camera_Parameters" / args.triplet / args.sequence
-    intrinsics = np.loadtxt(camera_root / "egocentric_intrinsic.txt").astype(np.float32)
     extrinsics = np.asarray(object_data["extrinsics_world_to_camera"], dtype=np.float32)
-    mano_backend, mano_models = create_mano_models(args.mano_model_folder)
+    frame_ids = np.asarray(object_data["frame_indices"], dtype=np.int64)
+    if not len(frame_ids) or len(set(frame_ids.tolist())) != len(frame_ids):
+        raise ValueError("Object cache needs nonempty, unique frame_indices")
+    if extrinsics.shape != (len(frame_ids), 4, 4):
+        raise ValueError("Object extrinsics and frame_indices disagree")
+    for name in ("tool", "target"):
+        if object_data[f"{name}_pose_object_to_world"].shape != extrinsics.shape:
+            raise ValueError(f"Object pose frame count mismatch: {name}")
+    mano_backend, mano_models = create_mano_models(
+        args.mano_model_folder, args.taco_code_root
+    )
+    pose_keys = {side: sorted(hand_pose[side], key=str) for side in hand_pose}
+    annotation_keys = {}
+    for row in rows:
+        if row["stream_id"] != stream_id:
+            continue
+        for frame, label in zip(row["frame_indices"], row["label_paths"]):
+            if int(frame) in annotation_keys:
+                continue
+            with np.load(label, allow_pickle=False) as data:
+                if "source_frame_id" in data and int(data["source_frame_id"]) != int(frame):
+                    raise ValueError(f"TACO source/cache frame mismatch: {label}")
+                if "taco_annotation_key" in data:
+                    annotation_keys[int(frame)] = dict(zip(
+                        data["hand_sides"].astype(str), data["taco_annotation_key"].astype(str)
+                    ))
     local_camera = {"left": [], "right": []}
     gt_wrist_camera = {"left": [], "right": []}
-    for frame in range(len(extrinsics)):
+    audits = {side: {"wrist": [], "joint": []} for side in hand_pose}
+    hand_faces = {}
+    for offset, frame in enumerate(frame_ids):
         for side in ("left", "right"):
-            keys = sorted(hand_pose[side], key=str)
-            item = hand_pose[side][keys[frame]]
-            local_world = mano_local_vertices(
-                mano_backend, mano_models[side], item["hand_pose"], hand_betas[side]
+            if frame < 0 or frame >= len(pose_keys[side]):
+                raise ValueError(f"Annotation missing frame {frame}: {side}")
+            key = annotation_keys.get(int(frame), {}).get(side, pose_keys[side][frame])
+            item = hand_pose[side][key]
+            local_world, local_joints = mano_local_geometry(
+                mano_backend, mano_models[side], side, item["hand_pose"], hand_betas[side]
             )
-            local_camera[side].append(local_world @ extrinsics[frame, :3, :3].T)
-            gt_wrist_camera[side].append(
-                transform_points(extrinsics[frame], np.asarray(item["hand_trans"], dtype=np.float32).reshape(1, 3))[0]
-            )
+            ext = extrinsics[offset]
+            wrist = transform_points(
+                ext, np.asarray(item["hand_trans"], dtype=np.float32).reshape(1, 3)
+            )[0]
+            local_camera[side].append(local_world @ ext[:3, :3].T)
+            gt_wrist_camera[side].append(wrist)
+            if side not in hand_faces:
+                hand_faces[side] = mano_faces(mano_models[side], len(local_world))
+            reference = reference_joints.get((int(frame), side))
+            if reference is not None:
+                reconstructed = local_joints @ ext[:3, :3].T + wrist
+                errors = np.linalg.norm(reconstructed - reference, axis=-1) * 1000
+                audits[side]["wrist"].append(errors[0])
+                audits[side]["joint"].extend(errors)
 
-    capture = cv2.VideoCapture(
-        str(root / "Egocentric_RGB_Videos" / args.triplet / args.sequence / "color.mp4")
-    )
-    first_ok, first = capture.read()
-    if not first_ok:
-        raise RuntimeError("Could not read TACO video")
-    height, width = first.shape[:2]
-    capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    out_frame_dir = Path(args.out_frame_dir).expanduser().resolve() if args.out_frame_dir else None
-    if out_frame_dir:
-        out_frame_dir.mkdir(parents=True, exist_ok=True)
+    prediction_by_side = {}
+    for key, result in predictions.items():
+        side = frame_to_track.get(key)
+        if side is None:
+            raise ValueError(f"Prediction has no known hand side: {key}")
+        prediction_by_side[(key[0], side)] = result["prediction"]
+    audit_report = {
+        "mano_backend": mano_backend,
+        "prediction_geometry": "GT MANO pose/shape plus predicted camera wrist translation",
+        "coordinate_frame": "camera_x_right_y_down_z_forward_meters",
+        "frames": len(frame_ids),
+        "prediction_hand_frames": len(prediction_by_side),
+        "gt_vs_tracks": {
+            side: {name: error_summary(values) for name, values in errors.items()}
+            for side, errors in audits.items()
+        },
+    }
+    audit_path = object_cache_path.with_name("viser_mano_audit.json")
+    audit_path.write_text(json.dumps(audit_report, indent=2), encoding="utf-8")
+    print(json.dumps(audit_report, indent=2), flush=True)
+    if any(error_summary(audits[side]["joint"])["median_mm"] is not None
+           and error_summary(audits[side]["joint"])["median_mm"] > 5
+           for side in audits):
+        print(
+            "WARNING: MANO reconstruction differs from track annotations by >5 mm median. "
+            "Check MANO models and --taco-code-root against preprocessing.", flush=True,
+        )
 
     server = viser.ViserServer(port=args.port)
     server.scene.set_up_direction("-y")
-    frame_slider = server.gui.add_slider("Frame", min=0, max=len(extrinsics) - 1, step=1, initial_value=0)
-    play_button = server.gui.add_button("Play")
+    server.scene.add_frame("/camera_axes", axes_length=0.1, axes_radius=0.002)
+    frame_slider = server.gui.add_slider(
+        "Frame Index", min=0, max=max(1, len(frame_ids) - 1), step=1, initial_value=0,
+    )
+    play = server.gui.add_checkbox("Play", initial_value=False)
+    fps = server.gui.add_slider("FPS", min=1, max=30, step=1, initial_value=15)
     show_gt = server.gui.add_checkbox("Show GT", initial_value=True)
     show_pred = server.gui.add_checkbox("Show Prediction", initial_value=True)
     show_objects = server.gui.add_checkbox("Show Objects", initial_value=True)
-    playing = False
-    lock = threading.Lock()
-    fov_y = 2.0 * np.arctan(height / (2.0 * intrinsics[1, 1]))
+    gt_opacity = server.gui.add_slider(
+        "GT Opacity", min=0.05, max=1.0, step=0.05, initial_value=0.3,
+    )
+    handles = {}
+    dirty = threading.Event()
+    dirty.set()
 
-    def read_frame(frame_index):
-        capture.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
-        ok, image = capture.read()
-        return None if not ok else cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-    def add_hand(path, vertices, color, visible, opacity=1.0):
-        handle = server.scene.add_mesh_simple(
-            path, vertices=np.asarray(vertices, dtype=np.float32),
-            faces=np.asarray(mano_models["right"].faces, dtype=np.uint32),
-            color=color, opacity=opacity, side="double",
-        )
-        handle.visible = visible
-
-    def update(frame_index):
-        frame_index = int(frame_index)
-        image = read_frame(frame_index)
-        if image is None:
-            return
-        server.scene.add_camera_frustum(
-            "/camera", fov=float(fov_y), aspect=width / height, scale=0.35,
-            image=image, format="jpeg", jpeg_quality=90,
-        )
-        if out_frame_dir:
-            cv2.imwrite(str(out_frame_dir / f"{frame_index:06d}.jpg"), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
-
-        ext = extrinsics[frame_index]
-        if show_objects.value:
-            for name, vertices, pose, color in (
-                ("tool", tool_vertices, object_data["tool_pose_object_to_world"][frame_index], (255, 170, 20)),
-                ("target", target_vertices, object_data["target_pose_object_to_world"][frame_index], (35, 120, 255)),
-            ):
-                world = vertices @ pose[:3, :3].T + pose[:3, 3]
-                camera = world @ ext[:3, :3].T + ext[:3, 3]
-                handle = server.scene.add_mesh_simple(
-                    f"/gt/object/{name}", vertices=camera.astype(np.float32),
-                    faces=faces[name], color=color, opacity=0.65, side="double",
-                )
-                handle.visible = True
-
+    def update(offset):
+        frame = int(frame_ids[offset])
+        ext = extrinsics[offset]
+        for name, vertices, color in (
+            ("tool", tool_vertices, (255, 170, 20)),
+            ("target", target_vertices, (35, 120, 255)),
+        ):
+            pose = object_data[f"{name}_pose_object_to_world"][offset]
+            camera = transform_points(ext, transform_points(pose, vertices))
+            update_mesh(
+                server, handles, f"/objects/{name}", camera, faces[name],
+                color, show_objects.value, 1.0,
+            )
         for side in ("left", "right"):
-            gt = np.asarray(local_camera[side][frame_index]) + gt_wrist_camera[side][frame_index]
-            add_hand(f"/gt/hand/{side}", gt, (80, 235, 100), show_gt.value, 0.5)
-            for (frame, track_id), result in predictions.items():
-                if frame != frame_index or frame_to_track.get((frame, track_id)) != side:
-                    continue
-                pred = np.asarray(local_camera[side][frame_index]) + result["prediction"]
-                add_hand(f"/prediction/hand/{side}", pred, (255, 150, 40), show_pred.value, 0.8)
+            local = np.asarray(local_camera[side][offset])
+            gt = local + gt_wrist_camera[side][offset]
+            wrist = prediction_by_side.get((frame, side))
+            pred = None if wrist is None else local + wrist
+            update_mesh(
+                server, handles, f"/gt/hand/{side}", gt, hand_faces[side],
+                (80, 235, 100), show_gt.value, gt_opacity.value,
+            )
+            update_mesh(
+                server, handles, f"/prediction/hand/{side}", pred, hand_faces[side],
+                (255, 150, 40), show_pred.value, 1.0,
+            )
 
-    update(0)
+    # Viser callbacks may run on worker threads; only the main loop updates meshes.
+    def request_update(_):
+        dirty.set()
 
-    @frame_slider.on_update
-    def on_frame(_):
-        update(int(frame_slider.value))
+    for control in (frame_slider, show_gt, show_pred, show_objects, gt_opacity):
+        control.on_update(request_update)
 
-    @show_gt.on_update
-    def on_gt(_):
-        update(int(frame_slider.value))
-
-    @show_pred.on_update
-    def on_pred(_):
-        update(int(frame_slider.value))
-
-    @show_objects.on_update
-    def on_objects(_):
-        update(int(frame_slider.value))
-
-    @play_button.on_click
-    def on_play(_):
-        nonlocal playing
-        with lock:
-            playing = not playing
-            play_button.name = "Pause" if playing else "Play"
-
-    def loop():
-        nonlocal playing
-        while True:
-            if playing:
-                next_frame = int(frame_slider.value) + 1
-                frame_slider.value = next_frame if next_frame < len(extrinsics) else 0
-                update(int(frame_slider.value))
-                time.sleep(1.0 / 30.0)
-            else:
-                time.sleep(0.05)
-
-    threading.Thread(target=loop, daemon=True).start()
-    print(f"Viewer running at http://localhost:{args.port}")
+    print(f"Viewer running at http://localhost:{args.port}", flush=True)
     print("Use SSH port forwarding if the server is remote.")
+    next_tick = time.monotonic()
     try:
         while True:
-            time.sleep(1.0)
+            now = time.monotonic()
+            if play.value and now >= next_tick:
+                frame_slider.value = (int(frame_slider.value) + 1) % len(frame_ids)
+                next_tick = now + 1.0 / fps.value
+                dirty.set()
+            if dirty.is_set():
+                dirty.clear()
+                update(min(int(frame_slider.value), len(frame_ids) - 1))
+            time.sleep(0.01)
     except KeyboardInterrupt:
         pass
 
