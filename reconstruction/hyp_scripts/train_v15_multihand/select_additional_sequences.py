@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 HOT3D_PATTERN = re.compile(r"P\d{4}_[0-9A-Za-z]+")
-OAKINK2_PATTERN = re.compile(r"scene_[^/]+__[^/]+\+\+seq__[^/]+")
+OAKINK2_PATTERN = re.compile(r"scene_\d+__[A-Za-z0-9]+\+\+seq__[A-Za-z0-9_-]+")
 
 
 def parse_args():
@@ -40,7 +40,8 @@ def normalized_sequence(dataset, value):
     elif name.endswith(".pkl"):
         name = name[:-4]
     pattern = HOT3D_PATTERN if dataset == "hot3d" else OAKINK2_PATTERN
-    match = pattern.search(name)
+    # OakInk2 completion markers and partial downloads are not sequence IDs.
+    match = pattern.fullmatch(name) if dataset == "oakink2" else pattern.search(name)
     return match.group(0) if match else None
 
 
