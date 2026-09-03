@@ -104,7 +104,6 @@ def create_mano_models(model_folder, taco_code_root=None):
     import smplx
 
     common = {
-        "model_path": str(model_folder),
         "model_type": "mano",
         "use_pca": False,
         "flat_hand_mean": True,
@@ -112,8 +111,12 @@ def create_mano_models(model_folder, taco_code_root=None):
         "batch_size": 1,
     }
     return "smplx", {
-        "left": smplx.create(is_rhand=False, **common).eval(),
-        "right": smplx.create(is_rhand=True, **common).eval(),
+        side: smplx.create(
+            model_path=str(model_folder / f"MANO_{side.upper()}.pkl"),
+            is_rhand=(side == "right"),
+            **common,
+        ).eval()
+        for side in ("left", "right")
     }
 
 

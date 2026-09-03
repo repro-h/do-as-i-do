@@ -59,6 +59,7 @@ def main():
     code_root = Path(args.taco_code_root).expanduser().resolve()
     root = Path(args.taco_root).expanduser().resolve()
     out = Path(args.out_dir).expanduser().resolve()
+    print("Loading viewer SMPL-X and TACO manopth models...", flush=True)
     _, viewer_models = create_mano_models(args.mano_model_folder)
     _, official_models = create_mano_models(args.mano_model_folder, code_root)
     implementation = Path(inspect.getfile(type(official_models["right"]))).resolve()
@@ -100,8 +101,14 @@ def main():
         face_report = compare_faces(viewer_faces, official_faces)
         collected = {name: [] for name in ("viewer_vertices", "official_vertices", "viewer_joints", "official_joints")}
         per_frame = []
+        raw_poses = []
+        pose_shapes = set()
         for index, key in enumerate(sorted(poses, key=str)):
             pose = as_numpy(poses[key]["hand_pose"])
+            if pose.size != 48 or not np.isfinite(pose).all():
+                raise ValueError(f"Invalid hand_pose at {side}/{key}: {pose.shape}")
+            pose_shapes.add(tuple(pose.shape))
+            raw_poses.append(pose.reshape(48))
             vv, vj = mano_local_geometry("smplx", viewer, side, pose, betas)
             ov, oj = official_geometry(official, pose, betas)
             for name, value in zip(collected, (vv, ov, vj, oj)):
@@ -111,6 +118,8 @@ def main():
                 "vertices": distance_summary(vv, ov),
                 "joints": distance_summary(vj, oj),
             })
+            if index % 25 == 0 or index + 1 == len(poses):
+                print(f"{side}: {index + 1}/{len(poses)} frames compared", flush=True)
         worst = max(per_frame, key=lambda row: row["vertices"]["max_mm"])
         worst_index = worst["frame_index"]
         for backend, faces in (("viewer", viewer_faces), ("official", official_faces)):
@@ -130,6 +139,13 @@ def main():
                 )
         report["sides"][side] = {
             "frames": len(poses), "faces": face_report,
+            "raw_hand_pose": {
+                "shapes": sorted(pose_shapes),
+                "min": float(np.min(raw_poses)),
+                "max": float(np.max(raw_poses)),
+                "first_frame_values": raw_poses[0].tolist(),
+                "interpretation": "3 global + 45 local axis-angle values; PCA disabled as in TACO loader",
+            },
             "vertices": distance_summary(collected["viewer_vertices"], collected["official_vertices"]),
             "joints": distance_summary(collected["viewer_joints"], collected["official_joints"]),
             "worst_frame": worst, "controls": controls,
