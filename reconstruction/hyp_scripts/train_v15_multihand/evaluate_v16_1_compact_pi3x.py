@@ -22,6 +22,54 @@ from train import run_epoch  # noqa: E402
 from train_v16_1_compact_pi3x import load_model_state  # noqa: E402
 
 
+FEATURE_ABLATIONS = (
+    "full",
+    "no-local",
+    "shuffled-local",
+    "no-global",
+    "no-metric",
+    "prior-only",
+)
+
+
+class FeatureAblationWrapper(torch.nn.Module):
+    """Apply inference-only Pi3X feature ablations without rewriting caches."""
+
+    def __init__(self, model, mode):
+        super().__init__()
+        self.model = model
+        self.mode = mode
+
+    @staticmethod
+    def _shuffle_local(feature):
+        if feature.shape[0] > 1:
+            return feature.roll(shifts=1, dims=0)
+        if feature.shape[1] > 1:
+            return feature.roll(shifts=max(1, feature.shape[1] // 2), dims=1)
+        return feature.flip(dims=(-2,))
+
+    def forward(self, batch):
+        if self.mode == "full":
+            return self.model(batch)
+
+        batch = dict(batch)
+        if self.mode == "shuffled-local":
+            batch["joint_patch_features"] = self._shuffle_local(
+                batch["joint_patch_features"]
+            )
+        if self.mode in ("no-local", "prior-only"):
+            batch["joint_patch_features"] = torch.zeros_like(
+                batch["joint_patch_features"]
+            )
+        if self.mode in ("no-global", "prior-only"):
+            batch["global_features"] = torch.zeros_like(batch["global_features"])
+        if self.mode in ("no-metric", "prior-only"):
+            batch["metric_window_features"] = torch.zeros_like(
+                batch["metric_window_features"]
+            )
+        return self.model(batch)
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--windows", required=True)
@@ -37,6 +85,12 @@ def parse_args():
     parser.add_argument("--global-grid-size", type=int, default=4)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--data-parallel", action="store_true")
+    parser.add_argument(
+        "--feature-ablation",
+        choices=FEATURE_ABLATIONS,
+        default="full",
+        help="Inference-only Pi3X feature ablation; does not retrain the model.",
+    )
     return parser.parse_args()
 
 
@@ -98,11 +152,12 @@ def main():
             config, "max_image_offset_fraction", 0.15
         ),
     ).to(device)
+    load_model_state(model, checkpoint["model"])
+    model = FeatureAblationWrapper(model, args.feature_ablation).to(device)
     if args.data_parallel:
         if device.type != "cuda" or torch.cuda.device_count() < 2:
             raise RuntimeError("--data-parallel requires at least two CUDA devices")
         model = torch.nn.DataParallel(model)
-    load_model_state(model, checkpoint["model"])
 
     loader = DataLoader(
         dataset,
@@ -139,6 +194,8 @@ def main():
         "compact_cache_root": str(
             Path(args.compact_cache_root).expanduser().resolve()
         ),
+        "feature_ablation": args.feature_ablation,
+        "feature_ablation_scope": "inference_only_no_retraining",
         "metrics": metrics,
     }
     output = Path(args.out_json).expanduser().resolve()
