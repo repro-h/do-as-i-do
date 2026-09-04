@@ -86,7 +86,7 @@ class CompactMultiHandPi3XTrajectoryModel(nn.Module):
         nn.init.normal_(self.frame_residual[-1].weight, std=1e-3)
         nn.init.zeros_(self.frame_residual[-1].bias)
 
-    def forward(self, batch):
+    def encode_frame_features(self, batch):
         feature = batch["joint_patch_features"].float()
         patch_uv = batch["joint_patch_uv"].float()
         patch_confidence = batch["joint_patch_confidence"].float()
@@ -178,7 +178,11 @@ class CompactMultiHandPi3XTrajectoryModel(nn.Module):
             wrist, pooled, global_token, metric,
             observed_fraction, visible_fraction,
         ), dim=-1))
+        return frame
 
+    def forward(self, batch):
+        frame = self.encode_frame_features(batch)
+        batch_size, time, hands, _ = frame.shape
         frame = frame.permute(0, 2, 1, 3).reshape(batch_size * hands, time, -1)
         frame = frame + self.temporal_position[:time][None]
         temporal_valid = slot_valid.permute(0, 2, 1).reshape(batch_size * hands, time)
@@ -221,3 +225,101 @@ class CompactMultiHandPi3XTrajectoryModel(nn.Module):
             / intrinsics[..., 1, 1].clamp_min(1e-6) * depth[..., 0]
         )
         return torch.stack((x, y, depth[..., 0]), dim=-1), predicted_pixels
+
+
+class GeometryTemporalCompactModel(CompactMultiHandPi3XTrajectoryModel):
+    """Single-frame metric geometry followed by a small temporal correction."""
+
+    def __init__(
+        self,
+        *args,
+        min_depth_m=0.05,
+        initial_depth_m=0.85,
+        max_log_depth_correction=0.5,
+        max_temporal_offset_fraction=0.03,
+        **kwargs,
+    ):
+        super().__init__(*args, initial_depth_m=initial_depth_m, **kwargs)
+        hidden_dim = self.temporal_position.shape[-1]
+        del self.window_base
+        del self.frame_residual
+        self.min_depth_m = float(min_depth_m)
+        self.max_log_depth_correction = float(max_log_depth_correction)
+        self.max_temporal_offset_fraction = float(max_temporal_offset_fraction)
+        self.geometry_head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 3),
+        )
+        self.temporal_correction = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 3),
+        )
+        self._initialize_v2_heads(initial_depth_m)
+
+    def _initialize_v2_heads(self, initial_depth_m):
+        nn.init.normal_(self.geometry_head[-1].weight, std=1e-3)
+        nn.init.zeros_(self.geometry_head[-1].bias)
+        target = max(float(initial_depth_m) - self.min_depth_m, 1e-4)
+        self.geometry_head[-1].bias.data[2] = math.log(math.expm1(target))
+        nn.init.zeros_(self.temporal_correction[-1].weight)
+        nn.init.zeros_(self.temporal_correction[-1].bias)
+
+    def forward(self, batch):
+        geometry_feature = self.encode_frame_features(batch)
+        batch_size, time, hands, hidden = geometry_feature.shape
+        geometry_raw = self.geometry_head(geometry_feature)
+        geometry_depth = self.min_depth_m + torch.nn.functional.softplus(
+            geometry_raw[..., 2:3]
+        )
+
+        temporal = geometry_feature.permute(0, 2, 1, 3).reshape(
+            batch_size * hands, time, hidden
+        )
+        temporal = temporal + self.temporal_position[:time][None]
+        temporal_valid = batch["hand_slot_valid"].permute(0, 2, 1).reshape(
+            batch_size * hands, time
+        )
+        temporal_padding = ~temporal_valid
+        temporal_padding[temporal_padding.all(dim=1), 0] = False
+        temporal = self.temporal(
+            temporal, src_key_padding_mask=temporal_padding
+        ).reshape(batch_size, hands, time, hidden).permute(0, 2, 1, 3)
+        correction_raw = self.temporal_correction(temporal)
+        delta_log_depth = (
+            torch.tanh(correction_raw[..., 2:3])
+            * self.max_log_depth_correction
+        )
+        depth = geometry_depth * torch.exp(delta_log_depth)
+
+        root_uv01 = (batch["ray_anchor_uv"] + 1.0) * 0.5
+        image_wh = batch["image_wh"][:, :, None].expand(-1, -1, hands, -1)
+        root_pixels = root_uv01 * (image_wh - 1.0).clamp_min(1.0)
+        geometry_offset = (
+            torch.tanh(geometry_raw[..., :2])
+            * image_wh * self.max_image_offset_fraction
+        )
+        temporal_offset = (
+            torch.tanh(correction_raw[..., :2])
+            * image_wh * self.max_temporal_offset_fraction
+        )
+        predicted_pixels = root_pixels + geometry_offset + temporal_offset
+        intrinsics = batch["intrinsics"][:, :, None]
+        x = (
+            (predicted_pixels[..., 0] - intrinsics[..., 0, 2])
+            / intrinsics[..., 0, 0].clamp_min(1e-6) * depth[..., 0]
+        )
+        y = (
+            (predicted_pixels[..., 1] - intrinsics[..., 1, 2])
+            / intrinsics[..., 1, 1].clamp_min(1e-6) * depth[..., 0]
+        )
+        translation = torch.stack((x, y, depth[..., 0]), dim=-1)
+        auxiliary = {
+            "geometry_depth": geometry_depth[..., 0],
+            "temporal_log_depth_correction": delta_log_depth[..., 0],
+            "temporal_depth_correction": depth[..., 0] - geometry_depth[..., 0],
+        }
+        return translation, predicted_pixels, auxiliary

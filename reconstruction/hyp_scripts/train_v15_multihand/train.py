@@ -245,9 +245,10 @@ def run_epoch(
     model.train(training)
     totals = {key: 0.0 for key in (
         "total", "absolute", "depth", "relative", "velocity",
-        "acceleration", "reprojection",
+        "acceleration", "reprojection", "temporal_correction",
     )}
     translation_errors, depth_errors = [], []
+    geometry_depth_errors, temporal_depth_corrections = [], []
     grouped_errors = {
         name: {"translation": [], "depth": []}
         for name in ("observed", "missing_supervised", "unsupervised_target")
@@ -268,7 +269,12 @@ def run_epoch(
         observed = batch["observation_valid"] & valid
         target = batch["target_t"]
         with torch.set_grad_enabled(training):
-            prediction, predicted_pixels = model(batch)
+            model_output = model(batch)
+            if len(model_output) == 3:
+                prediction, predicted_pixels, auxiliary = model_output
+            else:
+                prediction, predicted_pixels = model_output
+                auxiliary = {}
             beta = args.smooth_l1_beta_mm / 1000.0
             absolute = weighted_mean(
                 smooth_l1(prediction - target, beta), supervision_weight
@@ -312,10 +318,17 @@ def run_epoch(
                     args.reprojection_beta_px,
                 ), supervision_weight,
             )
+            correction_value = auxiliary.get("temporal_log_depth_correction")
+            temporal_correction = (
+                weighted_mean(correction_value.square(), valid.to(torch.float32))
+                if correction_value is not None else prediction.new_zeros(())
+            )
             total = (
                 absolute + args.w_depth * depth + args.w_relative * relative
                 + args.w_velocity * velocity + args.w_acceleration * acceleration
                 + args.w_reprojection * reprojection / 1000.0
+                + getattr(args, "w_temporal_correction", 0.0)
+                * temporal_correction
             )
             if not torch.isfinite(total):
                 raise RuntimeError("non-finite loss")
@@ -328,6 +341,7 @@ def run_epoch(
             ("total", total), ("absolute", absolute), ("depth", depth),
             ("relative", relative), ("velocity", velocity), ("acceleration", acceleration),
             ("reprojection", reprojection),
+            ("temporal_correction", temporal_correction),
         ):
             totals[key] += float(value.detach())
         mask = supervised.detach().cpu().numpy().astype(bool)
@@ -343,6 +357,17 @@ def run_epoch(
         depth_error = np.abs(error[..., 2])
         translation_errors.append(translation_error[mask])
         depth_errors.append(depth_error[mask])
+        geometry_depth = auxiliary.get("geometry_depth")
+        if geometry_depth is not None:
+            geometry_error = np.abs(
+                geometry_depth.detach().cpu().numpy()
+                - target.detach().cpu().numpy()[..., 2]
+            )
+            geometry_depth_errors.append(geometry_error[mask])
+        correction_depth = auxiliary.get("temporal_depth_correction")
+        if correction_depth is not None:
+            correction_np = np.abs(correction_depth.detach().cpu().numpy())
+            temporal_depth_corrections.append(correction_np[valid_np])
         for name, group_mask in group_masks.items():
             grouped_errors[name]["translation"].append(
                 translation_error[group_mask]
@@ -393,6 +418,8 @@ def run_epoch(
         **{key: value / max(batches, 1) for key, value in totals.items()},
         "translation_error": distribution(translation_errors),
         "depth_error": distribution(depth_errors),
+        "geometry_depth_error": distribution(geometry_depth_errors),
+        "temporal_depth_correction": distribution(temporal_depth_corrections),
         "axis_error": {
             axis: distribution(values) for axis, values in axis_errors.items()
         },

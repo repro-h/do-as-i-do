@@ -450,10 +450,13 @@ class CompactFeatureProvider(RamFeatureProvider):
 
 
 class DiskCompactFeatureProvider:
-    def __init__(self, root, patch_radius=None, global_grid_size=None):
+    def __init__(
+        self, root, patch_radius=None, global_grid_size=None, query_source=None,
+    ):
         self.root = Path(root).expanduser().resolve()
         self.patch_radius = patch_radius
         self.global_grid_size = global_grid_size
+        self.query_source = query_source
 
     def path(self, row):
         return compact_cache_path(self.root, row)
@@ -461,7 +464,8 @@ class DiskCompactFeatureProvider:
     def __call__(self, row):
         path = self.path(row)
         if not valid_compact_cache(
-            path, row, self.patch_radius, self.global_grid_size
+            path, row, self.patch_radius, self.global_grid_size,
+            query_source=self.query_source,
         ):
             raise FileNotFoundError(
                 f"Missing or incompatible compact Pi3X cache: {path}"

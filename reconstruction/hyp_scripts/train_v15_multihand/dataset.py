@@ -108,6 +108,7 @@ class DexYCBMultiHandWindowDataset(Dataset):
         far_missing_weight=0.2,
         dense_provider=None,
         query_source="gt",
+        supervision_source="observation",
     ):
         self.rows = load_jsonl(windows)
         if not self.rows:
@@ -136,12 +137,17 @@ class DexYCBMultiHandWindowDataset(Dataset):
         self.near_missing_weight = float(near_missing_weight)
         self.far_missing_weight = float(far_missing_weight)
         self.query_source = str(query_source)
+        self.supervision_source = str(supervision_source)
         if self.visibility_source not in ("detector", "mask", "ones"):
             raise ValueError(f"Unknown visibility source: {self.visibility_source}")
         if self.query_source not in ("gt", "detector"):
             raise ValueError(f"Unknown query source: {self.query_source}")
         if self.query_source == "detector" and self.visibility_source != "detector":
             raise ValueError("Detector queries require visibility_source='detector'")
+        if self.supervision_source not in ("observation", "target"):
+            raise ValueError(
+                f"Unknown supervision source: {self.supervision_source}"
+            )
         if self.visibility_source == "detector" and self.visibility_root is None:
             missing = [row["stream_id"] for row in self.rows if not row.get("visibility_npz")]
             if missing:
@@ -333,12 +339,14 @@ class DexYCBMultiHandWindowDataset(Dataset):
 
         ray_anchor_uv_px = np.zeros((time, hands, 2), dtype=np.float32)
         supervision_weight = np.zeros((time, hands), dtype=np.float32)
+        track_has_anchor = np.zeros(hands, dtype=bool)
         frame_axis = np.arange(time, dtype=np.float32)
         for hand in range(hands):
             observed = observation_valid[:, hand] & hand_slot_valid[:, hand]
             anchors = np.flatnonzero(observed)
             if len(anchors) == 0:
                 continue
+            track_has_anchor[hand] = True
             for coordinate in range(2):
                 ray_anchor_uv_px[:, hand, coordinate] = np.interp(
                     frame_axis,
@@ -357,7 +365,12 @@ class DexYCBMultiHandWindowDataset(Dataset):
             )
             supervision_weight[near, hand] = self.near_missing_weight
             supervision_weight[far, hand] = self.far_missing_weight
-        supervision_weight *= target_valid & hand_slot_valid
+        if self.supervision_source == "target":
+            supervision_weight = (
+                target_valid & hand_slot_valid & track_has_anchor[None]
+            ).astype(np.float32)
+        else:
+            supervision_weight *= target_valid & hand_slot_valid
 
         dense_file = None
         if self.dense_provider is None:

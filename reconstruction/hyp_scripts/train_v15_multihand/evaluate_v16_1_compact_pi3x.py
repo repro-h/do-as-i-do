@@ -15,7 +15,10 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from compact_dataset import CompactWindowDataset  # noqa: E402
-from compact_model import CompactMultiHandPi3XTrajectoryModel  # noqa: E402
+from compact_model import (  # noqa: E402
+    CompactMultiHandPi3XTrajectoryModel,
+    GeometryTemporalCompactModel,
+)
 from dataset import DexYCBMultiHandWindowDataset, QueryNoise  # noqa: E402
 from online_pi3x import DiskCompactFeatureProvider, DummyDenseProvider  # noqa: E402
 from train import run_epoch  # noqa: E402
@@ -108,6 +111,7 @@ def main():
         str(checkpoint_path), map_location="cpu", weights_only=False
     )
     config = dict(checkpoint.get("args", {}))
+    architecture = value(config, "architecture", "v1")
 
     metadata = DexYCBMultiHandWindowDataset(
         args.windows,
@@ -129,6 +133,7 @@ def main():
         args.compact_cache_root,
         patch_radius=args.joint_patch_radius,
         global_grid_size=args.global_grid_size,
+        query_source=(args.query_source if architecture == "geometry-temporal-v2" else None),
     )
     dataset = CompactWindowDataset(metadata, provider)
     sample = dataset[0]
@@ -140,7 +145,12 @@ def main():
         )
 
     device = torch.device(args.device)
-    model = CompactMultiHandPi3XTrajectoryModel(
+    model_class = (
+        GeometryTemporalCompactModel
+        if architecture == "geometry-temporal-v2"
+        else CompactMultiHandPi3XTrajectoryModel
+    )
+    model_kwargs = dict(
         point_dim=sample["joint_patch_features"].shape[-1],
         metric_dim=sample["metric_window_features"].shape[-1],
         token_dim=value(config, "token_dim", 128),
@@ -155,7 +165,18 @@ def main():
         max_image_offset_fraction=value(
             config, "max_image_offset_fraction", 0.15
         ),
-    ).to(device)
+    )
+    if architecture == "geometry-temporal-v2":
+        model_kwargs.update(
+            min_depth_m=value(config, "min_depth_m", 0.05),
+            max_log_depth_correction=value(
+                config, "max_log_depth_correction", 0.5
+            ),
+            max_temporal_offset_fraction=value(
+                config, "max_temporal_offset_fraction", 0.03
+            ),
+        )
+    model = model_class(**model_kwargs).to(device)
     load_model_state(model, checkpoint["model"])
     model = FeatureAblationWrapper(model, args.feature_ablation).to(device)
     if args.data_parallel:
@@ -194,6 +215,7 @@ def main():
         "checkpoint": str(checkpoint_path),
         "checkpoint_epoch": int(checkpoint.get("epoch", -1)),
         "model_version": checkpoint.get("model_version"),
+        "architecture": architecture,
         "windows": str(Path(args.windows).expanduser().resolve()),
         "compact_cache_root": str(
             Path(args.compact_cache_root).expanduser().resolve()

@@ -18,7 +18,10 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from compact_dataset import CompactWindowDataset  # noqa: E402
-from compact_model import CompactMultiHandPi3XTrajectoryModel  # noqa: E402
+from compact_model import (  # noqa: E402
+    CompactMultiHandPi3XTrajectoryModel,
+    GeometryTemporalCompactModel,
+)
 from dataset import DexYCBMultiHandWindowDataset, QueryNoise  # noqa: E402
 from online_pi3x import (  # noqa: E402
     CompactFeatureProvider,
@@ -32,6 +35,7 @@ from train_v16_online_pi3x import load_rows, window_layout  # noqa: E402
 
 
 MODEL_VERSION = "v16_1_compact_pi3x_multihand_trajectory_v1"
+V2_MODEL_VERSION = "v17_compact_pi3x_geometry_temporal_v2"
 
 
 def parse_args():
@@ -61,6 +65,16 @@ def parse_args():
     )
     parser.add_argument("--joint-patch-radius", type=int, default=1)
     parser.add_argument("--global-grid-size", type=int, default=4)
+    parser.add_argument(
+        "--architecture", choices=("v1", "geometry-temporal-v2"), default="v1",
+    )
+    parser.add_argument(
+        "--query-source", choices=("gt", "detector"), default="gt",
+    )
+    parser.add_argument(
+        "--supervision-source", choices=("observation", "target"),
+        default="observation",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--data-parallel", action="store_true")
     parser.add_argument("--lr", type=float, default=2e-4)
@@ -92,6 +106,7 @@ def parse_args():
     parser.add_argument("--w-velocity", type=float, default=0.05)
     parser.add_argument("--w-acceleration", type=float, default=0.02)
     parser.add_argument("--w-reprojection", type=float, default=0.1)
+    parser.add_argument("--w-temporal-correction", type=float, default=0.01)
     parser.add_argument("--reprojection-beta-px", type=float, default=2.0)
     parser.add_argument("--smooth-l1-beta-mm", type=float, default=5.0)
     parser.add_argument(
@@ -99,6 +114,9 @@ def parse_args():
         choices=("ray_depth_uv", "direct_xyz"), default="ray_depth_uv",
     )
     parser.add_argument("--max-image-offset-fraction", type=float, default=0.15)
+    parser.add_argument("--min-depth-m", type=float, default=0.05)
+    parser.add_argument("--max-log-depth-correction", type=float, default=0.5)
+    parser.add_argument("--max-temporal-offset-fraction", type=float, default=0.03)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--train-windows-per-dataset", type=int, default=0,
@@ -144,11 +162,33 @@ def metadata_dataset(args, split, training):
         near_missing_weight=args.near_missing_weight,
         far_missing_weight=args.far_missing_weight,
         dense_provider=DummyDenseProvider(),
+        query_source=args.query_source,
+        supervision_source=args.supervision_source,
     )
 
 
 def main():
     args = parse_args()
+    model_version = (
+        V2_MODEL_VERSION
+        if args.architecture == "geometry-temporal-v2" else MODEL_VERSION
+    )
+    noise_values = (
+        args.global_noise_px, args.temporal_noise_px, args.joint_noise_px,
+        args.outlier_probability, args.query_dropout,
+    )
+    if args.architecture == "geometry-temporal-v2":
+        if args.query_source != "detector":
+            raise ValueError("V2 requires --query-source detector")
+        if any(value != 0 for value in noise_values):
+            raise ValueError(
+                "V2 compact features must stay aligned with detector queries; "
+                "set all query-noise and dropout arguments to zero"
+            )
+        if args.supervision_source != "target":
+            raise ValueError("V2 requires --supervision-source target")
+        if args.translation_parameterization != "ray_depth_uv":
+            raise ValueError("V2 requires --translation-parameterization ray_depth_uv")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -173,6 +213,7 @@ def main():
             args.compact_cache_root,
             patch_radius=args.joint_patch_radius,
             global_grid_size=args.global_grid_size,
+            query_source=args.query_source,
         )
         print(f"Reading compact Pi3X caches from {provider.root}", flush=True)
     else:
@@ -233,7 +274,7 @@ def main():
                 * channels * feature.dtype.itemsize
             )
     audit = {
-        "model_version": MODEL_VERSION,
+        "model_version": model_version,
         "pi3x_execution": (
             "precomputed_compact_disk_cache"
             if args.compact_cache_root
@@ -269,13 +310,22 @@ def main():
         "visible_cuda_devices": torch.cuda.device_count(),
         "resume_checkpoint": args.resume_checkpoint,
         "lr_scheduler": args.lr_scheduler,
+        "architecture": args.architecture,
+        "query_source": args.query_source,
+        "supervision_source": args.supervision_source,
+        "query_noise_aligned": not any(value != 0 for value in noise_values),
     }
     print(json.dumps(audit, indent=2), flush=True)
     if args.audit_only:
         return
 
     device = torch.device(args.device)
-    model = CompactMultiHandPi3XTrajectoryModel(
+    model_class = (
+        GeometryTemporalCompactModel
+        if args.architecture == "geometry-temporal-v2"
+        else CompactMultiHandPi3XTrajectoryModel
+    )
+    model_kwargs = dict(
         point_dim=sample["joint_patch_features"].shape[-1],
         metric_dim=sample["metric_window_features"].shape[-1],
         token_dim=args.token_dim,
@@ -286,7 +336,14 @@ def main():
         max_window_size=args.max_window_size,
         translation_parameterization=args.translation_parameterization,
         max_image_offset_fraction=args.max_image_offset_fraction,
-    ).to(device)
+    )
+    if args.architecture == "geometry-temporal-v2":
+        model_kwargs.update(
+            min_depth_m=args.min_depth_m,
+            max_log_depth_correction=args.max_log_depth_correction,
+            max_temporal_offset_fraction=args.max_temporal_offset_fraction,
+        )
+    model = model_class(**model_kwargs).to(device)
     if args.data_parallel:
         if device.type != "cuda":
             raise ValueError("--data-parallel requires --device cuda")
@@ -334,7 +391,8 @@ def main():
         source_val = resume.get("val", {})
         loss_keys = (
             "w_depth", "w_relative", "w_velocity", "w_acceleration",
-            "w_reprojection", "smooth_l1_beta_mm", "reprojection_beta_px",
+            "w_reprojection", "w_temporal_correction",
+            "smooth_l1_beta_mm", "reprojection_beta_px",
         )
         same_objective = all(
             resume.get("args", {}).get(key) == getattr(args, key)
@@ -401,7 +459,7 @@ def main():
                 scheduler.step()
         checkpoint = {
             "epoch": epoch,
-            "model_version": MODEL_VERSION,
+            "model_version": model_version,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": None if scheduler is None else scheduler.state_dict(),
