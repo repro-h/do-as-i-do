@@ -49,6 +49,10 @@ def parse_args():
     )
     parser.add_argument("--joint-patch-radius", type=int, default=1)
     parser.add_argument("--global-grid-size", type=int, default=4)
+    parser.add_argument(
+        "--query-source", choices=("gt", "detector"), default="gt",
+        help="2D joints used both as model queries and Pi3X sampling centers.",
+    )
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0)
@@ -70,6 +74,7 @@ def metadata_dataset(args):
         visibility_root=args.visibility_root,
         track_root=args.track_root,
         dense_provider=DummyDenseProvider(),
+        query_source=args.query_source,
     )
 
 
@@ -101,7 +106,8 @@ def main():
         seen.add(key)
         path = compact_cache_path(out_root, row)
         if not args.overwrite and valid_compact_cache(
-            path, row, args.joint_patch_radius, args.global_grid_size
+            path, row, args.joint_patch_radius, args.global_grid_size,
+            query_source=args.query_source,
         ):
             cached.append(key)
         else:
@@ -139,6 +145,7 @@ def main():
                     joint_uv,
                     args.joint_patch_radius,
                     args.global_grid_size,
+                    query_source=args.query_source,
                 )
                 completed.append(row_key(row))
             except Exception as error:
@@ -165,6 +172,7 @@ def main():
         "failures": failures,
         "joint_patch_radius": args.joint_patch_radius,
         "global_grid_size": args.global_grid_size,
+        "query_source": args.query_source,
     }
     if args.status_json:
         status_path = Path(args.status_json).expanduser().resolve()

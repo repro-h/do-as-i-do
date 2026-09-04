@@ -101,7 +101,9 @@ COMPACT_CACHE_KEYS = (
 )
 
 
-def valid_compact_cache(path, row, patch_radius=None, global_grid_size=None):
+def valid_compact_cache(
+    path, row, patch_radius=None, global_grid_size=None, query_source=None,
+):
     path = Path(path)
     if not path.is_file():
         return False
@@ -128,6 +130,13 @@ def valid_compact_cache(path, row, patch_radius=None, global_grid_size=None):
                 data["global_grid_size"].item()
             ) != int(global_grid_size):
                 return False
+            if query_source is not None:
+                cached_source = (
+                    str(data["query_source"].item())
+                    if "query_source" in data.files else "gt"
+                )
+                if cached_source != str(query_source):
+                    return False
             return True
     except (OSError, KeyError, ValueError):
         return False
@@ -135,6 +144,7 @@ def valid_compact_cache(path, row, patch_radius=None, global_grid_size=None):
 
 def write_compact_cache(
     path, row, payload, joint_uv, patch_radius, global_grid_size,
+    query_source="gt",
 ):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -149,6 +159,7 @@ def write_compact_cache(
         "joint_uv_clean": np.asarray(joint_uv, dtype=np.float32),
         "joint_patch_radius": np.int32(patch_radius),
         "global_grid_size": np.int32(global_grid_size),
+        "query_source": np.asarray(str(query_source)),
     })
     try:
         np.savez(str(temporary), **content)

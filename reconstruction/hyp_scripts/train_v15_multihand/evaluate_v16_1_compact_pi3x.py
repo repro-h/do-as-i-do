@@ -83,6 +83,9 @@ def parse_args():
     parser.add_argument("--max-hands", type=int, default=2)
     parser.add_argument("--joint-patch-radius", type=int, default=1)
     parser.add_argument("--global-grid-size", type=int, default=4)
+    parser.add_argument(
+        "--query-source", choices=("gt", "detector"), default="gt",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--data-parallel", action="store_true")
     parser.add_argument(
@@ -120,6 +123,7 @@ def main():
         near_missing_weight=value(config, "near_missing_weight", 0.5),
         far_missing_weight=value(config, "far_missing_weight", 0.2),
         dense_provider=DummyDenseProvider(),
+        query_source=args.query_source,
     )
     provider = DiskCompactFeatureProvider(
         args.compact_cache_root,
@@ -196,6 +200,7 @@ def main():
         ),
         "feature_ablation": args.feature_ablation,
         "feature_ablation_scope": "inference_only_no_retraining",
+        "query_source": args.query_source,
         "metrics": metrics,
     }
     output = Path(args.out_json).expanduser().resolve()

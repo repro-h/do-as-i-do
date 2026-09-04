@@ -107,6 +107,7 @@ class DexYCBMultiHandWindowDataset(Dataset):
         near_missing_weight=0.5,
         far_missing_weight=0.2,
         dense_provider=None,
+        query_source="gt",
     ):
         self.rows = load_jsonl(windows)
         if not self.rows:
@@ -134,8 +135,13 @@ class DexYCBMultiHandWindowDataset(Dataset):
         self.max_anchor_frames = int(max_anchor_frames)
         self.near_missing_weight = float(near_missing_weight)
         self.far_missing_weight = float(far_missing_weight)
+        self.query_source = str(query_source)
         if self.visibility_source not in ("detector", "mask", "ones"):
             raise ValueError(f"Unknown visibility source: {self.visibility_source}")
+        if self.query_source not in ("gt", "detector"):
+            raise ValueError(f"Unknown query source: {self.query_source}")
+        if self.query_source == "detector" and self.visibility_source != "detector":
+            raise ValueError("Detector queries require visibility_source='detector'")
         if self.visibility_source == "detector" and self.visibility_root is None:
             missing = [row["stream_id"] for row in self.rows if not row.get("visibility_npz")]
             if missing:
@@ -195,12 +201,24 @@ class DexYCBMultiHandWindowDataset(Dataset):
                 cache_frames = np.asarray(cache["frame_indices"], dtype=np.int64)
                 cache_values = np.asarray(cache["joint_visibility"], dtype=np.float32)
                 cache_valid = np.asarray(cache["visibility_valid"], dtype=bool)
+                cache_uv = (
+                    np.asarray(cache["detector_joint_uv"], dtype=np.float32)
+                    if "detector_joint_uv" in cache.files else None
+                )
+            if self.query_source == "detector" and cache_uv is None:
+                raise KeyError(
+                    f"{visibility_file} lacks detector_joint_uv required by "
+                    "query_source='detector'"
+                )
             if cache_values.ndim == 2:
                 cache_values = cache_values[:, None]
             if cache_valid.ndim == 1:
                 cache_valid = cache_valid[:, None]
             detector_visibility = {
-                int(frame): (cache_values[offset], cache_valid[offset])
+                int(frame): (
+                    cache_values[offset], cache_valid[offset],
+                    None if cache_uv is None else cache_uv[offset],
+                )
                 for offset, frame in enumerate(cache_frames)
             }
 
@@ -271,11 +289,12 @@ class DexYCBMultiHandWindowDataset(Dataset):
             elif self.visibility_source == "ones":
                 visibility[frame, hand_slot_valid[frame]] = 1.0
             else:
-                values, values_valid = detector_visibility.get(
+                values, values_valid, detector_uv = detector_visibility.get(
                     source_frame,
                     (
                         np.full((hands, joints), 0.5, dtype=np.float32),
                         np.zeros(hands, dtype=bool),
+                        None,
                     ),
                 )
                 count = min(hands, len(values))
@@ -285,6 +304,18 @@ class DexYCBMultiHandWindowDataset(Dataset):
                 detector_observation_valid[frame, :count] = (
                     values_valid[:count] & hand_slot_valid[frame, :count]
                 )
+                if self.query_source == "detector" and detector_uv is not None:
+                    detector_uv = np.asarray(detector_uv[:count], dtype=np.float32)
+                    detector_joint_valid = np.isfinite(detector_uv).all(axis=-1)
+                    detector_joint_valid &= values_valid[:count, None]
+                    detector_joint_valid &= (
+                        (detector_uv[..., 0] >= 0)
+                        & (detector_uv[..., 0] < width)
+                        & (detector_uv[..., 1] >= 0)
+                        & (detector_uv[..., 1] < height)
+                    )
+                    query_uv_px[frame, :count] = finite_float(detector_uv)
+                    query_valid[frame, :count] = detector_joint_valid
 
         if track_data is not None:
             track_data.close()
