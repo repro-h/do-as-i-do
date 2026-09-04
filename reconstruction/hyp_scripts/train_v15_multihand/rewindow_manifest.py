@@ -138,7 +138,9 @@ def main():
                     raise RuntimeError(f"Failed to construct {dataset}:{stream}:{positions[0]}")
                 output_rows.append(row)
                 stats["windows"] += 1
-                stats["covered_frames"].update(positions)
+                stats["covered_frames"].update(
+                    (stream, position) for position in positions
+                )
 
     output_rows.sort(key=lambda row: (
         str(row["dataset"]), str(row["stream_id"]), int(row["start"])

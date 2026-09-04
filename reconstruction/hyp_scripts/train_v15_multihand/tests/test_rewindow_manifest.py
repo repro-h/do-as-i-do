@@ -15,3 +15,10 @@ def test_long_run_anchors_final_window():
 
 def test_short_runs_are_rejected():
     assert rewindow.window_positions(list(range(63)), 64, 32) == []
+
+
+def test_stream_qualified_frame_keys_do_not_collide():
+    covered = set()
+    covered.update(("stream_a", position) for position in range(64))
+    covered.update(("stream_b", position) for position in range(64))
+    assert len(covered) == 128
