@@ -106,7 +106,9 @@ def parse_args():
     parser.add_argument("--w-velocity", type=float, default=0.05)
     parser.add_argument("--w-acceleration", type=float, default=0.02)
     parser.add_argument("--w-reprojection", type=float, default=0.1)
+    parser.add_argument("--w-geometry-depth", type=float, default=0.0)
     parser.add_argument("--w-temporal-correction", type=float, default=0.01)
+    parser.add_argument("--geometry-warmup-epochs", type=int, default=0)
     parser.add_argument("--reprojection-beta-px", type=float, default=2.0)
     parser.add_argument("--smooth-l1-beta-mm", type=float, default=5.0)
     parser.add_argument(
@@ -189,6 +191,8 @@ def main():
             raise ValueError("V2 requires --supervision-source target")
         if args.translation_parameterization != "ray_depth_uv":
             raise ValueError("V2 requires --translation-parameterization ray_depth_uv")
+        if args.w_geometry_depth <= 0:
+            raise ValueError("V2 requires --w-geometry-depth greater than zero")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -392,6 +396,7 @@ def main():
         loss_keys = (
             "w_depth", "w_relative", "w_velocity", "w_acceleration",
             "w_reprojection", "w_temporal_correction",
+            "w_geometry_depth",
             "smooth_l1_beta_mm", "reprojection_beta_px",
         )
         same_objective = all(
@@ -435,6 +440,16 @@ def main():
     history = []
     for epoch in range(start_epoch, start_epoch + args.epochs):
         print(f"\n===== epoch {epoch} =====", flush=True)
+        base_model = model.module if hasattr(model, "module") else model
+        if hasattr(base_model, "set_temporal_enabled"):
+            relative_epoch = epoch - start_epoch + 1
+            temporal_enabled = relative_epoch > args.geometry_warmup_epochs
+            base_model.set_temporal_enabled(temporal_enabled)
+            print(
+                "temporal correction: "
+                f"{'enabled' if temporal_enabled else 'disabled (geometry warmup)'}",
+                flush=True,
+            )
         epoch_lr = float(optimizer.param_groups[0]["lr"])
         train_metrics = run_epoch(
             model, train_loader, device, args, optimizer,

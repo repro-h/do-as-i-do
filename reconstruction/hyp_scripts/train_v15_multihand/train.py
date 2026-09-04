@@ -245,7 +245,8 @@ def run_epoch(
     model.train(training)
     totals = {key: 0.0 for key in (
         "total", "absolute", "depth", "relative", "velocity",
-        "acceleration", "reprojection", "temporal_correction",
+        "acceleration", "reprojection", "geometry_depth",
+        "temporal_correction",
     )}
     translation_errors, depth_errors = [], []
     geometry_depth_errors, temporal_depth_corrections = [], []
@@ -319,6 +320,14 @@ def run_epoch(
                 ), supervision_weight,
             )
             correction_value = auxiliary.get("temporal_log_depth_correction")
+            geometry_depth_value = auxiliary.get("geometry_depth")
+            geometry_depth_loss = (
+                weighted_mean(
+                    smooth_l1(geometry_depth_value - target[..., 2], beta),
+                    supervision_weight,
+                )
+                if geometry_depth_value is not None else prediction.new_zeros(())
+            )
             temporal_correction = (
                 weighted_mean(correction_value.square(), valid.to(torch.float32))
                 if correction_value is not None else prediction.new_zeros(())
@@ -327,6 +336,7 @@ def run_epoch(
                 absolute + args.w_depth * depth + args.w_relative * relative
                 + args.w_velocity * velocity + args.w_acceleration * acceleration
                 + args.w_reprojection * reprojection / 1000.0
+                + getattr(args, "w_geometry_depth", 0.0) * geometry_depth_loss
                 + getattr(args, "w_temporal_correction", 0.0)
                 * temporal_correction
             )
@@ -341,6 +351,7 @@ def run_epoch(
             ("total", total), ("absolute", absolute), ("depth", depth),
             ("relative", relative), ("velocity", velocity), ("acceleration", acceleration),
             ("reprojection", reprojection),
+            ("geometry_depth", geometry_depth_loss),
             ("temporal_correction", temporal_correction),
         ):
             totals[key] += float(value.detach())

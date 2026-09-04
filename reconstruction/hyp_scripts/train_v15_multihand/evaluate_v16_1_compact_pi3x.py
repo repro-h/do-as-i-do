@@ -199,6 +199,8 @@ def main():
         w_velocity=value(config, "w_velocity", 0.05),
         w_acceleration=value(config, "w_acceleration", 0.02),
         w_reprojection=value(config, "w_reprojection", 0.1),
+        w_geometry_depth=value(config, "w_geometry_depth", 0.0),
+        w_temporal_correction=value(config, "w_temporal_correction", 0.0),
     )
     metrics = run_epoch(
         model,

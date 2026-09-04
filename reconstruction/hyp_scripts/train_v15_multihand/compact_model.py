@@ -246,6 +246,7 @@ class GeometryTemporalCompactModel(CompactMultiHandPi3XTrajectoryModel):
         self.min_depth_m = float(min_depth_m)
         self.max_log_depth_correction = float(max_log_depth_correction)
         self.max_temporal_offset_fraction = float(max_temporal_offset_fraction)
+        self.temporal_enabled = True
         self.geometry_head = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
@@ -259,6 +260,9 @@ class GeometryTemporalCompactModel(CompactMultiHandPi3XTrajectoryModel):
             nn.Linear(hidden_dim, 3),
         )
         self._initialize_v2_heads(initial_depth_m)
+
+    def set_temporal_enabled(self, enabled):
+        self.temporal_enabled = bool(enabled)
 
     def _initialize_v2_heads(self, initial_depth_m):
         nn.init.normal_(self.geometry_head[-1].weight, std=1e-3)
@@ -276,19 +280,22 @@ class GeometryTemporalCompactModel(CompactMultiHandPi3XTrajectoryModel):
             geometry_raw[..., 2:3]
         )
 
-        temporal = geometry_feature.permute(0, 2, 1, 3).reshape(
-            batch_size * hands, time, hidden
-        )
-        temporal = temporal + self.temporal_position[:time][None]
-        temporal_valid = batch["hand_slot_valid"].permute(0, 2, 1).reshape(
-            batch_size * hands, time
-        )
-        temporal_padding = ~temporal_valid
-        temporal_padding[temporal_padding.all(dim=1), 0] = False
-        temporal = self.temporal(
-            temporal, src_key_padding_mask=temporal_padding
-        ).reshape(batch_size, hands, time, hidden).permute(0, 2, 1, 3)
-        correction_raw = self.temporal_correction(temporal)
+        if self.temporal_enabled:
+            temporal = geometry_feature.permute(0, 2, 1, 3).reshape(
+                batch_size * hands, time, hidden
+            )
+            temporal = temporal + self.temporal_position[:time][None]
+            temporal_valid = batch["hand_slot_valid"].permute(0, 2, 1).reshape(
+                batch_size * hands, time
+            )
+            temporal_padding = ~temporal_valid
+            temporal_padding[temporal_padding.all(dim=1), 0] = False
+            temporal = self.temporal(
+                temporal, src_key_padding_mask=temporal_padding
+            ).reshape(batch_size, hands, time, hidden).permute(0, 2, 1, 3)
+            correction_raw = self.temporal_correction(temporal)
+        else:
+            correction_raw = torch.zeros_like(geometry_raw)
         delta_log_depth = (
             torch.tanh(correction_raw[..., 2:3])
             * self.max_log_depth_correction
