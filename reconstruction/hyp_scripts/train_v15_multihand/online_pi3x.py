@@ -414,7 +414,7 @@ class RamFeatureProvider:
     def __init__(self, payloads):
         self.payloads = payloads
 
-    def __call__(self, row):
+    def __call__(self, row, joint_uv=None):
         return self.payloads[row_key(row)]
 
     @property
@@ -449,6 +449,28 @@ class CompactFeatureProvider(RamFeatureProvider):
     pass
 
 
+class OnlineCompactFeatureProvider:
+    """Run frozen Pi3X and sample around this sample's actual joint query."""
+
+    def __init__(self, materializer, patch_radius=1, global_grid_size=4):
+        self.materializer = materializer
+        self.patch_radius = int(patch_radius)
+        self.global_grid_size = int(global_grid_size)
+
+    def __call__(self, row, joint_uv=None):
+        if joint_uv is None:
+            raise ValueError("Online compact sampling requires joint_uv")
+        return self.materializer.compact(
+            row,
+            joint_uv,
+            patch_radius=self.patch_radius,
+            global_grid_size=self.global_grid_size,
+        )
+
+    def close(self):
+        self.materializer.close()
+
+
 class DiskCompactFeatureProvider:
     def __init__(
         self, root, patch_radius=None, global_grid_size=None, query_source=None,
@@ -461,7 +483,7 @@ class DiskCompactFeatureProvider:
     def path(self, row):
         return compact_cache_path(self.root, row)
 
-    def __call__(self, row):
+    def __call__(self, row, joint_uv=None):
         path = self.path(row)
         if not valid_compact_cache(
             path, row, self.patch_radius, self.global_grid_size,

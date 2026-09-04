@@ -18,7 +18,9 @@ class CompactWindowDataset(Dataset):
 
     def __getitem__(self, index):
         sample = self.metadata[index]
-        compact = self.compact_provider(self.rows[index])
+        compact = self.compact_provider(
+            self.rows[index], sample["joint_uv"].numpy()
+        )
         for key in ("point_features", "grid_uv", "grid_confidence", "grid_valid"):
             sample.pop(key, None)
         for key in (

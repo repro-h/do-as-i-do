@@ -27,6 +27,7 @@ from online_pi3x import (  # noqa: E402
     CompactFeatureProvider,
     DiskCompactFeatureProvider,
     DummyDenseProvider,
+    OnlineCompactFeatureProvider,
     Pi3XWindowMaterializer,
     row_key,
 )
@@ -180,11 +181,10 @@ def main():
         args.outlier_probability, args.query_dropout,
     )
     if args.architecture == "geometry-temporal-v2":
-        if args.query_source != "detector":
-            raise ValueError("V2 requires --query-source detector")
-        if any(value != 0 for value in noise_values):
+        if args.compact_cache_root and any(value != 0 for value in noise_values):
             raise ValueError(
-                "V2 compact features must stay aligned with detector queries; "
+                "Cached V2 features cannot follow runtime query noise; either "
+                "omit --compact-cache-root for aligned online Pi3X sampling or "
                 "set all query-noise and dropout arguments to zero"
             )
         if args.supervision_source != "target":
@@ -207,10 +207,6 @@ def main():
                 f"{args.max_window_size}"
             )
 
-    clean_sets = {
-        "train": metadata_dataset(args, "train", False),
-        "val": metadata_dataset(args, "val", False),
-    }
     payloads = None
     if args.compact_cache_root:
         provider = DiskCompactFeatureProvider(
@@ -221,8 +217,13 @@ def main():
         )
         print(f"Reading compact Pi3X caches from {provider.root}", flush=True)
     else:
+        if args.num_workers != 0:
+            raise ValueError(
+                "Online Pi3X sampling runs on the training GPU and requires "
+                "--num-workers 0"
+            )
         print(
-            "Materializing compact Pi3X candidates once per unique clip",
+            "Running frozen Pi3X online with query-aligned compact sampling",
             flush=True,
         )
         extractor = Pi3XWindowMaterializer(
@@ -233,26 +234,11 @@ def main():
             pixel_limit=args.pixel_limit,
             feature_dtype=args.feature_dtype,
         )
-        payloads = {}
-        try:
-            total = sum(len(dataset) for dataset in clean_sets.values())
-            progress = tqdm(total=total, desc="Pi3X/compact-RAM")
-            for dataset in clean_sets.values():
-                for index, row in enumerate(dataset.rows):
-                    key = row_key(row)
-                    if key not in payloads:
-                        metadata = dataset[index]
-                        payloads[key] = extractor.compact(
-                            row,
-                            metadata["joint_uv"].numpy(),
-                            patch_radius=args.joint_patch_radius,
-                            global_grid_size=args.global_grid_size,
-                        )
-                    progress.update(1)
-            progress.close()
-        finally:
-            extractor.close()
-        provider = CompactFeatureProvider(payloads)
+        provider = OnlineCompactFeatureProvider(
+            extractor,
+            patch_radius=args.joint_patch_radius,
+            global_grid_size=args.global_grid_size,
+        )
     train_metadata = metadata_dataset(args, "train", True)
     val_metadata = metadata_dataset(args, "val", False)
     train_data = CompactWindowDataset(train_metadata, provider)
@@ -282,7 +268,7 @@ def main():
         "pi3x_execution": (
             "precomputed_compact_disk_cache"
             if args.compact_cache_root
-            else "once_per_unique_clip_then_compact_host_ram"
+            else "frozen_online_query_aligned_per_sample"
         ),
         "disk_feature_export": bool(args.compact_cache_root),
         "unique_pi3x_clips": None if payloads is None else len(payloads),
@@ -317,7 +303,10 @@ def main():
         "architecture": args.architecture,
         "query_source": args.query_source,
         "supervision_source": args.supervision_source,
-        "query_noise_aligned": not any(value != 0 for value in noise_values),
+        "query_noise_aligned": (
+            not any(value != 0 for value in noise_values)
+            or not args.compact_cache_root
+        ),
     }
     print(json.dumps(audit, indent=2), flush=True)
     if args.audit_only:
