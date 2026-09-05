@@ -74,6 +74,22 @@ class DynamicWindowSamplerTests(unittest.TestCase):
             sampler.reconstruction["a::too_short"]["possible_starts"], 0
         )
 
+    def test_ddp_ranks_share_dataset_schedule_but_not_sample_seed(self):
+        samplers = [
+            dynamic.DynamicSequenceBatchSampler(
+                self.rows(), batch_size=1, steps_per_epoch=8,
+                window_size=64, seed=5, rank=rank, world_size=2,
+            )
+            for rank in range(2)
+        ]
+        batches = [list(sampler) for sampler in samplers]
+        schedules = [
+            [batch[0]["dataset"] for batch in rank_batches]
+            for rank_batches in batches
+        ]
+        self.assertEqual(schedules[0], schedules[1])
+        self.assertNotEqual(samplers[0].audit()["seed"], samplers[1].audit()["seed"])
+
 
 if __name__ == "__main__":
     unittest.main()

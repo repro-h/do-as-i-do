@@ -262,7 +262,11 @@ def run_epoch(
     stitched = defaultdict(list)
     batches = evaluated = 0
     observed_hands = missing_supervised_hands = unsupervised_targets = 0
-    for raw in tqdm(loader, desc="train" if training else "val"):
+    for raw in tqdm(
+        loader,
+        desc="train" if training else "val",
+        disable=getattr(args, "disable_progress", False),
+    ):
         batch = move(raw, device)
         valid = batch["target_valid"] & batch["hand_slot_valid"]
         supervision_weight = batch["supervision_weight"] * valid.to(torch.float32)

@@ -82,11 +82,15 @@ class DynamicSequenceBatchSampler:
         window_size=64,
         dataset_weights=None,
         seed=0,
+        rank=0,
+        world_size=1,
     ):
         self.batch_size = int(batch_size)
         self.steps_per_epoch = int(steps_per_epoch)
         self.window_size = int(window_size)
         self.seed = int(seed)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
         if min(self.batch_size, self.steps_per_epoch, self.window_size) <= 0:
             raise ValueError("Batch size, steps, and window size must be positive")
 
@@ -242,8 +246,10 @@ class DynamicSequenceBatchSampler:
         return row
 
     def __iter__(self):
-        rng = random.Random(self.seed + self.epoch)
-        schedule, dataset_batch_counts = self._batch_datasets(rng)
+        epoch_seed = self.seed + self.epoch * self.world_size + self.rank
+        rng = random.Random(epoch_seed)
+        schedule_rng = random.Random(self.seed + self.epoch)
+        schedule, dataset_batch_counts = self._batch_datasets(schedule_rng)
         sequence_counts = {
             dataset: {stream: 0 for stream in streams}
             for dataset, streams in self.sequences.items()
@@ -263,7 +269,9 @@ class DynamicSequenceBatchSampler:
             yield batch
         self.last_audit = {
             "epoch": self.epoch,
-            "seed": self.seed + self.epoch,
+            "seed": epoch_seed,
+            "rank": self.rank,
+            "world_size": self.world_size,
             "window_size": self.window_size,
             "steps": self.steps_per_epoch,
             "batch_size": self.batch_size,
@@ -324,6 +332,8 @@ class DynamicSequenceBatchSampler:
             "steps_per_epoch": self.steps_per_epoch,
             "batch_size": self.batch_size,
             "same_dataset_batches": True,
+            "rank": self.rank,
+            "world_size": self.world_size,
             "dataset_weights": self.dataset_weights,
             "by_dataset": by_dataset,
         }

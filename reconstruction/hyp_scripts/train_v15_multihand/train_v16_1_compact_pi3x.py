@@ -2,7 +2,9 @@
 """Run frozen Pi3X once, retain compact candidates, then train trajectory."""
 
 import argparse
+from datetime import timedelta
 import json
+import os
 import random
 import shutil
 import sys
@@ -10,7 +12,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -167,6 +171,62 @@ def load_model_state(model, state):
     model.load_state_dict(state)
 
 
+def distributed_context(args):
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size == 1:
+        return False, 0, 0, 1
+    if args.data_parallel:
+        raise ValueError("Do not combine torchrun DDP with --data-parallel")
+    if not torch.cuda.is_available():
+        raise RuntimeError("DDP training requires CUDA")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    rank = int(os.environ["RANK"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl", timeout=timedelta(hours=24))
+    args.device = f"cuda:{local_rank}"
+    return True, rank, local_rank, world_size
+
+
+def gather_sampling_audit(local_audit, rank, world_size):
+    if world_size == 1:
+        return local_audit
+    gathered = [None] * world_size if rank == 0 else None
+    dist.gather_object(local_audit, gathered, dst=0)
+    if rank != 0:
+        return None
+    datasets = sorted(gathered[0]["by_dataset"])
+    return {
+        "world_size": world_size,
+        "global_batches": sum(item["steps"] for item in gathered),
+        "global_samples": sum(
+            sum(value["samples"] for value in item["by_dataset"].values())
+            for item in gathered
+        ),
+        "global_supervised_hand_frames": sum(
+            item["supervised_hand_frames"] for item in gathered
+        ),
+        "by_dataset": {
+            dataset: {
+                "batches": sum(
+                    item["by_dataset"][dataset]["batches"] for item in gathered
+                ),
+                "samples": sum(
+                    item["by_dataset"][dataset]["samples"] for item in gathered
+                ),
+                "supervised_hand_frames": sum(
+                    item["by_dataset"][dataset]["supervised_hand_frames"]
+                    for item in gathered
+                ),
+                "eligible_sequences": gathered[0]["by_dataset"][dataset][
+                    "eligible_sequences"
+                ],
+            }
+            for dataset in datasets
+        },
+        "ranks": gathered,
+    }
+
+
 def metadata_dataset(args, split, training):
     return DexYCBMultiHandWindowDataset(
         getattr(args, f"{split}_windows"),
@@ -189,6 +249,9 @@ def metadata_dataset(args, split, training):
 
 def main():
     args = parse_args()
+    distributed, rank, local_rank, world_size = distributed_context(args)
+    is_main = rank == 0
+    args.disable_progress = not is_main
     model_version = (
         V2_MODEL_VERSION
         if args.architecture == "geometry-temporal-v2" else MODEL_VERSION
@@ -227,9 +290,10 @@ def main():
             raise ValueError(
                 "--dynamic-window-size exceeds --max-window-size"
             )
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    process_seed = args.seed + rank
+    random.seed(process_seed)
+    np.random.seed(process_seed)
+    torch.manual_seed(process_seed)
     train_rows = load_rows(args.train_windows)
     val_rows = load_rows(args.val_windows)
     if not train_rows or not val_rows:
@@ -253,6 +317,8 @@ def main():
             window_size=args.dynamic_window_size,
             dataset_weights=dataset_weights,
             seed=args.seed,
+            rank=rank,
+            world_size=world_size,
         )
 
     payloads = None
@@ -370,8 +436,13 @@ def main():
             if dynamic_batch_sampler is not None else None
         ),
     }
-    print(json.dumps(audit, indent=2), flush=True)
+    audit["distributed"] = distributed
+    audit["world_size"] = world_size
+    if is_main:
+        print(json.dumps(audit, indent=2), flush=True)
     if args.audit_only:
+        if distributed:
+            dist.destroy_process_group()
         return
 
     device = torch.device(args.device)
@@ -399,7 +470,15 @@ def main():
             max_temporal_offset_fraction=args.max_temporal_offset_fraction,
         )
     model = model_class(**model_kwargs).to(device)
-    if args.data_parallel:
+    if distributed:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            broadcast_buffers=False,
+            find_unused_parameters=True,
+        )
+    elif args.data_parallel:
         if device.type != "cuda":
             raise ValueError("--data-parallel requires --device cuda")
         if torch.cuda.device_count() < 2:
@@ -416,14 +495,23 @@ def main():
             pin_memory=True,
         )
     else:
-        sampler = (
-            DatasetStreamBalancedSampler(
-                train_data.rows, args.train_windows_per_dataset, args.seed
+        if distributed and args.train_windows_per_dataset > 0:
+            raise ValueError(
+                "DDP requires --dynamic-train-sampling or ordinary shuffle; "
+                "do not use --train-windows-per-dataset"
             )
-            if args.train_windows_per_dataset > 0 else None
+        sampler = (
+            DistributedSampler(train_data, shuffle=True, seed=args.seed)
+            if distributed else (
+                DatasetStreamBalancedSampler(
+                    train_data.rows, args.train_windows_per_dataset, args.seed
+                )
+                if args.train_windows_per_dataset > 0 else None
+            )
         )
         train_loader = DataLoader(
-            train_data, batch_size=args.batch_size, shuffle=sampler is None,
+            train_data, batch_size=args.batch_size,
+            shuffle=sampler is None and not distributed,
             sampler=sampler,
             num_workers=args.num_workers, pin_memory=True,
             drop_last=sampler is not None,
@@ -466,17 +554,18 @@ def main():
         )
         if same_objective:
             best = float(source_val.get("total", float("inf")))
-        else:
+        elif is_main:
             print("Loss configuration changed; resetting best validation loss", flush=True)
         destination = out_dir / "best.pt"
-        if same_objective and resume_path != destination:
+        if is_main and same_objective and resume_path != destination:
             shutil.copy2(resume_path, destination)
-        print(
-            f"Resumed model from {resume_path} at epoch {start_epoch - 1}; "
-            f"optimizer={'restored' if args.resume_optimizer else 'fresh'}, "
-            f"lr={args.lr:g}",
-            flush=True,
-        )
+        if is_main:
+            print(
+                f"Resumed model from {resume_path} at epoch {start_epoch - 1}; "
+                f"optimizer={'restored' if args.resume_optimizer else 'fresh'}, "
+                f"lr={args.lr:g}",
+                flush=True,
+            )
 
     scheduler = None
     if args.lr_scheduler == "cosine":
@@ -500,19 +589,23 @@ def main():
         scheduler.load_state_dict(resume["scheduler"])
     history = []
     for epoch in range(start_epoch, start_epoch + args.epochs):
-        print(f"\n===== epoch {epoch} =====", flush=True)
+        if is_main:
+            print(f"\n===== epoch {epoch} =====", flush=True)
         if dynamic_batch_sampler is not None:
             dynamic_batch_sampler.set_epoch(epoch)
+        elif isinstance(sampler, DistributedSampler):
+            sampler.set_epoch(epoch)
         base_model = model.module if hasattr(model, "module") else model
         if hasattr(base_model, "set_temporal_enabled"):
             relative_epoch = epoch - start_epoch + 1
             temporal_enabled = relative_epoch > args.geometry_warmup_epochs
             base_model.set_temporal_enabled(temporal_enabled)
-            print(
-                "temporal correction: "
-                f"{'enabled' if temporal_enabled else 'disabled (geometry warmup)'}",
-                flush=True,
-            )
+            if is_main:
+                print(
+                    "temporal correction: "
+                    f"{'enabled' if temporal_enabled else 'disabled (geometry warmup)'}",
+                    flush=True,
+                )
         epoch_lr = float(optimizer.param_groups[0]["lr"])
         train_metrics = run_epoch(
             model, train_loader, device, args, optimizer,
@@ -528,48 +621,75 @@ def main():
                 item["supervised_hand_frames"] = train_metrics["by_dataset"][
                     dataset
                 ]["translation_error"]["count"]
-            print(
-                "dynamic sampling: " + json.dumps(sampling_audit),
-                flush=True,
+            sampling_audit = gather_sampling_audit(
+                sampling_audit, rank, world_size
             )
-        val_metrics = run_epoch(
-            model, val_loader, device, args,
-            dataset_names=val_metadata.dataset_names,
+            if is_main:
+                print(
+                    "dynamic sampling: " + json.dumps(sampling_audit),
+                    flush=True,
+                )
+        val_metrics = None
+        if is_main:
+            previous_disable = args.disable_progress
+            args.disable_progress = False
+            val_metrics = run_epoch(
+                base_model, val_loader, device, args,
+                dataset_names=val_metadata.dataset_names,
+            )
+            args.disable_progress = previous_disable
+        val_total = torch.tensor(
+            float(val_metrics["total"]) if is_main else 0.0,
+            device=device,
         )
+        if distributed:
+            dist.broadcast(val_total, src=0)
         epoch_row = {
             "epoch": epoch,
             "lr": epoch_lr,
             "train": train_metrics,
             "val": val_metrics,
+            "train_metrics_scope": (
+                "rank_0_shard" if distributed else "full_epoch"
+            ),
         }
         if sampling_audit is not None:
             epoch_row["sampling"] = sampling_audit
-        history.append(epoch_row)
-        print(json.dumps(epoch_row), flush=True)
+        if is_main:
+            history.append(epoch_row)
+            print(json.dumps(epoch_row), flush=True)
         if scheduler is not None:
             if args.lr_scheduler == "plateau":
-                scheduler.step(val_metrics["total"])
+                scheduler.step(float(val_total.item()))
             else:
                 scheduler.step()
-        checkpoint = {
-            "epoch": epoch,
-            "model_version": model_version,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": None if scheduler is None else scheduler.state_dict(),
-            "args": vars(args),
-            "audit": audit,
-            "val": val_metrics,
-            "lr": epoch_lr,
-            "next_lr": float(optimizer.param_groups[0]["lr"]),
-        }
-        torch.save(checkpoint, out_dir / "last.pt")
-        if val_metrics["total"] < best:
-            best = val_metrics["total"]
-            torch.save(checkpoint, out_dir / "best.pt")
-        (out_dir / "history.json").write_text(
-            json.dumps(history, indent=2), encoding="utf-8"
-        )
+        if is_main:
+            checkpoint = {
+                "epoch": epoch,
+                "model_version": model_version,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": None if scheduler is None else scheduler.state_dict(),
+                "args": vars(args),
+                "audit": audit,
+                "val": val_metrics,
+                "lr": epoch_lr,
+                "next_lr": float(optimizer.param_groups[0]["lr"]),
+            }
+            torch.save(checkpoint, out_dir / "last.pt")
+            if val_metrics["total"] < best:
+                best = val_metrics["total"]
+                torch.save(checkpoint, out_dir / "best.pt")
+            (out_dir / "history.json").write_text(
+                json.dumps(history, indent=2), encoding="utf-8"
+            )
+        if distributed:
+            dist.barrier()
+
+    if hasattr(provider, "close"):
+        provider.close()
+    if distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
