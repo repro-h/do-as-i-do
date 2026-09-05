@@ -21,6 +21,7 @@ def row(dataset, stream, start, end):
         "label_paths": [f"{stream}/label/{frame}.npz" for frame in frames],
         "tracks_npz": f"{stream}/tracks.npz",
         "visibility_npz": f"{stream}/visibility.npz",
+        "intrinsics": [[600.0, 0.0, 320.0], [0.0, 600.0, 240.0], [0.0, 0.0, 1.0]],
     }
 
 
@@ -43,6 +44,7 @@ class DynamicWindowSamplerTests(unittest.TestCase):
         self.assertTrue(any(item["start"] not in (0, 32) for item in sampled))
         for item in sampled:
             self.assertEqual(len(item["frame_indices"]), 64)
+            self.assertEqual(len(item["intrinsics"]), 3)
             self.assertEqual(item["frame_indices"], list(range(item["start"], item["end"])))
             self.assertEqual(len({path.split("/")[0] for path in item["image_paths"]}), 1)
 
@@ -75,4 +77,3 @@ class DynamicWindowSamplerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

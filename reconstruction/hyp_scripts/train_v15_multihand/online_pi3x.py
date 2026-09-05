@@ -49,6 +49,19 @@ def row_intrinsics(row):
             f"{row_key(row)}"
         )
 
+    if str(row.get("dataset", "")).lower() == "dexycb":
+        from build_dexycb_s0_windows import camera_intrinsics
+
+        label_path = Path(row["label_paths"][0]).expanduser().resolve()
+        camera_dir = label_path.parent
+        if len(label_path.parents) < 4:
+            raise ValueError(f"Cannot infer DexYCB root from {label_path}")
+        root = label_path.parents[3]
+        matrix = np.asarray(
+            camera_intrinsics(root, camera_dir.name), dtype=np.float32
+        ).reshape(3, 3)
+        return np.broadcast_to(matrix[None], (time, 3, 3)).copy()
+
     matrices = []
     for label_path in row["label_paths"]:
         path = Path(label_path).expanduser().resolve()

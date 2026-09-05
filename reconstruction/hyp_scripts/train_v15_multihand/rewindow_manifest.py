@@ -7,6 +7,13 @@ from collections import defaultdict
 from pathlib import Path
 
 
+STATIC_LIST_KEYS = {
+    "intrinsics",
+    "hand_sides",
+    "hand_sides_metadata_only",
+}
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", action="append", required=True)
@@ -97,7 +104,11 @@ def main():
             start = int(row["start"])
             frame_keys = {
                 key for key, value in row.items()
-                if isinstance(value, list) and len(value) == frame_count
+                if (
+                    key not in STATIC_LIST_KEYS
+                    and isinstance(value, list)
+                    and len(value) == frame_count
+                )
             }
             for offset in range(frame_count):
                 position = start + offset
@@ -123,7 +134,10 @@ def main():
                 template = template_by_position[positions[0]]
                 row = {
                     key: value for key, value in template.items()
-                    if not isinstance(value, list) and key not in ("start", "end")
+                    if (
+                        (not isinstance(value, list) or key in STATIC_LIST_KEYS)
+                        and key not in ("start", "end")
+                    )
                 }
                 common_keys = set.intersection(*(
                     set(frame_records[position]) for position in positions

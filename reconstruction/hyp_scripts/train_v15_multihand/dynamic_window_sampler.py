@@ -4,6 +4,13 @@ import random
 from collections import defaultdict
 
 
+STATIC_LIST_KEYS = {
+    "intrinsics",
+    "hand_sides",
+    "hand_sides_metadata_only",
+}
+
+
 def row_dataset(row):
     if row.get("dataset"):
         return str(row["dataset"])
@@ -131,7 +138,11 @@ class DynamicSequenceBatchSampler:
             frame_count = len(row["frame_indices"])
             frame_keys = {
                 key for key, value in row.items()
-                if isinstance(value, list) and len(value) == frame_count
+                if (
+                    key not in STATIC_LIST_KEYS
+                    and isinstance(value, list)
+                    and len(value) == frame_count
+                )
             }
             for offset in range(frame_count):
                 position = int(row["start"]) + offset
@@ -213,7 +224,10 @@ class DynamicSequenceBatchSampler:
         template = sequence["templates"][positions[0]]
         row = {
             key: value for key, value in template.items()
-            if not isinstance(value, list) and key not in ("start", "end")
+            if (
+                (not isinstance(value, list) or key in STATIC_LIST_KEYS)
+                and key not in ("start", "end")
+            )
         }
         records = sequence["frame_records"]
         common_keys = set.intersection(*(
