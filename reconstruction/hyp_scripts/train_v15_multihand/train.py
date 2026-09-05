@@ -205,10 +205,14 @@ def wandb_metrics(split, metrics):
             "total", "absolute", "depth", "relative", "velocity",
             "acceleration", "reprojection", "evaluated_hands",
             "observed_hands", "missing_supervised_hands",
-            "unsupervised_target_hands",
+            "unsupervised_target_hands", "geometry_depth",
+            "temporal_correction",
         )
     }
-    for name in ("translation_error", "depth_error"):
+    for name in (
+        "translation_error", "depth_error", "geometry_depth_error",
+        "temporal_depth_correction",
+    ):
         for statistic in ("median_mm", "p90_mm", "max_mm"):
             value = metrics[name].get(statistic)
             if value is not None:

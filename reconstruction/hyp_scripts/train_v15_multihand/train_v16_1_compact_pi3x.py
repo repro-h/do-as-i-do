@@ -39,7 +39,12 @@ from online_pi3x import (  # noqa: E402
     Pi3XWindowMaterializer,
     row_key,
 )
-from train import DatasetStreamBalancedSampler, row_dataset, run_epoch  # noqa: E402
+from train import (  # noqa: E402
+    DatasetStreamBalancedSampler,
+    row_dataset,
+    run_epoch,
+    wandb_metrics,
+)
 from train_v16_online_pi3x import load_rows, window_layout  # noqa: E402
 
 
@@ -61,6 +66,10 @@ def parse_args():
     parser.add_argument(
         "--compact-cache-root",
         help="Read precomputed compact window caches instead of running Pi3X",
+    )
+    parser.add_argument(
+        "--val-compact-cache-root",
+        help="Optional fixed validation cache while training Pi3X stays online",
     )
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--epochs", type=int, default=20)
@@ -145,6 +154,14 @@ def parse_args():
     parser.add_argument(
         "--dataset-weights", default="",
         help="Optional dataset=weight comma pairs; unspecified weights are one",
+    )
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb-project", default="uni-hand-geometry-v2")
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--wandb-name", default=None)
+    parser.add_argument(
+        "--wandb-mode", choices=("online", "offline", "disabled"),
+        default="online",
     )
     parser.add_argument("--audit-only", action="store_true")
     return parser.parse_args()
@@ -353,10 +370,25 @@ def main():
             patch_radius=args.joint_patch_radius,
             global_grid_size=args.global_grid_size,
         )
+    train_provider = provider
+    if args.val_compact_cache_root:
+        val_provider = DiskCompactFeatureProvider(
+            args.val_compact_cache_root,
+            patch_radius=args.joint_patch_radius,
+            global_grid_size=args.global_grid_size,
+            query_source=args.query_source,
+        )
+        if is_main:
+            print(
+                f"Reading validation compact caches from {val_provider.root}",
+                flush=True,
+            )
+    else:
+        val_provider = train_provider
     train_metadata = metadata_dataset(args, "train", True)
     val_metadata = metadata_dataset(args, "val", False)
-    train_data = CompactWindowDataset(train_metadata, provider)
-    val_data = CompactWindowDataset(val_metadata, provider)
+    train_data = CompactWindowDataset(train_metadata, train_provider)
+    val_data = CompactWindowDataset(val_metadata, val_provider)
     sample = train_data[0]
     compact_thj = tuple(sample["joint_patch_features"].shape[:3])
     query_thj = tuple(sample["joint_uv"].shape[:3])
@@ -391,6 +423,9 @@ def main():
         ),
         "compact_cache_root": (
             str(provider.root) if args.compact_cache_root else None
+        ),
+        "val_compact_cache_root": (
+            str(val_provider.root) if args.val_compact_cache_root else None
         ),
         "dense_feature_equivalent_gib": (
             None if dense_equivalent is None else dense_equivalent / 2**30
@@ -525,6 +560,22 @@ def main():
     )
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    wandb_run = None
+    if is_main and args.wandb:
+        try:
+            import wandb
+        except ImportError as error:
+            raise RuntimeError(
+                "--wandb was requested but wandb is not installed"
+            ) from error
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_name,
+            mode=args.wandb_mode,
+            config=vars(args),
+            dir=str(out_dir),
+        )
     resume = None
     start_epoch = 1
     best = float("inf")
@@ -658,6 +709,19 @@ def main():
         if is_main:
             history.append(epoch_row)
             print(json.dumps(epoch_row), flush=True)
+            if wandb_run is not None:
+                logged = {"epoch": epoch, "lr": epoch_lr}
+                logged.update(wandb_metrics("train", train_metrics))
+                logged.update(wandb_metrics("val", val_metrics))
+                for dataset, values in val_metrics["by_dataset"].items():
+                    for metric in ("translation_error", "depth_error"):
+                        for statistic in ("median_mm", "p90_mm"):
+                            value = values[metric].get(statistic)
+                            if value is not None:
+                                logged[
+                                    f"val/by_dataset/{dataset}/{metric}/{statistic}"
+                                ] = value
+                wandb_run.log(logged, step=epoch)
         if scheduler is not None:
             if args.lr_scheduler == "plateau":
                 scheduler.step(float(val_total.item()))
@@ -686,8 +750,13 @@ def main():
         if distributed:
             dist.barrier()
 
-    if hasattr(provider, "close"):
-        provider.close()
+    if hasattr(train_provider, "close"):
+        train_provider.close()
+    if val_provider is not train_provider and hasattr(val_provider, "close"):
+        val_provider.close()
+    if wandb_run is not None:
+        wandb_run.summary["best_val_total"] = best
+        wandb_run.finish()
     if distributed:
         dist.destroy_process_group()
 
