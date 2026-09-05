@@ -17,9 +17,10 @@ class CompactWindowDataset(Dataset):
         return len(self.metadata)
 
     def __getitem__(self, index):
-        sample = self.metadata[index]
+        row = self.metadata.row_for_index(index)
+        sample = self.metadata[row]
         compact = self.compact_provider(
-            self.rows[index], sample["joint_uv"].numpy()
+            row, sample["joint_uv"].numpy()
         )
         for key in ("point_features", "grid_uv", "grid_confidence", "grid_valid"):
             sample.pop(key, None)
@@ -39,7 +40,7 @@ class CompactWindowDataset(Dataset):
         metric = np.asarray(compact["metric_window_features"], dtype=np.float32)
         metric = metric.reshape(-1, metric.shape[-1]).mean(axis=0)
         sample["metric_window_features"] = torch.from_numpy(metric)
-        time = len(self.rows[index]["frame_indices"])
+        time = len(row["frame_indices"])
         intrinsics = np.asarray(compact["intrinsics_resized"], dtype=np.float32)
         if intrinsics.ndim == 2:
             intrinsics = np.broadcast_to(intrinsics[None], (time, 3, 3)).copy()

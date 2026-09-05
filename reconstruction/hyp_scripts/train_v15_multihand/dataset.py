@@ -170,8 +170,12 @@ class DexYCBMultiHandWindowDataset(Dataset):
     def __len__(self):
         return len(self.rows)
 
+    def row_for_index(self, index):
+        """Accept a materialized dynamic row from a batch sampler."""
+        return index if isinstance(index, dict) else self.rows[index]
+
     def __getitem__(self, index):
-        row = self.rows[index]
+        row = self.row_for_index(index)
         labels = row["label_paths"]
         time = len(labels)
         hands, joints = self.max_hands, 21

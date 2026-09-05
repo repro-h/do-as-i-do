@@ -23,6 +23,10 @@ from compact_model import (  # noqa: E402
     GeometryTemporalCompactModel,
 )
 from dataset import DexYCBMultiHandWindowDataset, QueryNoise  # noqa: E402
+from dynamic_window_sampler import (  # noqa: E402
+    DynamicSequenceBatchSampler,
+    parse_dataset_weights,
+)
 from online_pi3x import (  # noqa: E402
     CompactFeatureProvider,
     DiskCompactFeatureProvider,
@@ -125,6 +129,19 @@ def parse_args():
         "--train-windows-per-dataset", type=int, default=0,
         help="Equal per-dataset epoch budget; zero uses ordinary window shuffle",
     )
+    parser.add_argument(
+        "--dynamic-train-sampling", action="store_true",
+        help="Build random contiguous train windows and same-dataset batches",
+    )
+    parser.add_argument(
+        "--steps-per-epoch", type=int, default=0,
+        help="Fixed train batches per epoch for --dynamic-train-sampling",
+    )
+    parser.add_argument("--dynamic-window-size", type=int, default=64)
+    parser.add_argument(
+        "--dataset-weights", default="",
+        help="Optional dataset=weight comma pairs; unspecified weights are one",
+    )
     parser.add_argument("--audit-only", action="store_true")
     return parser.parse_args()
 
@@ -193,6 +210,23 @@ def main():
             raise ValueError("V2 requires --translation-parameterization ray_depth_uv")
         if args.w_geometry_depth <= 0:
             raise ValueError("V2 requires --w-geometry-depth greater than zero")
+    if args.dynamic_train_sampling:
+        if args.compact_cache_root:
+            raise ValueError(
+                "Dynamic windows require online Pi3X; omit --compact-cache-root"
+            )
+        if args.steps_per_epoch <= 0:
+            raise ValueError(
+                "--dynamic-train-sampling requires positive --steps-per-epoch"
+            )
+        if args.train_windows_per_dataset > 0:
+            raise ValueError(
+                "Do not combine dynamic sampling with --train-windows-per-dataset"
+            )
+        if args.dynamic_window_size > args.max_window_size:
+            raise ValueError(
+                "--dynamic-window-size exceeds --max-window-size"
+            )
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -206,6 +240,20 @@ def main():
                 f"Window {row_key(row)} exceeds --max-window-size "
                 f"{args.max_window_size}"
             )
+    dynamic_batch_sampler = None
+    if args.dynamic_train_sampling:
+        dataset_weights = parse_dataset_weights(
+            args.dataset_weights,
+            sorted({row_dataset(row) for row in train_rows}),
+        )
+        dynamic_batch_sampler = DynamicSequenceBatchSampler(
+            train_rows,
+            batch_size=args.batch_size,
+            steps_per_epoch=args.steps_per_epoch,
+            window_size=args.dynamic_window_size,
+            dataset_weights=dataset_weights,
+            seed=args.seed,
+        )
 
     payloads = None
     if args.compact_cache_root:
@@ -296,6 +344,16 @@ def main():
         "train_datasets": sorted({row_dataset(row) for row in train_rows}),
         "val_datasets": sorted({row_dataset(row) for row in val_rows}),
         "train_windows_per_dataset": args.train_windows_per_dataset,
+        "dynamic_train_sampling": args.dynamic_train_sampling,
+        "dynamic_window_size": (
+            args.dynamic_window_size if args.dynamic_train_sampling else None
+        ),
+        "steps_per_epoch": (
+            args.steps_per_epoch if args.dynamic_train_sampling else None
+        ),
+        "dataset_weights": (
+            args.dataset_weights if args.dynamic_train_sampling else None
+        ),
         "data_parallel_requested": args.data_parallel,
         "visible_cuda_devices": torch.cuda.device_count(),
         "resume_checkpoint": args.resume_checkpoint,
@@ -306,6 +364,10 @@ def main():
         "query_noise_aligned": (
             not any(value != 0 for value in noise_values)
             or not args.compact_cache_root
+        ),
+        "dynamic_sampling_setup": (
+            dynamic_batch_sampler.setup_audit()
+            if dynamic_batch_sampler is not None else None
         ),
     }
     print(json.dumps(audit, indent=2), flush=True)
@@ -345,17 +407,27 @@ def main():
                 "--data-parallel requires at least two visible CUDA devices"
             )
         model = torch.nn.DataParallel(model)
-    sampler = (
-        DatasetStreamBalancedSampler(
-            train_data.rows, args.train_windows_per_dataset, args.seed
+    sampler = None
+    if args.dynamic_train_sampling:
+        train_loader = DataLoader(
+            train_data,
+            batch_sampler=dynamic_batch_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
         )
-        if args.train_windows_per_dataset > 0 else None
-    )
-    train_loader = DataLoader(
-        train_data, batch_size=args.batch_size, shuffle=sampler is None,
-        sampler=sampler,
-        num_workers=args.num_workers, pin_memory=True, drop_last=sampler is not None,
-    )
+    else:
+        sampler = (
+            DatasetStreamBalancedSampler(
+                train_data.rows, args.train_windows_per_dataset, args.seed
+            )
+            if args.train_windows_per_dataset > 0 else None
+        )
+        train_loader = DataLoader(
+            train_data, batch_size=args.batch_size, shuffle=sampler is None,
+            sampler=sampler,
+            num_workers=args.num_workers, pin_memory=True,
+            drop_last=sampler is not None,
+        )
     val_loader = DataLoader(
         val_data, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=True,
@@ -429,6 +501,8 @@ def main():
     history = []
     for epoch in range(start_epoch, start_epoch + args.epochs):
         print(f"\n===== epoch {epoch} =====", flush=True)
+        if dynamic_batch_sampler is not None:
+            dynamic_batch_sampler.set_epoch(epoch)
         base_model = model.module if hasattr(model, "module") else model
         if hasattr(base_model, "set_temporal_enabled"):
             relative_epoch = epoch - start_epoch + 1
@@ -444,6 +518,20 @@ def main():
             model, train_loader, device, args, optimizer,
             dataset_names=train_metadata.dataset_names,
         )
+        sampling_audit = None
+        if dynamic_batch_sampler is not None:
+            sampling_audit = dynamic_batch_sampler.audit()
+            sampling_audit["supervised_hand_frames"] = train_metrics[
+                "evaluated_hands"
+            ]
+            for dataset, item in sampling_audit["by_dataset"].items():
+                item["supervised_hand_frames"] = train_metrics["by_dataset"][
+                    dataset
+                ]["translation_error"]["count"]
+            print(
+                "dynamic sampling: " + json.dumps(sampling_audit),
+                flush=True,
+            )
         val_metrics = run_epoch(
             model, val_loader, device, args,
             dataset_names=val_metadata.dataset_names,
@@ -454,6 +542,8 @@ def main():
             "train": train_metrics,
             "val": val_metrics,
         }
+        if sampling_audit is not None:
+            epoch_row["sampling"] = sampling_audit
         history.append(epoch_row)
         print(json.dumps(epoch_row), flush=True)
         if scheduler is not None:
