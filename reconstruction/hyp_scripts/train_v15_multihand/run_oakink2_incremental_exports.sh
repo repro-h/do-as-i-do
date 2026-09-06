@@ -19,6 +19,7 @@ compact_root=""
 gpus=""
 wait_pid=""
 dry_run=0
+skip_compact=0
 
 usage() {
   cat <<'EOF'
@@ -33,6 +34,7 @@ Usage: bash run_oakink2_incremental_exports.sh --gpus 5,6 [options]
   --python FILE --visibility-python FILE
   --visibility-root DIR --visibility-checkpoint FILE
   --mano-model-folder DIR --hand-uni-root DIR --pi3-root DIR
+  --skip-compact             Stop after tracks and visibility
   --dry-run                   Validate paths and print commands, without exporting
 
 Order: prepare -> tracks train/val -> visibility train/val -> compact train/val.
@@ -58,6 +60,7 @@ while (($#)); do
     --mano-model-folder) mano_folder="$2"; shift 2 ;;
     --hand-uni-root) hand_uni_root="$2"; shift 2 ;;
     --pi3-root) pi3_root="$2"; shift 2 ;;
+    --skip-compact) skip_compact=1; shift ;;
     --dry-run) dry_run=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -76,13 +79,17 @@ sequence_list=${sequence_list:-"$oak_root/sequence_sample_128_clean.txt"}
 for executable in "$python" "$visibility_python"; do
   [[ -x "$executable" ]] || { echo "Python not executable: $executable" >&2; exit 1; }
 done
-for file in "$sequence_list" "$out_root/status.json" "$visibility_checkpoint" "$pi3x_checkpoint"; do
+required_files=("$sequence_list" "$out_root/status.json" "$visibility_checkpoint")
+if ((skip_compact == 0)); then
+  required_files+=("$pi3x_checkpoint")
+fi
+for file in "${required_files[@]}"; do
   [[ -f "$file" ]] || { echo "Missing file: $file" >&2; exit 1; }
 done
 for directory in "$oak_root" "$visibility_root" "$mano_folder" "$hand_uni_root" "$pi3_root"; do
   [[ -d "$directory" ]] || { echo "Missing directory: $directory" >&2; exit 1; }
 done
-if [[ -z "$compact_root" ]]; then
+if ((skip_compact == 0)) && [[ -z "$compact_root" ]]; then
   [[ -f "$training_checkpoint" ]] || { echo "Missing trusted training checkpoint: $training_checkpoint" >&2; exit 1; }
   compact_root=$("$python" - "$training_checkpoint" <<'PY'
 import sys
@@ -95,7 +102,9 @@ print(root)
 PY
   )
 fi
-[[ -d "$compact_root" ]] || { echo "Existing compact cache not found: $compact_root" >&2; exit 1; }
+if ((skip_compact == 0)); then
+  [[ -d "$compact_root" ]] || { echo "Existing compact cache not found: $compact_root" >&2; exit 1; }
+fi
 
 log_root="$out_root/logs/incremental_exports"
 mkdir -p "$log_root"
@@ -148,16 +157,18 @@ for split in train val; do
     --backbone wilor --max-hands 2 --device cuda
 done
 
-for split in train val; do
-  stage "compact_$split" env CUDA_VISIBLE_DEVICES="$gpus" \
-    bash "$script_dir/run_sharded_export.sh" \
-    --log-dir "$log_root/compact_$split" --num-shards "${#gpu_ids[@]}" -- \
-    "$python" -u "$script_dir/export_compact_pi3x_cache.py" \
-    --windows "$out_root/manifests/${split}_windows.jsonl" \
-    --track-root "$out_root/tracks/$split" --visibility-root "$out_root/visibility/$split" \
-    --hand-uni-root "$hand_uni_root" --pi3-root "$pi3_root" \
-    --pi3x-checkpoint "$pi3x_checkpoint" --out-root "$compact_root" \
-    --max-hands 2 --pixel-limit 180000 --joint-patch-radius 1 \
-    --global-grid-size 4 --feature-dtype float16 --device cuda
-done
+if ((skip_compact == 0)); then
+  for split in train val; do
+    stage "compact_$split" env CUDA_VISIBLE_DEVICES="$gpus" \
+      bash "$script_dir/run_sharded_export.sh" \
+      --log-dir "$log_root/compact_$split" --num-shards "${#gpu_ids[@]}" -- \
+      "$python" -u "$script_dir/export_compact_pi3x_cache.py" \
+      --windows "$out_root/manifests/${split}_windows.jsonl" \
+      --track-root "$out_root/tracks/$split" --visibility-root "$out_root/visibility/$split" \
+      --hand-uni-root "$hand_uni_root" --pi3-root "$pi3_root" \
+      --pi3x-checkpoint "$pi3x_checkpoint" --out-root "$compact_root" \
+      --max-hands 2 --pixel-limit 180000 --joint-patch-radius 1 \
+      --global-grid-size 4 --feature-dtype float16 --device cuda
+  done
+fi
 echo "[$(date +%FT%T)] pipeline complete (dry_run=$dry_run); no training launched"
