@@ -177,21 +177,29 @@ def temporal_weighted_loss(prediction, target, weight, order, beta):
 
 
 def distribution(values):
+    empty = {
+        "count": 0,
+        "mean_mm": None,
+        "median_mm": None,
+        "p90_mm": None,
+        "max_mm": None,
+    }
     if not values:
-        return {"count": 0, "median_mm": None, "p90_mm": None, "max_mm": None}
+        return empty
     arrays = [
         np.asarray(value).reshape(-1)
         for value in values
         if np.asarray(value).size
     ]
     if not arrays:
-        return {"count": 0, "median_mm": None, "p90_mm": None, "max_mm": None}
+        return empty
     array = np.concatenate(arrays)
     array = array[np.isfinite(array)] * 1000.0
     if array.size == 0:
-        return {"count": 0, "median_mm": None, "p90_mm": None, "max_mm": None}
+        return empty
     return {
         "count": int(array.size),
+        "mean_mm": float(np.mean(array)),
         "median_mm": float(np.median(array)),
         "p90_mm": float(np.percentile(array, 90)),
         "max_mm": float(np.max(array)),
@@ -213,23 +221,41 @@ def wandb_metrics(split, metrics):
         "translation_error", "depth_error", "geometry_depth_error",
         "temporal_depth_correction",
     ):
-        for statistic in ("median_mm", "p90_mm", "max_mm"):
+        for statistic in ("mean_mm", "median_mm", "p90_mm", "max_mm"):
             value = metrics[name].get(statistic)
             if value is not None:
                 result[f"{split}/{name}/{statistic}"] = value
     for group, values in metrics.get("by_observability", {}).items():
         for name in ("translation_error", "depth_error"):
-            for statistic in ("median_mm", "p90_mm"):
+            for statistic in ("mean_mm", "median_mm", "p90_mm"):
                 value = values[name].get(statistic)
                 if value is not None:
                     result[
                         f"{split}/by_observability/{group}/{name}/{statistic}"
                     ] = value
+    for dataset, groups in metrics.get("by_dataset_observability", {}).items():
+        for group, values in groups.items():
+            for name in ("translation_error", "depth_error"):
+                for statistic in ("mean_mm", "median_mm", "p90_mm"):
+                    value = values[name].get(statistic)
+                    if value is not None:
+                        result[
+                            f"{split}/by_dataset_observability/{dataset}/"
+                            f"{group}/{name}/{statistic}"
+                        ] = value
+            for axis, axis_values in values.get("axis_error", {}).items():
+                for statistic in ("mean_mm", "median_mm", "p90_mm"):
+                    value = axis_values.get(statistic)
+                    if value is not None:
+                        result[
+                            f"{split}/by_dataset_observability/{dataset}/"
+                            f"{group}/axis_error/{axis}/{statistic}"
+                        ] = value
     stitched = metrics.get("stitched")
     if stitched:
         result[f"{split}/stitched/unique_hands"] = stitched["unique_hands"]
         for name in ("translation_error", "depth_error", "overlap_disagreement"):
-            for statistic in ("median_mm", "p90_mm"):
+            for statistic in ("mean_mm", "median_mm", "p90_mm"):
                 value = stitched[name].get(statistic)
                 if value is not None:
                     result[f"{split}/stitched/{name}/{statistic}"] = value
@@ -261,6 +287,17 @@ def run_epoch(
     dataset_errors = {
         name: {"translation": [], "depth": []}
         for name in (dataset_names or [])
+    }
+    dataset_observability_errors = {
+        dataset: {
+            group: {
+                "translation": [],
+                "depth": [],
+                "axis": {axis: [] for axis in ("x", "y", "z")},
+            }
+            for group in grouped_errors
+        }
+        for dataset in (dataset_names or [])
     }
     axis_errors = {axis: [] for axis in ("x", "y", "z")}
     stitched = defaultdict(list)
@@ -395,11 +432,21 @@ def run_epoch(
         if dataset_errors:
             dataset_index = batch["dataset_index"].detach().cpu().numpy()
             for index, name in enumerate(dataset_names):
-                dataset_mask = mask & (dataset_index[:, None, None] == index)
+                in_dataset = dataset_index[:, None, None] == index
+                dataset_mask = mask & in_dataset
                 dataset_errors[name]["translation"].append(
                     translation_error[dataset_mask]
                 )
                 dataset_errors[name]["depth"].append(depth_error[dataset_mask])
+                for group, group_mask in group_masks.items():
+                    cross_mask = group_mask & in_dataset
+                    cross = dataset_observability_errors[name][group]
+                    cross["translation"].append(translation_error[cross_mask])
+                    cross["depth"].append(depth_error[cross_mask])
+                    for axis, axis_index in (("x", 0), ("y", 1), ("z", 2)):
+                        cross["axis"][axis].append(
+                            np.abs(error[..., axis_index])[cross_mask]
+                        )
         for axis, axis_index in (("x", 0), ("y", 1), ("z", 2)):
             axis_errors[axis].append(np.abs(error[..., axis_index])[mask])
         if not training:
@@ -455,6 +502,20 @@ def run_epoch(
                 "depth_error": distribution(values["depth"]),
             }
             for name, values in dataset_errors.items()
+        },
+        "by_dataset_observability": {
+            dataset: {
+                group: {
+                    "translation_error": distribution(values["translation"]),
+                    "depth_error": distribution(values["depth"]),
+                    "axis_error": {
+                        axis: distribution(axis_values)
+                        for axis, axis_values in values["axis"].items()
+                    },
+                }
+                for group, values in groups.items()
+            }
+            for dataset, groups in dataset_observability_errors.items()
         },
         "evaluated_hands": evaluated,
         "observed_hands": observed_hands,

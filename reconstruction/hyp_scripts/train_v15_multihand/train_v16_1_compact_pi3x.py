@@ -715,7 +715,7 @@ def main():
                 logged.update(wandb_metrics("val", val_metrics))
                 for dataset, values in val_metrics["by_dataset"].items():
                     for metric in ("translation_error", "depth_error"):
-                        for statistic in ("median_mm", "p90_mm"):
+                        for statistic in ("mean_mm", "median_mm", "p90_mm"):
                             value = values[metric].get(statistic)
                             if value is not None:
                                 logged[
