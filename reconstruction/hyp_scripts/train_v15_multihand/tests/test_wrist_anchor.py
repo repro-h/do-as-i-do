@@ -5,12 +5,14 @@ from tempfile import TemporaryDirectory
 import unittest
 
 import numpy as np
+import torch
 
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from dataset import DexYCBMultiHandWindowDataset
+from compact_model import ray_anchor_relative_uv
 
 
 class DenseProvider:
@@ -127,6 +129,65 @@ class WristAnchorTests(unittest.TestCase):
             sample = dataset[0]
             self.assertEqual(int(sample["ray_anchor_source"][9, 0]), 0)
             self.assertEqual(float(sample["supervision_weight"][9, 0]), 0.0)
+
+
+class RayAnchorRelativeUvTests(unittest.TestCase):
+    @staticmethod
+    def inputs(source, wrist, joint, joint_valid=True):
+        joint_uv = torch.zeros((1, 1, 1, 21, 2), dtype=torch.float32)
+        joint_uv[..., 0, :] = torch.tensor(wrist)
+        joint_uv[..., 1, :] = torch.tensor(joint)
+        valid = torch.zeros((1, 1, 1, 21), dtype=torch.bool)
+        valid[..., 0] = source == 1 and joint_valid
+        valid[..., 1] = joint_valid
+        anchor = torch.tensor(wrist, dtype=torch.float32).reshape(1, 1, 1, 2)
+        anchor_source = torch.tensor([[[source]]], dtype=torch.int64)
+        return joint_uv, valid, anchor, anchor_source
+
+    def test_source_1_matches_raw_wrist_reference(self):
+        joint_uv, valid, anchor, source = self.inputs(
+            1, wrist=(0.2, -0.3), joint=(0.5, 0.1)
+        )
+        local_uv, relative_valid = ray_anchor_relative_uv(
+            joint_uv, anchor, valid, source
+        )
+        old_local_uv = joint_uv - joint_uv[..., :1, :]
+        torch.testing.assert_close(local_uv[..., :2, :], old_local_uv[..., :2, :])
+        self.assertTrue(bool(relative_valid[..., 1]))
+
+    def test_source_2_uses_estimated_anchor_not_invalid_wrist(self):
+        joint_uv, valid, _, source = self.inputs(
+            2, wrist=(-1.0, -1.0), joint=(0.5, 0.6)
+        )
+        anchor = torch.tensor([0.1, 0.2]).reshape(1, 1, 1, 2)
+        local_uv, relative_valid = ray_anchor_relative_uv(
+            joint_uv, anchor, valid, source
+        )
+        torch.testing.assert_close(
+            local_uv[..., 1, :], torch.tensor([[[[0.4, 0.4]]]])
+        )
+        self.assertTrue(bool(relative_valid[..., 1]))
+
+    def test_source_3_invalid_joints_have_zero_relative_metadata(self):
+        joint_uv, valid, anchor, source = self.inputs(
+            3, wrist=(-1.0, -1.0), joint=(0.4, 0.5), joint_valid=False
+        )
+        anchor = torch.tensor([0.1, 0.2]).reshape(1, 1, 1, 2)
+        local_uv, relative_valid = ray_anchor_relative_uv(
+            joint_uv, anchor, valid, source
+        )
+        self.assertTrue(torch.equal(local_uv, torch.zeros_like(local_uv)))
+        self.assertFalse(bool(relative_valid.any()))
+
+    def test_source_0_has_no_relative_metadata(self):
+        joint_uv, valid, anchor, source = self.inputs(
+            0, wrist=(-1.0, -1.0), joint=(0.4, 0.5)
+        )
+        local_uv, relative_valid = ray_anchor_relative_uv(
+            joint_uv, anchor, valid, source
+        )
+        self.assertTrue(torch.equal(local_uv, torch.zeros_like(local_uv)))
+        self.assertFalse(bool(relative_valid.any()))
 
 
 if __name__ == "__main__":

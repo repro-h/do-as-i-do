@@ -6,6 +6,22 @@ import torch
 import torch.nn as nn
 
 
+def ray_anchor_relative_uv(
+    joint_uv, ray_anchor_uv, joint_valid, ray_anchor_source=None,
+):
+    """Return joint UV relative to a valid ray anchor in normalized coordinates."""
+    if ray_anchor_source is None:
+        anchor_valid = torch.ones_like(joint_valid[..., 0])
+    else:
+        anchor_valid = ray_anchor_source > 0
+    relative_valid = joint_valid & anchor_valid[..., None]
+    local_uv = joint_uv - ray_anchor_uv[..., None, :]
+    local_uv = torch.where(
+        relative_valid[..., None], local_uv, torch.zeros_like(local_uv)
+    )
+    return local_uv, relative_valid
+
+
 class CompactMultiHandPi3XTrajectoryModel(nn.Module):
     def __init__(
         self,
@@ -101,11 +117,15 @@ class CompactMultiHandPi3XTrajectoryModel(nn.Module):
         if time > self.temporal_position.shape[0]:
             raise ValueError("Window exceeds max_window_size")
 
-        root_uv = joint_uv[:, :, :, :1]
-        local_uv = joint_uv - root_uv
+        local_uv, relative_valid = ray_anchor_relative_uv(
+            joint_uv,
+            batch["ray_anchor_uv"],
+            joint_valid,
+            batch.get("ray_anchor_source"),
+        )
         metadata = torch.cat((
             joint_uv, local_uv,
-            joint_valid.to(joint_uv.dtype)[..., None],
+            relative_valid.to(joint_uv.dtype)[..., None],
             visibility[..., None],
         ), dim=-1)
         query = self.joint_encoder(metadata)
