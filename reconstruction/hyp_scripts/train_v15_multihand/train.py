@@ -242,6 +242,40 @@ def signed_distribution(values, scale=1.0, unit=""):
     }
 
 
+ANCHOR_SOURCE_NAMES = {
+    0: "none",
+    1: "direct_wrist",
+    2: "visible_joints",
+    3: "temporal",
+}
+
+
+def anchor_source_summary(groups):
+    counts = {
+        source: sum(np.asarray(value).size for value in values["translation"])
+        for source, values in groups.items()
+    }
+    total = sum(counts.values())
+    return {
+        f"{source}_{ANCHOR_SOURCE_NAMES[source]}": {
+            "source": source,
+            "name": ANCHOR_SOURCE_NAMES[source],
+            "count": counts[source],
+            "fraction": counts[source] / total if total else None,
+            "anchor_reprojection_error": pixel_distribution(
+                values["anchor_reprojection"]
+            ),
+            "translation_error": distribution(values["translation"]),
+            "depth_error": distribution(values["depth"]),
+            "axis_error": {
+                axis: distribution(axis_values)
+                for axis, axis_values in values["axis"].items()
+            },
+        }
+        for source, values in groups.items()
+    }
+
+
 def wandb_metrics(split, metrics):
     result = {
         f"{split}/{key}": metrics[key]
@@ -287,6 +321,31 @@ def wandb_metrics(split, metrics):
                             f"{split}/by_dataset_observability/{dataset}/"
                             f"{group}/axis_error/{axis}/{statistic}"
                         ] = value
+    for group, values in metrics.get("by_anchor_source", {}).items():
+        if values["fraction"] is not None:
+            result[f"{split}/by_anchor_source/{group}/fraction"] = values[
+                "fraction"
+            ]
+        for name in (
+            "anchor_reprojection_error", "translation_error", "depth_error"
+        ):
+            for statistic in (
+                "mean_px", "median_px", "p90_px",
+                "mean_mm", "median_mm", "p90_mm",
+            ):
+                value = values[name].get(statistic)
+                if value is not None:
+                    result[
+                        f"{split}/by_anchor_source/{group}/{name}/{statistic}"
+                    ] = value
+        for axis, axis_values in values.get("axis_error", {}).items():
+            for statistic in ("mean_mm", "median_mm", "p90_mm"):
+                value = axis_values.get(statistic)
+                if value is not None:
+                    result[
+                        f"{split}/by_anchor_source/{group}/"
+                        f"axis_error/{axis}/{statistic}"
+                    ] = value
     stitched = metrics.get("stitched")
     if stitched:
         result[f"{split}/stitched/unique_hands"] = stitched["unique_hands"]
@@ -339,6 +398,22 @@ def run_epoch(
             }
             for group in grouped_errors
         }
+        for dataset in (dataset_names or [])
+    }
+    def new_anchor_source_groups():
+        return {
+            source: {
+                "translation": [],
+                "depth": [],
+                "axis": {axis: [] for axis in ("x", "y", "z")},
+                "anchor_reprojection": [],
+            }
+            for source in ANCHOR_SOURCE_NAMES
+        }
+
+    anchor_source_errors = new_anchor_source_groups()
+    dataset_anchor_source_errors = {
+        dataset: new_anchor_source_groups()
         for dataset in (dataset_names or [])
     }
     axis_errors = {axis: [] for axis in ("x", "y", "z")}
@@ -473,6 +548,11 @@ def run_epoch(
         pixel_offset_fraction = pixel_offset / np.maximum(image_wh_np, 1.0)
         translation_error = np.linalg.norm(error, axis=-1)
         depth_error = np.abs(error[..., 2])
+        anchor_source_np = (
+            batch["ray_anchor_source"].detach().cpu().numpy()
+            if "ray_anchor_source" in batch
+            else np.zeros_like(valid_np, dtype=np.int64)
+        )
         translation_errors.append(translation_error[mask])
         depth_errors.append(depth_error[mask])
         geometry_depth = auxiliary.get("geometry_depth")
@@ -491,6 +571,17 @@ def run_epoch(
                 translation_error[group_mask]
             )
             grouped_errors[name]["depth"].append(depth_error[group_mask])
+        for source, source_values in anchor_source_errors.items():
+            source_mask = valid_np & (anchor_source_np == source)
+            source_values["translation"].append(translation_error[source_mask])
+            source_values["depth"].append(depth_error[source_mask])
+            source_values["anchor_reprojection"].append(
+                anchor_reprojection[source_mask]
+            )
+            for axis, axis_index in (("x", 0), ("y", 1), ("z", 2)):
+                source_values["axis"][axis].append(
+                    np.abs(error[..., axis_index])[source_mask]
+                )
         if dataset_errors:
             dataset_index = batch["dataset_index"].detach().cpu().numpy()
             for index, name in enumerate(dataset_names):
@@ -500,6 +591,27 @@ def run_epoch(
                     translation_error[dataset_mask]
                 )
                 dataset_errors[name]["depth"].append(depth_error[dataset_mask])
+                for source, source_values in dataset_anchor_source_errors[
+                    name
+                ].items():
+                    source_mask = (
+                        valid_np
+                        & in_dataset
+                        & (anchor_source_np == source)
+                    )
+                    source_values["translation"].append(
+                        translation_error[source_mask]
+                    )
+                    source_values["depth"].append(depth_error[source_mask])
+                    source_values["anchor_reprojection"].append(
+                        anchor_reprojection[source_mask]
+                    )
+                    for axis, axis_index in (
+                        ("x", 0), ("y", 1), ("z", 2)
+                    ):
+                        source_values["axis"][axis].append(
+                            np.abs(error[..., axis_index])[source_mask]
+                        )
                 for group, group_mask in group_masks.items():
                     cross_mask = group_mask & in_dataset
                     cross = dataset_observability_errors[name][group]
@@ -617,6 +729,11 @@ def run_epoch(
                 for group, values in groups.items()
             }
             for dataset, groups in dataset_observability_errors.items()
+        },
+        "by_anchor_source": anchor_source_summary(anchor_source_errors),
+        "by_dataset_anchor_source": {
+            dataset: anchor_source_summary(groups)
+            for dataset, groups in dataset_anchor_source_errors.items()
         },
         "evaluated_hands": evaluated,
         "observed_hands": observed_hands,

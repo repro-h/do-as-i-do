@@ -104,6 +104,7 @@ class DexYCBMultiHandWindowDataset(Dataset):
         track_root=None,
         near_anchor_frames=4,
         max_anchor_frames=8,
+        anchor_visibility_threshold=0.5,
         near_missing_weight=0.5,
         far_missing_weight=0.2,
         dense_provider=None,
@@ -134,6 +135,7 @@ class DexYCBMultiHandWindowDataset(Dataset):
         )
         self.near_anchor_frames = int(near_anchor_frames)
         self.max_anchor_frames = int(max_anchor_frames)
+        self.anchor_visibility_threshold = float(anchor_visibility_threshold)
         self.near_missing_weight = float(near_missing_weight)
         self.far_missing_weight = float(far_missing_weight)
         self.query_source = str(query_source)
@@ -147,6 +149,12 @@ class DexYCBMultiHandWindowDataset(Dataset):
         if self.supervision_source not in ("observation", "target"):
             raise ValueError(
                 f"Unknown supervision source: {self.supervision_source}"
+            )
+        if not 0.0 <= self.anchor_visibility_threshold <= 1.0:
+            raise ValueError("anchor_visibility_threshold must be in [0, 1]")
+        if not 0 <= self.near_anchor_frames <= self.max_anchor_frames:
+            raise ValueError(
+                "Expected 0 <= near_anchor_frames <= max_anchor_frames"
             )
         if self.visibility_source == "detector" and self.visibility_root is None:
             missing = [row["stream_id"] for row in self.rows if not row.get("visibility_npz")]
@@ -330,10 +338,18 @@ class DexYCBMultiHandWindowDataset(Dataset):
         if track_data is not None:
             track_data.close()
 
+        original_wh = np.array([seg.shape[1], seg.shape[0]], dtype=np.float32)
         clean_query_uv_px = query_uv_px.copy()
         clean_query_valid = query_valid.copy()
         if self.training:
             query_uv_px, query_valid = self.noise(query_uv_px, query_valid)
+        query_valid &= np.isfinite(query_uv_px).all(axis=-1)
+        query_valid &= (
+            (query_uv_px[..., 0] >= 0)
+            & (query_uv_px[..., 0] < original_wh[0])
+            & (query_uv_px[..., 1] >= 0)
+            & (query_uv_px[..., 1] < original_wh[1])
+        )
 
         if self.visibility_source == "detector":
             # GT joints remain supervision, but a failed detector must not expose
@@ -343,43 +359,112 @@ class DexYCBMultiHandWindowDataset(Dataset):
 
         ray_anchor_uv_px = np.zeros((time, hands, 2), dtype=np.float32)
         supervision_weight = np.zeros((time, hands), dtype=np.float32)
-        track_has_anchor = np.zeros(hands, dtype=bool)
         wrist_anchor_valid = (
             observation_valid
             & hand_slot_valid
             & query_valid[:, :, 0]
         )
+        spatial_wrist_anchor_valid = np.zeros((time, hands), dtype=bool)
+        ray_anchor_source = np.zeros((time, hands), dtype=np.int64)
+        ray_anchor_distance_frames = np.full((time, hands), np.inf, dtype=np.float32)
         frame_axis = np.arange(time, dtype=np.float32)
         for hand in range(hands):
-            observed = wrist_anchor_valid[:, hand]
-            anchors = np.flatnonzero(observed)
-            if len(anchors) == 0:
+            direct = wrist_anchor_valid[:, hand]
+            direct_frames = np.flatnonzero(direct)
+            if len(direct_frames) == 0:
                 continue
-            track_has_anchor[hand] = True
+
+            ray_anchor_uv_px[direct, hand] = query_uv_px[direct, hand, 0]
+            ray_anchor_source[direct, hand] = 1
+            ray_anchor_distance_frames[direct, hand] = 0.0
+
+            direct_distance = np.min(
+                np.abs(frame_axis[:, None] - direct_frames[None]), axis=1
+            )
+            temporal = (
+                ~direct
+                & hand_slot_valid[:, hand]
+                & (direct_distance <= self.max_anchor_frames)
+            )
             for coordinate in range(2):
-                ray_anchor_uv_px[:, hand, coordinate] = np.interp(
-                    frame_axis,
-                    anchors.astype(np.float32),
-                    query_uv_px[anchors, hand, 0, coordinate],
+                ray_anchor_uv_px[temporal, hand, coordinate] = np.interp(
+                    frame_axis[temporal],
+                    direct_frames.astype(np.float32),
+                    query_uv_px[direct, hand, 0, coordinate],
                 )
-            distance = np.min(
-                np.abs(frame_axis[:, None] - anchors[None]), axis=1
+            ray_anchor_source[temporal, hand] = 3
+            ray_anchor_distance_frames[temporal, hand] = direct_distance[temporal]
+
+            candidates = np.full((time, joints - 1, 2), np.nan, dtype=np.float32)
+            candidate_distance = np.full(
+                (time, joints - 1), np.inf, dtype=np.float32
             )
-            supervision_weight[observed, hand] = 1.0
-            near = (~observed) & (distance <= self.near_anchor_frames)
-            far = (
-                (~observed)
-                & (distance > self.near_anchor_frames)
-                & (distance <= self.max_anchor_frames)
+            for joint in range(1, joints):
+                reliable = (
+                    hand_slot_valid[:, hand]
+                    & query_valid[:, hand, joint]
+                    & (
+                        visibility[:, hand, joint]
+                        >= self.anchor_visibility_threshold
+                    )
+                )
+                reference = direct & reliable
+                reference_frames = np.flatnonzero(reference)
+                if len(reference_frames) == 0:
+                    continue
+                reference_distance = np.min(
+                    np.abs(frame_axis[:, None] - reference_frames[None]), axis=1
+                )
+                offset = (
+                    query_uv_px[reference, hand, 0]
+                    - query_uv_px[reference, hand, joint]
+                )
+                estimate = query_uv_px[:, hand, joint].copy()
+                for coordinate in range(2):
+                    estimate[:, coordinate] += np.interp(
+                        frame_axis,
+                        reference_frames.astype(np.float32),
+                        offset[:, coordinate],
+                    )
+                estimate[
+                    ~reliable
+                    | (reference_distance > self.max_anchor_frames)
+                ] = np.nan
+                candidates[:, joint - 1] = estimate
+                candidate_distance[:, joint - 1] = reference_distance
+
+            candidate_valid = np.isfinite(candidates).all(axis=-1)
+            spatial = (
+                ~direct
+                & hand_slot_valid[:, hand]
+                & candidate_valid.any(axis=-1)
             )
-            supervision_weight[near, hand] = self.near_missing_weight
-            supervision_weight[far, hand] = self.far_missing_weight
-        if self.supervision_source == "target":
-            supervision_weight = (
-                target_valid & hand_slot_valid & track_has_anchor[None]
-            ).astype(np.float32)
-        else:
-            supervision_weight *= target_valid & hand_slot_valid
+            for frame in np.flatnonzero(spatial):
+                valid_candidates = candidate_valid[frame]
+                ray_anchor_uv_px[frame, hand] = np.median(
+                    candidates[frame, valid_candidates], axis=0
+                )
+                ray_anchor_distance_frames[frame, hand] = np.median(
+                    candidate_distance[frame, valid_candidates]
+                )
+            spatial_wrist_anchor_valid[:, hand] = spatial
+            ray_anchor_source[spatial, hand] = 2
+
+        direct_source = ray_anchor_source == 1
+        inferred_source = (ray_anchor_source == 2) | (ray_anchor_source == 3)
+        near = (
+            inferred_source
+            & (ray_anchor_distance_frames <= self.near_anchor_frames)
+        )
+        far = (
+            inferred_source
+            & (ray_anchor_distance_frames > self.near_anchor_frames)
+            & (ray_anchor_distance_frames <= self.max_anchor_frames)
+        )
+        supervision_weight[direct_source] = 1.0
+        supervision_weight[near] = self.near_missing_weight
+        supervision_weight[far] = self.far_missing_weight
+        supervision_weight *= target_valid & hand_slot_valid
 
         dense_file = None
         if self.dense_provider is None:
@@ -409,7 +494,6 @@ class DexYCBMultiHandWindowDataset(Dataset):
 
         if point_features.shape[:3] != (time, grid_hw[0], grid_hw[1]):
             raise ValueError(f"Pi3X/window shape mismatch: {dense_file}")
-        original_wh = np.array([seg.shape[1], seg.shape[0]], dtype=np.float32)
         scale = resized_wh / original_wh
         query_uv_px *= scale.reshape(1, 1, 1, 2)
         clean_query_uv_px *= scale.reshape(1, 1, 1, 2)
@@ -452,6 +536,13 @@ class DexYCBMultiHandWindowDataset(Dataset):
             "hand_slot_valid": torch.from_numpy(hand_slot_valid),
             "observation_valid": torch.from_numpy(observation_valid),
             "wrist_anchor_valid": torch.from_numpy(wrist_anchor_valid),
+            "spatial_wrist_anchor_valid": torch.from_numpy(
+                spatial_wrist_anchor_valid
+            ),
+            "ray_anchor_source": torch.from_numpy(ray_anchor_source),
+            "ray_anchor_distance_frames": torch.from_numpy(
+                ray_anchor_distance_frames
+            ),
             "detector_observation_valid": torch.from_numpy(detector_observation_valid),
             "supervision_weight": torch.from_numpy(supervision_weight),
             "target_t": torch.from_numpy(target),

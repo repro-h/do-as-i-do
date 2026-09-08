@@ -117,6 +117,7 @@ def parse_args():
     parser.add_argument("--query-dropout", type=float, default=0.1)
     parser.add_argument("--near-anchor-frames", type=int, default=4)
     parser.add_argument("--max-anchor-frames", type=int, default=8)
+    parser.add_argument("--anchor-visibility-threshold", type=float, default=0.5)
     parser.add_argument("--near-missing-weight", type=float, default=0.5)
     parser.add_argument("--far-missing-weight", type=float, default=0.2)
     parser.add_argument("--w-depth", type=float, default=0.5)
@@ -256,6 +257,7 @@ def metadata_dataset(args, split, training):
         track_root=getattr(args, f"track_{split}_root"),
         near_anchor_frames=args.near_anchor_frames,
         max_anchor_frames=args.max_anchor_frames,
+        anchor_visibility_threshold=args.anchor_visibility_threshold,
         near_missing_weight=args.near_missing_weight,
         far_missing_weight=args.far_missing_weight,
         dense_provider=DummyDenseProvider(),

@@ -124,10 +124,14 @@ def main():
         track_root=args.track_root,
         near_anchor_frames=value(config, "near_anchor_frames", 4),
         max_anchor_frames=value(config, "max_anchor_frames", 8),
+        anchor_visibility_threshold=value(
+            config, "anchor_visibility_threshold", 0.5
+        ),
         near_missing_weight=value(config, "near_missing_weight", 0.5),
         far_missing_weight=value(config, "far_missing_weight", 0.2),
         dense_provider=DummyDenseProvider(),
         query_source=args.query_source,
+        supervision_source=value(config, "supervision_source", "observation"),
     )
     provider = DiskCompactFeatureProvider(
         args.compact_cache_root,
