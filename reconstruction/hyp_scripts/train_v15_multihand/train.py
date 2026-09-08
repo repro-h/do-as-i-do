@@ -176,7 +176,7 @@ def temporal_weighted_loss(prediction, target, weight, order, beta):
     return weighted_mean(smooth_l1(pred - truth, beta), temporal_weight)
 
 
-def distribution(values):
+def distribution(values, scale=1000.0):
     empty = {
         "count": 0,
         "mean_mm": None,
@@ -194,7 +194,7 @@ def distribution(values):
     if not arrays:
         return empty
     array = np.concatenate(arrays)
-    array = array[np.isfinite(array)] * 1000.0
+    array = array[np.isfinite(array)] * scale
     if array.size == 0:
         return empty
     return {
@@ -203,6 +203,42 @@ def distribution(values):
         "median_mm": float(np.median(array)),
         "p90_mm": float(np.percentile(array, 90)),
         "max_mm": float(np.max(array)),
+    }
+
+
+def pixel_distribution(values):
+    result = distribution(values, scale=1.0)
+    return {
+        key.replace("_mm", "_px"): value
+        for key, value in result.items()
+    }
+
+
+def signed_distribution(values, scale=1.0, unit=""):
+    arrays = [
+        np.asarray(value).reshape(-1)
+        for value in values
+        if np.asarray(value).size
+    ]
+    array = np.concatenate(arrays) if arrays else np.asarray([])
+    array = array[np.isfinite(array)] * scale
+    suffix = f"_{unit}" if unit else ""
+    if array.size == 0:
+        return {
+            "count": 0,
+            f"mean{suffix}": None,
+            f"median{suffix}": None,
+            f"abs_p90{suffix}": None,
+            f"min{suffix}": None,
+            f"max{suffix}": None,
+        }
+    return {
+        "count": int(array.size),
+        f"mean{suffix}": float(np.mean(array)),
+        f"median{suffix}": float(np.median(array)),
+        f"abs_p90{suffix}": float(np.percentile(np.abs(array), 90)),
+        f"min{suffix}": float(np.min(array)),
+        f"max{suffix}": float(np.max(array)),
     }
 
 
@@ -294,6 +330,12 @@ def run_epoch(
                 "translation": [],
                 "depth": [],
                 "axis": {axis: [] for axis in ("x", "y", "z")},
+                "signed_axis": {axis: [] for axis in ("x", "y", "z")},
+                "anchor_reprojection": [],
+                "prediction_reprojection": [],
+                "pixel_offset": {axis: [] for axis in ("u", "v")},
+                "pixel_offset_fraction": {axis: [] for axis in ("u", "v")},
+                "predicted_depth": [],
             }
             for group in grouped_errors
         }
@@ -408,7 +450,27 @@ def run_epoch(
             "missing_supervised": mask & ~observed_np,
             "unsupervised_target": valid_np & ~mask,
         }
-        error = (prediction - target).detach().cpu().numpy()
+        prediction_np = prediction.detach().cpu().numpy()
+        error = prediction_np - target.detach().cpu().numpy()
+        predicted_pixels_np = predicted_pixels.detach().cpu().numpy()
+        target_pixels_np = target_pixels.detach().cpu().numpy()
+        image_wh_np = (
+            batch["image_wh"][:, :, None]
+            .expand(-1, -1, prediction.shape[2], -1)
+            .detach().cpu().numpy()
+        )
+        anchor_pixels_np = (
+            ((batch["ray_anchor_uv"] + 1.0) * 0.5)
+            * (batch["image_wh"][:, :, None] - 1.0).clamp_min(1.0)
+        ).detach().cpu().numpy()
+        anchor_reprojection = np.linalg.norm(
+            anchor_pixels_np - target_pixels_np, axis=-1
+        )
+        prediction_reprojection = np.linalg.norm(
+            predicted_pixels_np - target_pixels_np, axis=-1
+        )
+        pixel_offset = predicted_pixels_np - anchor_pixels_np
+        pixel_offset_fraction = pixel_offset / np.maximum(image_wh_np, 1.0)
         translation_error = np.linalg.norm(error, axis=-1)
         depth_error = np.abs(error[..., 2])
         translation_errors.append(translation_error[mask])
@@ -443,9 +505,26 @@ def run_epoch(
                     cross = dataset_observability_errors[name][group]
                     cross["translation"].append(translation_error[cross_mask])
                     cross["depth"].append(depth_error[cross_mask])
+                    cross["anchor_reprojection"].append(
+                        anchor_reprojection[cross_mask]
+                    )
+                    cross["prediction_reprojection"].append(
+                        prediction_reprojection[cross_mask]
+                    )
+                    cross["predicted_depth"].append(prediction_np[..., 2][cross_mask])
+                    for coordinate, coordinate_name in enumerate(("u", "v")):
+                        cross["pixel_offset"][coordinate_name].append(
+                            pixel_offset[..., coordinate][cross_mask]
+                        )
+                        cross["pixel_offset_fraction"][coordinate_name].append(
+                            pixel_offset_fraction[..., coordinate][cross_mask]
+                        )
                     for axis, axis_index in (("x", 0), ("y", 1), ("z", 2)):
                         cross["axis"][axis].append(
                             np.abs(error[..., axis_index])[cross_mask]
+                        )
+                        cross["signed_axis"][axis].append(
+                            error[..., axis_index][cross_mask]
                         )
         for axis, axis_index in (("x", 0), ("y", 1), ("z", 2)):
             axis_errors[axis].append(np.abs(error[..., axis_index])[mask])
@@ -512,6 +591,28 @@ def run_epoch(
                         axis: distribution(axis_values)
                         for axis, axis_values in values["axis"].items()
                     },
+                    "signed_axis_error": {
+                        axis: signed_distribution(
+                            axis_values, scale=1000.0, unit="mm"
+                        )
+                        for axis, axis_values in values["signed_axis"].items()
+                    },
+                    "anchor_reprojection_error": pixel_distribution(
+                        values["anchor_reprojection"]
+                    ),
+                    "prediction_reprojection_error": pixel_distribution(
+                        values["prediction_reprojection"]
+                    ),
+                    "pixel_offset": {
+                        axis: signed_distribution(axis_values, unit="px")
+                        for axis, axis_values in values["pixel_offset"].items()
+                    },
+                    "pixel_offset_image_fraction": {
+                        axis: signed_distribution(axis_values)
+                        for axis, axis_values
+                        in values["pixel_offset_fraction"].items()
+                    },
+                    "predicted_depth": distribution(values["predicted_depth"]),
                 }
                 for group, values in groups.items()
             }
