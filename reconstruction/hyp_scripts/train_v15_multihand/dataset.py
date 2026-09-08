@@ -344,9 +344,14 @@ class DexYCBMultiHandWindowDataset(Dataset):
         ray_anchor_uv_px = np.zeros((time, hands, 2), dtype=np.float32)
         supervision_weight = np.zeros((time, hands), dtype=np.float32)
         track_has_anchor = np.zeros(hands, dtype=bool)
+        wrist_anchor_valid = (
+            observation_valid
+            & hand_slot_valid
+            & query_valid[:, :, 0]
+        )
         frame_axis = np.arange(time, dtype=np.float32)
         for hand in range(hands):
-            observed = observation_valid[:, hand] & hand_slot_valid[:, hand]
+            observed = wrist_anchor_valid[:, hand]
             anchors = np.flatnonzero(observed)
             if len(anchors) == 0:
                 continue
@@ -446,6 +451,7 @@ class DexYCBMultiHandWindowDataset(Dataset):
             "clean_joint_valid": torch.from_numpy(clean_query_valid),
             "hand_slot_valid": torch.from_numpy(hand_slot_valid),
             "observation_valid": torch.from_numpy(observation_valid),
+            "wrist_anchor_valid": torch.from_numpy(wrist_anchor_valid),
             "detector_observation_valid": torch.from_numpy(detector_observation_valid),
             "supervision_weight": torch.from_numpy(supervision_weight),
             "target_t": torch.from_numpy(target),
