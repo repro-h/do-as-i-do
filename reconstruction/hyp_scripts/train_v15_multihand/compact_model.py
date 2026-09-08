@@ -203,6 +203,7 @@ class CompactMultiHandPi3XTrajectoryModel(nn.Module):
     def forward(self, batch):
         frame = self.encode_frame_features(batch)
         batch_size, time, hands, _ = frame.shape
+        slot_valid = batch["hand_slot_valid"]
         frame = frame.permute(0, 2, 1, 3).reshape(batch_size * hands, time, -1)
         frame = frame + self.temporal_position[:time][None]
         temporal_valid = slot_valid.permute(0, 2, 1).reshape(batch_size * hands, time)
